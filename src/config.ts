@@ -1,10 +1,53 @@
 import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ENV_PATH = '/root/.config/jev-mcp/.env';
+const DEFAULT_ENV_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', '.env');
+const ENV_PATH_ENV_VAR = 'JEV_ENV_PATH';
 
 export interface Config {
   accountId: string;
   apiToken: string;
+}
+
+function commandLineEnvPath(args: readonly string[]): string | undefined {
+  let path: string | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--env-file') {
+      const next = args[index + 1]?.trim();
+      if (!next) {
+        throw new Error('Missing path after --env-file.');
+      }
+      path = next;
+      index += 1;
+      continue;
+    }
+
+    if (argument?.startsWith('--env-file=')) {
+      const value = argument.slice('--env-file='.length).trim();
+      if (!value) {
+        throw new Error('Missing path after --env-file=.');
+      }
+      path = value;
+      continue;
+    }
+
+    throw new Error(`Unknown command-line option: ${argument}`);
+  }
+
+  return path;
+}
+
+export function resolveConfigPath(
+  args: readonly string[] = process.argv.slice(2),
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  const cliPath = commandLineEnvPath(args);
+  const environmentPath = environment[ENV_PATH_ENV_VAR]?.trim() || undefined;
+  const selectedPath = cliPath ?? environmentPath ?? DEFAULT_ENV_PATH;
+  return resolve(selectedPath);
 }
 
 function parseEnvFile(contents: string): Map<string, string> {
@@ -46,7 +89,7 @@ function requiredValue(values: Map<string, string>, key: string): string {
   return value;
 }
 
-export function loadConfig(path = ENV_PATH): Config {
+export function loadConfig(path = resolveConfigPath()): Config {
   let contents: string;
   try {
     contents = readFileSync(path, 'utf8');
@@ -60,5 +103,3 @@ export function loadConfig(path = ENV_PATH): Config {
     apiToken: requiredValue(values, 'CLOUDFLARE_API_TOKEN'),
   };
 }
-
-export const configPath = ENV_PATH;
