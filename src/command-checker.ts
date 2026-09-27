@@ -1,16 +1,16 @@
 import type { Config } from './config.js';
 import { checkCommandWithJev, JevError } from './cloudflare-jev.js';
-import { findPolicyMatches, loadDefaultPolicy } from './policy.js';
-import type { CommandCheckInput, CommandCheckResult, RiskCategory, StaticFinding } from './types.js';
+import { findPolicyMatches, loadEffectivePolicies, strictestDecision } from './policy.js';
+import type { CommandCheckInput, CommandCheckResult, PolicyFinding, RiskCategory, StaticFinding } from './types.js';
 
 const MAX_COMMAND_LENGTH = 16_000;
 const MAX_CONTEXT_LENGTH = 16_000;
 const MAX_FIELD_LENGTH = 4_000;
 
-function reviewResult(reason: string, errorCode?: string, staticFindings: StaticFinding[] = []): CommandCheckResult {
+function reviewResult(reason: string, errorCode?: string, staticFindings: StaticFinding[] = [], policyFindings: PolicyFinding[] = [], policyVersion = 'unavailable'): CommandCheckResult {
   return { ok: false, dangerous: null, allowed: false, needsHumanReview: true, decision: 'review', reason,
     categories: [...new Set(staticFindings.map((finding) => finding.category))], riskScore: null, staticFindings,
-    policyVersion: 'unavailable', model: 'combined', ...(errorCode === undefined ? {} : { errorCode }) };
+    ...(policyFindings.length === 0 ? {} : { policyFindings }), policyVersion, model: 'combined', ...(errorCode === undefined ? {} : { errorCode }) };
 }
 
 function validateInput(input: CommandCheckInput): string | undefined {
@@ -35,11 +35,12 @@ function commandState(input: CommandCheckInput): CommandCheckInput {
     ...(input.context === undefined ? {} : { context: redactSecrets(input.context) }) };
 }
 
-function buildStaticFindings(input: CommandCheckInput): { findings: StaticFinding[]; policyVersion: string } {
-  const policy = loadDefaultPolicy();
+function buildStaticFindings(input: CommandCheckInput): { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string } {
+  const policies = loadEffectivePolicies(input.cwd);
   const text = [input.command, input.cwd, input.environment, input.target, input.context]
     .filter((item): item is string => item !== undefined).join('\n');
-  const findings = findPolicyMatches(policy, text);
+  const policyMatches = findPolicyMatches(policies, text);
+  const findings = policyMatches.findings;
   if (input.environment === 'production' && /\b(?:delete|destroy|drop|truncate|reset|clean|stop|disable|restart|reload|deploy|apply)\b/iu.test(input.command)) {
     findings.push({ ruleId: 'context.production-change', category: 'production-impact', severity: 'high', decision: 'review', message: 'A state-changing command targets a production environment.' });
   }
@@ -49,7 +50,7 @@ function buildStaticFindings(input: CommandCheckInput): { findings: StaticFindin
   if (/(?:--recursive|\s-R\b|\s-r\b|--force|\s-f\b|--delete|\*|\ball\b)/iu.test(input.command)) {
     findings.push({ ruleId: 'scope.broad-option', category: 'scope', severity: 'medium', decision: 'review', message: 'The command includes an option or wildcard that may broaden its impact.' });
   }
-  return { findings: [...new Map(findings.map((finding) => [finding.ruleId, finding])).values()], policyVersion: policy.version };
+  return { findings: [...new Map(findings.map((finding) => [finding.ruleId, finding])).values()], policyFindings: policyMatches.policyFindings, policyVersion: policies.version };
 }
 
 function scoreFromFindings(findings: StaticFinding[]): Partial<Record<RiskCategory, number>> {
@@ -72,24 +73,28 @@ function aggregateScore(risks: Partial<Record<RiskCategory, number>>, dangerous:
 
 export async function evaluateCommand(config: Config, input: CommandCheckInput): Promise<CommandCheckResult> {
   const validationError = validateInput(input);
-  let staticResult: { findings: StaticFinding[]; policyVersion: string };
+  let staticResult: { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string };
   try { staticResult = buildStaticFindings(input); } catch { return reviewResult('The safety policy could not be loaded. Human review is required.', 'POLICY_ERROR'); }
-  if (validationError !== undefined) return reviewResult(validationError, 'INVALID_INPUT', staticResult.findings);
+  if (validationError !== undefined) return reviewResult(validationError, 'INVALID_INPUT', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
 
   try {
     const response = await checkCommandWithJev(config, commandState(input));
     const dangerous = response.answers?.command_dangerous?.noul;
-    if (dangerous === undefined) return reviewResult('Jev did not return a dangerousness score.', 'JEV_INVALID_RESPONSE', staticResult.findings);
+    if (dangerous === undefined) return reviewResult('Jev did not return a dangerousness score.', 'JEV_INVALID_RESPONSE', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
     const risks = mergeScore(scoreFromFindings(staticResult.findings), dangerous);
     const categories = [...new Set([...staticResult.findings.map((finding) => finding.category), ...(dangerous >= 0.4 ? ['irreversibility' as const] : [])])];
     const riskScore = aggregateScore(risks, dangerous);
     const deny = staticResult.findings.find((finding) => finding.decision === 'deny');
     const review = staticResult.findings.find((finding) => finding.decision === 'review');
-    if (deny !== undefined || dangerous >= 0.8) return { ok: true, dangerous, allowed: false, needsHumanReview: false, decision: 'deny', reason: deny?.message ?? 'The command has a high probability of causing destructive or irreversible changes.', categories, riskScore, risks, staticFindings: staticResult.findings, policyVersion: staticResult.policyVersion, model: 'combined' };
-    if (review !== undefined || dangerous >= 0.4) return { ok: true, dangerous, allowed: false, needsHumanReview: true, decision: 'review', reason: review?.message ?? 'The command has a moderate probability of being destructive and requires human review.', categories, riskScore, risks, staticFindings: staticResult.findings, policyVersion: staticResult.policyVersion, model: 'combined' };
-    return { ok: true, dangerous, allowed: true, needsHumanReview: false, decision: 'allow', reason: 'No clear destructive risk was found in the command, context, or default safety policy.', categories, riskScore, risks, staticFindings: staticResult.findings, policyVersion: staticResult.policyVersion, model: 'combined' };
+    const jevDecision = dangerous >= 0.8 ? 'deny' : dangerous >= 0.4 ? 'review' : 'allow';
+    const decision = strictestDecision([jevDecision, deny === undefined ? 'allow' : 'deny', review === undefined ? 'allow' : 'review']);
+    const matchedPolicy = staticResult.policyFindings.find((finding) => finding.decision === decision);
+    const common = { ok: true, dangerous, categories, riskScore, risks, staticFindings: staticResult.findings, policyFindings: staticResult.policyFindings, policyVersion: staticResult.policyVersion, model: 'combined' as const };
+    if (decision === 'deny') return { ...common, allowed: false, needsHumanReview: false, decision, reason: matchedPolicy?.reason ?? 'The command has a high probability of causing destructive or irreversible changes.' };
+    if (decision === 'review') return { ...common, allowed: false, needsHumanReview: true, decision, reason: matchedPolicy?.reason ?? 'The command has a moderate probability of being destructive and requires human review.' };
+    return { ...common, allowed: true, needsHumanReview: false, decision, reason: 'No clear destructive risk was found in the command, context, or configured safety policies.' };
   } catch (error) {
-    if (error instanceof JevError) return reviewResult('Jev could not complete the safety check. Human review is required before execution.', error.code, staticResult.findings);
-    return reviewResult('An unexpected error occurred during the safety check.', 'INTERNAL_ERROR', staticResult.findings);
+    if (error instanceof JevError) return reviewResult('Jev could not complete the safety check. Human review is required before execution.', error.code, staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
+    return reviewResult('An unexpected error occurred during the safety check.', 'INTERNAL_ERROR', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
   }
 }

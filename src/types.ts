@@ -12,7 +12,9 @@ export type RiskCategory =
   | 'security'
   | 'credential'
   | 'irreversibility'
-  | 'scope';
+  | 'scope'
+  | 'deployment'
+  | 'dependencies';
 
 export interface StaticFinding {
   ruleId: string;
@@ -20,6 +22,17 @@ export interface StaticFinding {
   severity: 'low' | 'medium' | 'high' | 'critical';
   decision: Decision;
   message: string;
+}
+
+export type PolicySource = 'builtin' | 'user' | 'project';
+
+export interface PolicyFinding {
+  source: PolicySource;
+  rule: string;
+  category: RiskCategory;
+  severity: StaticFinding['severity'];
+  decision: Decision;
+  reason: string;
 }
 
 export interface CommandCheckInput {
@@ -41,6 +54,7 @@ export interface CommandCheckResult {
   riskScore: number | null;
   risks?: Partial<Record<RiskCategory, number>>;
   staticFindings: StaticFinding[];
+  policyFindings?: PolicyFinding[];
   policyVersion: string;
   model: 'typesafe/jev' | 'static' | 'combined';
   errorCode?: string;
