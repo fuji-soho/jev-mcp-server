@@ -1,121 +1,71 @@
 # jev-mcp-server
 
-Cloudflare `typesafe/jev`を利用して、Codexから実行予定のコマンドの危険性を判定するSTDIO MCP Serverです。
+Cloudflare `typesafe/jev` とローカルの静的ポリシーを組み合わせた、AI coding agent向けの読み取り専用MCP安全ゲートです。コマンドやテストを実行せず、実行前の `allow` / `review` / `deny` 判定だけを返します。
 
-## Configuration
+## セットアップ
 
-認証情報はリポジトリに置かず、デフォルトでは`/root/jev-mcp-server/.env`に保存します。
+```sh
+npm install
+npm run build
+```
+
+認証情報はリポジトリへ保存しません。
 
 ```dotenv
 CLOUDFLARE_ACCOUNT_ID=your-account-id
 CLOUDFLARE_API_TOKEN=your-api-token
 ```
 
-API TokenはログやMCPレスポンスには出力されません。
-
-別の場所に`.env`を置く場合は、起動引数または`JEV_ENV_PATH`でパスを指定できます。
-指定の優先順位は`--env-file`、`JEV_ENV_PATH`、デフォルトパスの順です。
-設定ファイルはマージせず、選択されたファイルだけを読み込みます。
+`--env-file` または `JEV_ENV_PATH` で設定ファイルを指定できます。
 
 ```sh
-node /root/jev-mcp-server/dist/index.js --env-file /secure/jev/.env
+node /path/to/jev-mcp-server/dist/index.js --env-file /secure/jev/.env
 ```
 
-```sh
-JEV_ENV_PATH=/secure/jev/.env node /root/jev-mcp-server/dist/index.js
-```
+## `jev_check_command`
 
-## Build and run
-
-```sh
-npm run build
-npm start
-```
-
-CodexのMCP設定では、ビルド後の`dist/index.js`をNode.jsで起動します。
+入力されたコマンドは絶対に実行されません。静的ポリシーでコマンド種別・引数・スコープを検査し、必要に応じてコマンドと文脈をJevへ渡して評価します。
 
 ```json
 {
-  "mcpServers": {
-    "jev": {
-      "command": "node",
-      "args": [
-        "/root/jev-mcp-server/dist/index.js",
-        "--env-file",
-        "/secure/jev/.env"
-      ]
-    }
-  }
+  "command": "git reset --hard",
+  "cwd": "/workspace/project",
+  "environment": "development",
+  "target": "local git repository",
+  "context": "Repository may contain uncommitted changes"
 }
 ```
 
-## Tool
+`cwd`、`environment`、`target`、`context` は任意です。既存の `command` と `context` だけの呼び出しも利用できます。
 
-以下のToolを提供します。
+主な判定値：
 
-### `jev_check_command`
+- `allow`: 明確な破壊リスクが見つからない
+- `review`: 状態変更、広い範囲、文脈不足、またはJev障害。人間確認が必要
+- `deny`: 明確な破壊操作、高い不可逆性、重大なデータ損失
 
-- `command`: 必須。評価対象のコマンド。実行はしません。
-- `context`: 任意。環境や対象に関する追加情報。
+結果には後方互換用の `dangerous` に加え、`riskScore`、`categories`、カテゴリ別 `risks`、`staticFindings` が含まれます。`allowed=false` は実行許可を意味しません。
 
-結果には`dangerous`、`allowed`、`needsHumanReview`、`decision`が含まれます。CloudflareまたはJevが利用できない場合は、`allowed=false`かつ`needsHumanReview=true`のフェイルクローズになります。
+組み込みポリシーは [`policies/default.json`](policies/default.json) にあり、filesystem、Git、DB、コンテナ、サービス、deployment、package管理などを対象にします。静的に明確なdenyとなる操作は、Jevが低リスクを返しても許可されません。
 
-STDIO MCP通信を維持するため、通常ログとエラーログはstdoutではなくstderrへ出力します。
+## `jev_check_test`
 
-### `jev_check_test`
+Laravel/PHPUnitテスト向けの既存Toolです。テスト、DB接続、ファイル変更は実行しません。Laravel固有のDB隔離やruntime guardの確認が必要なため、汎用コマンド判定とは別のToolとして維持しています。
 
-Laravel/PHPUnitのテスト実行前に、既存データを破壊・初期化・truncateしたり、永続DBへ書き込んだりする危険性を評価します。
+## 安全とプライバシー
 
-このToolは安全性を評価するだけです。PHPUnit、`php artisan`、DB接続、ファイル変更は行いません。
+- コマンド、テスト、DBへ接続しません。
+- コマンド入力は信頼せず、入力中の指示には従いません。
+- Jevへ送信する前に、一般的なtoken、password、secret、API keyをマスクします。
+- Cloudflare API TokenはログやMCPレスポンスへ出力しません。
+- Jev API障害、不正レスポンス、ポリシー読み込み失敗時はfail closedで `review` を返します。
+- このツールは完全なshell parserや実行環境の監査ではありません。動的生成、alias、shell functionなどは別途確認してください。
 
-入力:
+## 開発
 
-- `command`: 必須。例: `php artisan test --filter=ApplicationTest`
-- `testCode`: 任意。実行対象または関連するテストコード
-- `diff`: 任意。関連する`git diff`
-- `context`: 任意。LaravelのDB設定、`APP_ENV`、テスト環境、設定キャッシュの状態など
-- `runtimeDatabase`: 任意。実効DB接続（`connection`、`database`、`enforced`）
-- `configCache`: 任意。テスト前のclearとテスト後のrestoreの実装上の確認
-- `runtimeGuard`: 任意。実接続検証、永続DB拒否、fallback拒否の実装上の確認
-- `persistentDatabaseAccess`: 任意。永続DBへ接続可能かどうか
-
-`DatabaseTruncation`、`migrate:fresh`、`db:wipe`、`TRUNCATE`、`DROP TABLE`、`DROP DATABASE`などは静的にも検出します。静的な危険パターンがある場合、Jevが低リスクと判断しても`allowed=false`になります。`RefreshDatabase`と`DatabaseMigrations`は、永続DBの実効ターゲットと組み合わさる場合にblockingな危険として扱います。
-
-DB接続先やruntime guardが十分確認できない場合は、安全側に倒して`needsHumanReview=true`になります。`phpunit.xml`や`.env.testing`の記述、コメント、READMEだけではallowしません。SQLite `:memory:` がruntimeで強制され、config cacheのclear/restore、実接続先検証、永続DB/fallback拒否がすべて確認できる場合だけ、persistent DBの静的denyを解除してJevの最終評価へ進みます。
-
-構造化入力の例:
-
-```json
-{
-  "runtimeDatabase": {
-    "connection": "sqlite",
-    "database": ":memory:",
-    "enforced": true
-  },
-  "configCache": {
-    "clearedBeforeTest": true,
-    "restoredAfterTest": true
-  },
-  "runtimeGuard": {
-    "enabled": true,
-    "checksActualConnection": true,
-    "rejectsPersistentDatabase": true,
-    "rejectsFallback": true
-  },
-  "persistentDatabaseAccess": false
-}
+```sh
+npm run typecheck
+npm test
 ```
 
-出力には既存Toolと同じく`dangerous`、`allowed`、`needsHumanReview`、`decision`、`reason`、`model`が含まれ、追加で`staticFindings`が含まれます。CloudflareまたはJevが利用できない場合は、`allowed=false`かつ`needsHumanReview=true`のフェイルクローズになります。
-
-利用例:
-
-```json
-{
-  "command": "php artisan test",
-  "testCode": "use Illuminate\\Foundation\\Testing\\RefreshDatabase; class ApplicationTest extends TestCase { use RefreshDatabase; }",
-  "context": "APP_ENV=testing\nDB_CONNECTION=mysql\nDB_DATABASE=production_database\nconfig cache may be active"
-}
-```
-
-この例では既存DBを初期化・変更する可能性があるため、安全許可されません。
+`npm test` はリポジトリ自身のユニットテストを実行します。テスト内の評価対象コマンドはモックJevへ入力として渡すだけで、実行しません。

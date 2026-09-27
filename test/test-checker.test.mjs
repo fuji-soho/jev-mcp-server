@@ -103,6 +103,8 @@ test('php artisan test without database evidence requires human review', async (
   globalThis.fetch = async () => lowRiskResponse();
   const result = await evaluateTest(config, { command: 'php artisan test' });
 
+  assert.equal(result.dangerous, 0.1);
+  assert.equal(JSON.parse(JSON.stringify(result)).dangerous, 0.1);
   assert.equal(result.allowed, false);
   assert.equal(result.needsHumanReview, true);
   assert.equal(result.decision, 'review');

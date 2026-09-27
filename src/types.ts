@@ -1,7 +1,32 @@
 export type Decision = 'allow' | 'review' | 'deny';
 
+export type CommandEnvironment = 'development' | 'testing' | 'staging' | 'production' | 'unknown';
+
+export type RiskCategory =
+  | 'data-loss'
+  | 'filesystem'
+  | 'database'
+  | 'git'
+  | 'availability'
+  | 'production-impact'
+  | 'security'
+  | 'credential'
+  | 'irreversibility'
+  | 'scope';
+
+export interface StaticFinding {
+  ruleId: string;
+  category: RiskCategory;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  decision: Decision;
+  message: string;
+}
+
 export interface CommandCheckInput {
   command: string;
+  cwd?: string;
+  environment?: CommandEnvironment;
+  target?: string;
   context?: string;
 }
 
@@ -12,7 +37,12 @@ export interface CommandCheckResult {
   needsHumanReview: boolean;
   decision: Decision;
   reason: string;
-  model: 'typesafe/jev';
+  categories: RiskCategory[];
+  riskScore: number | null;
+  risks?: Partial<Record<RiskCategory, number>>;
+  staticFindings: StaticFinding[];
+  policyVersion: string;
+  model: 'typesafe/jev' | 'static' | 'combined';
   errorCode?: string;
 }
 

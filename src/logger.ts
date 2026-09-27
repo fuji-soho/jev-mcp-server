@@ -1,7 +1,8 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DEFAULT_LOG_PATH = '/root/jev-mcp-server/log/jev.log';
+const DEFAULT_LOG_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'log', 'jev.log');
 
 function logPath(): string {
   return process.env.JEV_LOG_PATH?.trim() || DEFAULT_LOG_PATH;

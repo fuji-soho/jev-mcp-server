@@ -1,0 +1,18 @@
+# Normalize text files to LF across platforms.
+* text=auto eol=lf
+
+# Keep binary files untouched.
+*.7z binary
+*.avif binary
+*.bmp binary
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.tar binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.zip binary

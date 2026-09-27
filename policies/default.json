@@ -1,0 +1,16 @@
+{
+  "version": "default-1",
+  "rules": [
+    { "id": "filesystem.root-recursive-delete", "pattern": "\\brm\\s+(?:(?:-rf)|(?:-fr)|(?:-r\\s+-f)|(?:-f\\s+-r)|(?:--recursive\\s+--force)|(?:--force\\s+--recursive))\\s+/\\s*$", "category": "filesystem", "severity": "critical", "decision": "deny", "message": "Recursive forced deletion targets the filesystem root." },
+    { "id": "filesystem.recursive-delete", "pattern": "\\b(?:rm\\s+[^;&\\n]*-r|find\\s+[^;&\\n]*-delete|shred\\s+[^;&\\n]*-r)", "category": "filesystem", "severity": "high", "decision": "review", "message": "The command may recursively delete files." },
+    { "id": "filesystem.overwrite-device", "pattern": "\\b(?:dd\\s+[^;&\\n]*\\bof=/|mkfs(?:\\.|\\s)|fdisk\\s|parted\\s)", "category": "filesystem", "severity": "critical", "decision": "deny", "message": "The command may overwrite or reformat a block device." },
+    { "id": "git.reset-hard", "pattern": "\\bgit\\s+(?:-[^;&\\n]+\\s+)?reset\\s+[^;&\\n]*--hard", "category": "git", "severity": "high", "decision": "review", "message": "The command may discard uncommitted changes." },
+    { "id": "git.clean-force", "pattern": "\\bgit\\s+clean\\s+[^;&\\n]*-f", "category": "git", "severity": "high", "decision": "review", "message": "The command may permanently delete untracked files." },
+    { "id": "git.force-push", "pattern": "\\bgit\\s+push\\s+[^;&\\n]*(?:--force|-f)(?:\\s|$)", "category": "git", "severity": "high", "decision": "review", "message": "Force-push may rewrite a remote branch." },
+    { "id": "database.destroy", "pattern": "\\b(?:drop\\s+(?:database|schema|table)|truncate\\s+(?:table\\s+)?|delete\\s+from\\s+[^;&\\n]+(?:;|$))", "category": "database", "severity": "critical", "decision": "deny", "message": "The command may destroy or remove database data." },
+    { "id": "containers.volume-delete", "pattern": "\\b(?:docker|podman)\\s+(?:volume\\s+rm|compose\\s+down\\s+[^;&\\n]*-v)", "category": "data-loss", "severity": "high", "decision": "review", "message": "The command may remove persistent container volumes." },
+    { "id": "system.service-disruption", "pattern": "\\bsystemctl\\s+(?:stop|disable|mask)\\b|\\b(?:shutdown|reboot)\\b", "category": "availability", "severity": "high", "decision": "review", "message": "The command may stop or disrupt a system service." },
+    { "id": "deployment.broad-delete", "pattern": "\\b(?:terraform\\s+destroy|kubectl\\s+delete|rsync\\s+[^;&\\n]*--delete)\\b", "category": "scope", "severity": "high", "decision": "review", "message": "The command may remove or broadly change deployed resources." },
+    { "id": "package.remove", "pattern": "\\b(?:apt|dnf|yum|apk)\\s+(?:remove|erase)\\b|\\b(?:npm|composer)\\s+update\\b", "category": "scope", "severity": "medium", "decision": "review", "message": "The command may change a broad set of installed dependencies." }
+  ]
+}
