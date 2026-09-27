@@ -1,0 +1,8 @@
+{
+  "version": "1",
+  "rules": [
+    { "id": "laravel.database-truncation", "pattern": "\\bDatabaseTruncation\\b", "category": "database", "severity": "critical", "decision": "deny", "message": "DatabaseTruncation" },
+    { "id": "laravel.migrate-fresh", "pattern": "\\b(?:php\\s+artisan\\s+)?migrate\\s*:\\s*fresh\\b", "category": "database", "severity": "critical", "decision": "deny", "message": "migrate:fresh" },
+    { "id": "laravel.db-wipe", "pattern": "\\bphp\\s+artisan\\s+db\\s*:\\s*wipe\\b", "category": "database", "severity": "critical", "decision": "deny", "message": "db:wipe" }
+  ]
+}

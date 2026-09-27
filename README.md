@@ -52,6 +52,8 @@ After saving, confirm that the MCP server is enabled and use it in a new chat. I
 codex mcp add jev-mcp-server -- node /jev-mcp-server/dist/index.js --env-file /jev-mcp-server/.env
 ```
 
+Codex users can copy [`examples/AGENTS.md`](examples/AGENTS.md) to `AGENTS.md` in their project root to provide Codex with the recommended Jev safety-gate instructions.
+
 ## `jev_check_command`
 
 Input commands are never executed. The server inspects the command type, arguments, and scope using static policies and, when necessary, sends the command and its context to Jev for evaluation.
@@ -101,7 +103,41 @@ You can add your own rules. On Linux/macOS, User policy is located at `$XDG_CONF
 
 ## `jev_check_test`
 
-This is an existing tool for Laravel/PHPUnit tests. It does not run tests, connect to a database, or modify files. It remains separate from the general command evaluator because Laravel-specific database isolation and runtime guard checks are required.
+`jev_check_test` evaluates test execution safety across languages and frameworks, including persistent-resource access, database and filesystem mutation, external service side effects, production access, credentials, network access, destructive cleanup, and isolation. It never runs the test, command, or database connection; the supplied command is untrusted input sent only for evaluation.
+
+The minimal input is:
+
+```json
+{ "command": "npm test" }
+```
+
+Optional `testCode`, `diff`, `cwd`, `environment`, `framework`, `context`, `isolation`, and `runtime` fields provide additional evidence. For example:
+
+```json
+{
+  "command": "npm test",
+  "framework": "vitest",
+  "environment": "testing",
+  "isolation": { "temporaryFilesystem": true, "mockedExternalServices": true },
+  "runtime": { "productionAccess": false, "persistentStorageAccess": false, "networkAccess": false }
+}
+```
+
+Generic test policy is always applied. A framework-specific policy is added only when `framework` is supplied; Laravel rules are provided as an example under [`policies/tests/laravel.json`](policies/tests/laravel.json). Built-in, User, Project, and Jev decisions use `allow < review < deny`.
+
+### Safety Profile
+
+Projects may define reusable test-safety evidence in `.jev/test-safety.json`. The profile is framework-neutral and declares safety-related files plus expected testing, isolation, database, and runtime conditions. A profile is not a permission or a guarantee: built-in, User, Project, and Jev `deny` decisions always win.
+
+The listed files are fingerprinted with SHA-256. Verified state is kept outside the repository under the user Jev configuration directory (or `JEV_TEST_SAFETY_STATE_PATH`) and is never committed. `jev_check_test` remains read-only; explicit verification creates the state:
+
+```sh
+npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verification-input.json
+```
+
+After human verification, an unchanged profile, matching fingerprint, matching runtime context, and low-risk Jev result can return `allow` without repeating the same review. Profile changes, missing files, runner/framework changes, isolation changes, invalid profiles, policy findings, or new risks return `review` or `deny`. Do not put credentials or `.env` values in a profile or verified state.
+
+The server only evaluates supplied evidence; it does not inspect a live process, connect to a database, or prove that runtime claims are truthful.
 
 ## Safety and privacy
 

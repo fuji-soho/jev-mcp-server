@@ -52,6 +52,8 @@ Codexから利用する場合は、次の手順でMCPサーバーを追加して
 codex mcp add jev-mcp-server -- node /jev-mcp-server/dist/index.js --env-file /jev-mcp-server/.env
 ```
 
+Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジェクトルートの`AGENTS.md`としてコピーし、Jev Safety Gateの推奨設定をCodexに適用できます。
+
 ## `jev_check_command`
 
 入力されたコマンドは絶対に実行されません。静的ポリシーでコマンド種別・引数・スコープを検査し、必要に応じてコマンドと文脈をJevへ渡して評価します。
@@ -101,7 +103,29 @@ codex mcp add jev-mcp-server -- node /jev-mcp-server/dist/index.js --env-file /j
 
 ## `jev_check_test`
 
-Laravel/PHPUnitテスト向けの既存Toolです。テスト、DB接続、ファイル変更は実行しません。Laravel固有のDB隔離やruntime guardの確認が必要なため、汎用コマンド判定とは別のToolとして維持しています。
+`jev_check_test`は、言語やフレームワークを問わず、テスト実行時の永続データ、データベース、ファイルシステム、外部サービス、本番環境、credential、ネットワーク、破壊的cleanup、隔離状態を評価します。テスト、コマンド、DB接続は絶対に実行せず、入力されたcommandは評価のための未信頼データとしてのみ扱います。
+
+最小入力は次の形式です。
+
+```json
+{ "command": "npm test" }
+```
+
+必要に応じて`testCode`、`diff`、`cwd`、`environment`、`framework`、`context`、`isolation`、`runtime`を追加できます。generic policyは常に適用され、`framework`指定時だけframework-specific policyが追加適用されます。Laravel固有ルールは[`policies/tests/laravel.json`](policies/tests/laravel.json)にあります。
+
+### Safety Profile
+
+プロジェクトは`.jev/test-safety.json`で、再利用するテスト安全条件を定義できます。ProfileはLaravel専用ではなく、安全関連ファイル、test runner、DB、隔離、runtime条件を宣言します。Profileは許可証や安全保証ではなく、Built-in／User／Project PolicyやJevの`deny`を上書きしません。
+
+Profileに記載したファイルはSHA-256でfingerprint化します。verified stateはリポジトリ外のユーザー設定ディレクトリ（または`JEV_TEST_SAFETY_STATE_PATH`）へ保存し、Gitへコミットしません。`jev_check_test`は読み取り専用のまま、明示的なverificationでstateを作成します。
+
+```sh
+npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verification-input.json
+```
+
+人間による初回確認後、Profile、対象ファイル、runtime条件が同じで、Jevも低リスクなら、同じ確認を毎回要求せず`allow`にできます。Profile変更、対象ファイル欠落、runner/framework変更、隔離条件変更、無効なProfile、Policy違反、新しいリスクがあれば`review`または`deny`に戻ります。Profileやverified stateへcredentialや`.env`の実値を保存しないでください。
+
+本サーバーは入力されたevidenceを評価するだけで、実行中プロセスやDBへ接続したり、runtimeの申告が正しいことを証明したりはしません。
 
 ## 安全とプライバシー
 

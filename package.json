@@ -9,8 +9,9 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "verify-test-safety": "npm run build && node dist/test-safety-cli.js",
     "start": "node dist/index.js",
-    "test": "npm run build && node --test test/*.test.mjs"
+    "test": "npm run build && JEV_CACHE_DB_PATH=:memory: node --test test/*.test.mjs"
   },
   "repository": {
     "type": "git",

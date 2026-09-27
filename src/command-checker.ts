@@ -2,6 +2,14 @@ import type { Config } from './config.js';
 import { checkCommandWithJev, JevError } from './cloudflare-jev.js';
 import { findPolicyMatches, loadEffectivePolicies, strictestDecision } from './policy.js';
 import type { CommandCheckInput, CommandCheckResult, PolicyFinding, RiskCategory, StaticFinding } from './types.js';
+import { openDatabase } from './storage/sqlite.js';
+import { insertAudit } from './storage/audit-log.js';
+import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, MODEL_VERSION, projectId, sha256 } from './safety-fingerprint.js';
+import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { logEvent } from './logger.js';
 
 const MAX_COMMAND_LENGTH = 16_000;
 const MAX_CONTEXT_LENGTH = 16_000;
@@ -35,7 +43,7 @@ function commandState(input: CommandCheckInput): CommandCheckInput {
     ...(input.context === undefined ? {} : { context: redactSecrets(input.context) }) };
 }
 
-function buildStaticFindings(input: CommandCheckInput): { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string } {
+function buildStaticFindings(input: CommandCheckInput): { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string; policyHash: string } {
   const policies = loadEffectivePolicies(input.cwd);
   const text = [input.command, input.cwd, input.environment, input.target, input.context]
     .filter((item): item is string => item !== undefined).join('\n');
@@ -50,7 +58,7 @@ function buildStaticFindings(input: CommandCheckInput): { findings: StaticFindin
   if (/(?:--recursive|\s-R\b|\s-r\b|--force|\s-f\b|--delete|\*|\ball\b)/iu.test(input.command)) {
     findings.push({ ruleId: 'scope.broad-option', category: 'scope', severity: 'medium', decision: 'review', message: 'The command includes an option or wildcard that may broaden its impact.' });
   }
-  return { findings: [...new Map(findings.map((finding) => [finding.ruleId, finding])).values()], policyFindings: policyMatches.policyFindings, policyVersion: policies.version };
+  return { findings: [...new Map(findings.map((finding) => [finding.ruleId, finding])).values()], policyFindings: policyMatches.policyFindings, policyVersion: policies.version, policyHash: policies.hash };
 }
 
 function scoreFromFindings(findings: StaticFinding[]): Partial<Record<RiskCategory, number>> {
@@ -73,12 +81,32 @@ function aggregateScore(risks: Partial<Record<RiskCategory, number>>, dangerous:
 
 export async function evaluateCommand(config: Config, input: CommandCheckInput): Promise<CommandCheckResult> {
   const validationError = validateInput(input);
-  let staticResult: { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string };
+  let staticResult: { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string; policyHash: string };
   try { staticResult = buildStaticFindings(input); } catch { return reviewResult('The safety policy could not be loaded. Human review is required.', 'POLICY_ERROR'); }
-  if (validationError !== undefined) return reviewResult(validationError, 'INVALID_INPUT', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
+  const state = commandState(input);
+  const root = (() => { try { return realpathSync(resolve(input.cwd ?? process.cwd())); } catch { return resolve(input.cwd ?? process.cwd()); } })();
+  const pid = projectId(root);
+  const contextHash = sha256(canonicalJson(state));
+  const targetKey = input.target?.trim() || 'command';
+  const cacheKey: CacheKey = { projectId: pid, targetType: 'command', targetKey, fingerprint: buildFingerprint({ projectId: pid, targetType: 'command', targetKey, testSpecific: state, sharedContext: { environment: input.environment }, policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION }), policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION };
+  let db;
+  try { db = openDatabase(); } catch { db = undefined; }
+  const staticDecision = strictestDecision(staticResult.findings.map((finding) => finding.decision).concat(staticResult.policyFindings.map((finding) => finding.decision)));
+  const audit = (result: CommandCheckResult, cacheStatus: 'disabled'|'miss'|'hit'|'error', jevDecision?: 'allow'|'review'|'deny', save = false): void => {
+    if (!db) return;
+    try { db.exec('BEGIN'); insertAudit(db, { requestId: requestId, projectId: pid, toolName: 'jev_check_command', targetType: 'command', targetKey, fingerprint: cacheKey.fingerprint, cacheStatus, staticDecision, jevDecision, finalDecision: result.decision, allowed: result.allowed, needsHumanReview: result.needsHumanReview, policyHash: cacheKey.policyHash, contextHash: cacheKey.contextHash, runtimeHash: cacheKey.runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION, reason: result.reason }); if (save) upsertCache(db, cacheKey, result.decision, result.decision === 'allow', new Date().toISOString()); db.exec('COMMIT'); } catch { try { db.exec('ROLLBACK'); } catch { /* best effort */ } logEvent('audit_persistence_error', { tool: 'jev_check_command' }); }
+  };
+  const requestId = randomUUID();
+  if (validationError !== undefined) { const result = reviewResult(validationError, 'INVALID_INPUT', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion); audit(result, 'miss'); return result; }
+  if (staticDecision === 'allow' && db) {
+    try {
+      const hit = lookupAllow(db, cacheKey);
+      if (hit) { const result: CommandCheckResult = { ok: true, dangerous: 0, allowed: true, needsHumanReview: false, decision: 'allow', reason: 'An unchanged allow decision was reused from the Safety Fingerprint Cache.', categories: [], riskScore: 0, staticFindings: staticResult.findings, policyFindings: staticResult.policyFindings, policyVersion: staticResult.policyVersion, model: 'combined' }; audit(result, 'hit'); return result; }
+    } catch { /* cache is unavailable; continue with Jev */ }
+  }
 
   try {
-    const response = await checkCommandWithJev(config, commandState(input));
+    const response = await checkCommandWithJev(config, state);
     const dangerous = response.answers?.command_dangerous?.noul;
     if (dangerous === undefined) return reviewResult('Jev did not return a dangerousness score.', 'JEV_INVALID_RESPONSE', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
     const risks = mergeScore(scoreFromFindings(staticResult.findings), dangerous);
@@ -90,11 +118,10 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
     const decision = strictestDecision([jevDecision, deny === undefined ? 'allow' : 'deny', review === undefined ? 'allow' : 'review']);
     const matchedPolicy = staticResult.policyFindings.find((finding) => finding.decision === decision);
     const common = { ok: true, dangerous, categories, riskScore, risks, staticFindings: staticResult.findings, policyFindings: staticResult.policyFindings, policyVersion: staticResult.policyVersion, model: 'combined' as const };
-    if (decision === 'deny') return { ...common, allowed: false, needsHumanReview: false, decision, reason: matchedPolicy?.reason ?? 'The command has a high probability of causing destructive or irreversible changes.' };
-    if (decision === 'review') return { ...common, allowed: false, needsHumanReview: true, decision, reason: matchedPolicy?.reason ?? 'The command has a moderate probability of being destructive and requires human review.' };
-    return { ...common, allowed: true, needsHumanReview: false, decision, reason: 'No clear destructive risk was found in the command, context, or configured safety policies.' };
+    const result = decision === 'deny' ? { ...common, allowed: false, needsHumanReview: false, decision, reason: matchedPolicy?.reason ?? 'The command has a high probability of causing destructive or irreversible changes.' } : decision === 'review' ? { ...common, allowed: false, needsHumanReview: true, decision, reason: matchedPolicy?.reason ?? 'The command has a moderate probability of being destructive and requires human review.' } : { ...common, allowed: true, needsHumanReview: false, decision, reason: 'No clear destructive risk was found in the command, context, or configured safety policies.' };
+    audit(result, 'miss', jevDecision, true); return result;
   } catch (error) {
-    if (error instanceof JevError) return reviewResult('Jev could not complete the safety check. Human review is required before execution.', error.code, staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
-    return reviewResult('An unexpected error occurred during the safety check.', 'INTERNAL_ERROR', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion);
+    if (error instanceof JevError) { const result = reviewResult('Jev could not complete the safety check. Human review is required before execution.', error.code, staticResult.findings, staticResult.policyFindings, staticResult.policyVersion); audit(result, 'miss'); return result; }
+    const result = reviewResult('An unexpected error occurred during the safety check.', 'INTERNAL_ERROR', staticResult.findings, staticResult.policyFindings, staticResult.policyVersion); audit(result, 'error'); return result;
   }
 }

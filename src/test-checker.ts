@@ -1,248 +1,195 @@
 import type { Config } from './config.js';
 import { checkTestWithJev, JevError } from './cloudflare-jev.js';
-import type { TestCheckInput, TestCheckResult } from './types.js';
+import { findPolicyMatches, loadEffectiveTestPolicies, strictestDecision } from './policy.js';
+import { assessSafetyProfile } from './test-safety-profile.js';
+import type { Decision, PolicyFinding, RiskCategory, StaticFinding, TestCheckInput, TestCheckResult, TestFinding } from './types.js';
+import { randomUUID } from 'node:crypto';
+import { readFileSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { openDatabase } from './storage/sqlite.js';
+import { insertAudit } from './storage/audit-log.js';
+import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, MODEL_VERSION, projectId, relativeTarget, sha256 } from './safety-fingerprint.js';
+import { logEvent } from './logger.js';
 
 const MAX_COMMAND_LENGTH = 16_000;
 const MAX_TEST_CODE_LENGTH = 64_000;
 const MAX_DIFF_LENGTH = 64_000;
 const MAX_CONTEXT_LENGTH = 32_000;
+const MAX_FIELD_LENGTH = 4_000;
+const SEVERITY_SCORE = { low: 0.25, medium: 0.5, high: 0.8, critical: 1 } as const;
 
-const SECRET_ASSIGNMENT = /((?:DB_PASSWORD|DB_USERNAME|API_TOKEN|CLOUDFLARE_API_TOKEN|APP_KEY|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|CREDENTIALS?|SECRET|PASSWORD|TOKEN)\s*[=:]\s*)([^\s,;\n]+)/giu;
-const ENV_SECRET_LINE = /(^|\n)(\s*(?:DB_PASSWORD|DB_USERNAME|API_TOKEN|CLOUDFLARE_API_TOKEN|APP_KEY|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|CREDENTIALS?|SECRET|PASSWORD|TOKEN)\s*=)[^\n]*/giu;
-
-function reviewResult(
-  reason: string,
-  staticFindings: string[] = [],
-  errorCode?: string,
-): TestCheckResult {
-  return {
-    ok: false,
-    dangerous: null,
-    allowed: false,
-    needsHumanReview: true,
-    decision: 'review',
-    staticFindings,
-    reason,
-    model: 'typesafe/jev',
-    ...(errorCode === undefined ? {} : { errorCode }),
-  };
+function reviewResult(reason: string, staticFindings: string[] = [], errorCode?: string, details: Partial<TestCheckResult> = {}): TestCheckResult {
+  return { ok: false, dangerous: null, allowed: false, needsHumanReview: true, decision: 'review', staticFindings, reason, model: 'typesafe/jev', ...details, ...(errorCode === undefined ? {} : { errorCode }) };
 }
 
 function redact(value: string): string {
   return value
-    .replace(ENV_SECRET_LINE, '$1$2[REDACTED]')
-    .replace(SECRET_ASSIGNMENT, '$1[REDACTED]');
+    .replace(/((?:DB_PASSWORD|DB_USERNAME|API_TOKEN|CLOUDFLARE_API_TOKEN|APP_KEY|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|CREDENTIALS?|SECRET|PASSWORD|TOKEN)\s*[=:]\s*)([^\s,;\n]+)/giu, '$1[REDACTED]')
+    .replace(/(--?(?:token|password|secret|api[-_]?key|access[-_]?key|private[-_]?key)(?:=|\s+))([^\s,;&]+)/giu, '$1[REDACTED]');
 }
 
 function inputText(input: TestCheckInput): string {
-  return [input.command, input.testCode, input.diff, input.context]
-    .filter((value): value is string => value !== undefined)
-    .join('\n');
-}
-
-function hasSafeRuntimeDatabase(input: TestCheckInput): boolean {
-  const database = input.runtimeDatabase;
-  return database?.connection === 'sqlite'
-    && database.database === ':memory:'
-    && database.enforced === true;
-}
-
-function hasSafeRuntimeGuard(input: TestCheckInput): boolean {
-  const cache = input.configCache;
-  const guard = input.runtimeGuard;
-  return hasSafeRuntimeDatabase(input)
-    && cache?.clearedBeforeTest === true
-    && cache.restoredAfterTest === true
-    && guard?.enabled === true
-    && guard.checksActualConnection === true
-    && guard.rejectsPersistentDatabase === true
-    && guard.rejectsFallback === true
-    && input.persistentDatabaseAccess === false;
-}
-
-function hasExplicitPersistentTarget(input: TestCheckInput): boolean {
-  if (input.persistentDatabaseAccess === true) {
-    return true;
-  }
-  if (input.runtimeDatabase !== undefined) {
-    return input.runtimeDatabase.connection !== 'sqlite'
-      || input.runtimeDatabase.database !== ':memory:';
-  }
-
-  const context = input.context ?? '';
-  return /\bDB_CONNECTION\s*=\s*(?:mysql|mariadb|pgsql|sqlsrv)\b/iu.test(context)
-    || /\bDB_DATABASE\s*=\s*(?!:memory:)[^\s#]+/iu.test(context)
-    || /\b(?:mysql|mariadb|postgres(?:ql)?|sqlsrv):\/\//iu.test(context);
-}
-
-function hasUnconfirmedPersistentTarget(input: TestCheckInput): boolean {
-  if (hasSafeRuntimeGuard(input) || hasExplicitPersistentTarget(input)) {
-    return false;
-  }
-  const context = input.context ?? '';
-  const sqliteMemoryConfig = /\bDB_CONNECTION\s*[=:]\s*sqlite\b/iu.test(context)
-    && /\bDB_DATABASE\s*[=:]\s*:memory:/iu.test(context);
-  if (sqliteMemoryConfig) {
-    return false;
-  }
-  return /\b(?:persistent|database|DB_CONNECTION|DB_DATABASE|mysql|mariadb|pgsql|sqlsrv)\b/iu.test(context)
-    || (input.runtimeDatabase !== undefined && input.persistentDatabaseAccess === undefined);
-}
-
-interface StaticRiskResult {
-  findings: string[];
-  blocking: string[];
-}
-
-function findStaticRisks(input: TestCheckInput): StaticRiskResult {
-  const text = inputText(input);
-  const findings: string[] = [];
-  const blocking: string[] = [];
-  const safeRuntime = hasSafeRuntimeGuard(input);
-  const patterns: Array<[string, RegExp]> = [
-    ['RefreshDatabase', /\bRefreshDatabase\b/u],
-    ['DatabaseMigrations', /\bDatabaseMigrations\b/u],
-    ['DatabaseTruncation', /\bDatabaseTruncation\b/u],
-    ['migrate:fresh', /\bmigrate\s*:\s*fresh\b/iu],
-    ['db:wipe', /\bdb\s*:\s*wipe\b/iu],
-    ['TRUNCATE', /\bTRUNCATE\s+(?:TABLE\s+)?[A-Za-z0-9_`".]+/iu],
-    ['DROP TABLE', /\bDROP\s+TABLE\b/iu],
-    ['DROP DATABASE', /\bDROP\s+DATABASE\b/iu],
-  ];
-
-  for (const [name, pattern] of patterns) {
-    if (pattern.test(text)) {
-      if (safeRuntime && ['RefreshDatabase', 'DatabaseMigrations'].includes(name)) {
-        continue;
-      }
-      findings.push(name);
-      if (!['RefreshDatabase', 'DatabaseMigrations'].includes(name)) {
-        blocking.push(name);
-      }
-    }
-  }
-
-  const persistentTarget = !hasSafeRuntimeGuard(input) && hasExplicitPersistentTarget(input);
-  if (persistentTarget) {
-    findings.push('persistent database target is not confirmed as test-only');
-    blocking.push('persistent database target is not confirmed as test-only');
-  } else if (hasUnconfirmedPersistentTarget(input)) {
-    findings.push('persistent database target is not confirmed as test-only');
-  }
-
-  if (persistentTarget && !hasSafeRuntimeGuard(input)) {
-    const traitIsPresent = findings.includes('RefreshDatabase') || findings.includes('DatabaseMigrations');
-    if (traitIsPresent) {
-      blocking.push('persistent database target is not confirmed as test-only');
-    }
-  }
-
-  return { findings, blocking: [...new Set(blocking)] };
+  return [input.command, input.testCode, input.diff, input.cwd, input.environment, input.framework, input.context]
+    .filter((value): value is string => value !== undefined).join('\n');
 }
 
 function validateInput(input: TestCheckInput): string | undefined {
-  if (input.command.trim() === '') {
-    return 'command must not be empty.';
-  }
-  if (input.command.length > MAX_COMMAND_LENGTH) {
-    return `command exceeds the ${MAX_COMMAND_LENGTH}-character limit.`;
-  }
-  if (input.testCode !== undefined && input.testCode.length > MAX_TEST_CODE_LENGTH) {
-    return `testCode exceeds the ${MAX_TEST_CODE_LENGTH}-character limit.`;
-  }
-  if (input.diff !== undefined && input.diff.length > MAX_DIFF_LENGTH) {
-    return `diff exceeds the ${MAX_DIFF_LENGTH}-character limit.`;
-  }
-  if (input.context !== undefined && input.context.length > MAX_CONTEXT_LENGTH) {
-    return `context exceeds the ${MAX_CONTEXT_LENGTH}-character limit.`;
-  }
+  if (input.command.trim() === '') return 'command must not be empty.';
+  if (input.command.length > MAX_COMMAND_LENGTH) return `command exceeds the ${MAX_COMMAND_LENGTH}-character limit.`;
+  if (input.testCode !== undefined && input.testCode.length > MAX_TEST_CODE_LENGTH) return `testCode exceeds the ${MAX_TEST_CODE_LENGTH}-character limit.`;
+  if (input.diff !== undefined && input.diff.length > MAX_DIFF_LENGTH) return `diff exceeds the ${MAX_DIFF_LENGTH}-character limit.`;
+  if (input.context !== undefined && input.context.length > MAX_CONTEXT_LENGTH) return `context exceeds the ${MAX_CONTEXT_LENGTH}-character limit.`;
+  for (const [name, value] of [['cwd', input.cwd], ['framework', input.framework]] as const) if (value !== undefined && value.length > MAX_FIELD_LENGTH) return `${name} exceeds the ${MAX_FIELD_LENGTH}-character limit.`;
   return undefined;
 }
 
-function hasSufficientEnvironmentEvidence(input: TestCheckInput): boolean {
-  return hasSafeRuntimeGuard(input);
+function legacySafeRuntime(input: TestCheckInput): boolean {
+  const database = input.runtimeDatabase;
+  const cache = input.configCache;
+  const guard = input.runtimeGuard;
+  return database?.connection === 'sqlite' && database.database === ':memory:' && database.enforced === true
+    && cache?.clearedBeforeTest === true && cache.restoredAfterTest === true
+    && guard?.enabled === true && guard.checksActualConnection === true
+    && guard.rejectsPersistentDatabase === true && guard.rejectsFallback === true && input.persistentDatabaseAccess === false;
 }
 
-export async function evaluateTest(
-  config: Config,
-  input: TestCheckInput,
-): Promise<TestCheckResult> {
+function structuredSafeRuntime(input: TestCheckInput): boolean {
+  const isolation = input.isolation;
+  const runtime = input.runtime;
+  const noPersistentStorage = runtime?.persistentStorageAccess === false && input.persistentDatabaseAccess !== true;
+  const noProduction = runtime?.productionAccess === false;
+  const isolatedResources = isolation?.ephemeralDatabase === true || (isolation?.temporaryFilesystem === true && isolation?.mockedExternalServices === true);
+  return noPersistentStorage && noProduction && isolatedResources === true;
+}
+
+function hasSafeRuntime(input: TestCheckInput): boolean { return legacySafeRuntime(input) || structuredSafeRuntime(input); }
+
+function hasExplicitPersistentTarget(input: TestCheckInput): boolean {
+  if (input.persistentDatabaseAccess === true || input.runtime?.persistentStorageAccess === true) return true;
+  const context = input.context ?? '';
+  if (input.runtimeDatabase !== undefined) return input.runtimeDatabase.connection !== 'sqlite' || input.runtimeDatabase.database !== ':memory:';
+  return /\bDB_CONNECTION\s*=\s*(?:mysql|mariadb|pgsql|sqlsrv)\b/iu.test(context)
+    || /\bDB_DATABASE\s*=\s*(?!:memory:)[^\s#]+/iu.test(context)
+    || /\b(?:mysql|mariadb|postgres(?:ql)?|sqlsrv):\/\//iu.test(context)
+    || /\b(?:production|persistent|real)\s+(?:database|db)\b/iu.test(context);
+}
+
+function customFindings(input: TestCheckInput): StaticFinding[] {
+  const findings: StaticFinding[] = [];
+  const text = inputText(input);
+  const safeRuntime = hasSafeRuntime(input);
+  // Keep the historical Laravel inputs working even when framework is omitted.
+  if (input.framework?.trim().toLowerCase() !== 'laravel') {
+    if (/\bDatabaseTruncation\b/u.test(text)) findings.push({ ruleId: 'legacy.laravel-database-truncation', category: 'database', severity: 'critical', decision: 'deny', message: 'DatabaseTruncation' });
+    if (/\bmigrate\s*:\s*fresh\b/iu.test(text)) findings.push({ ruleId: 'legacy.laravel-migrate-fresh', category: 'database', severity: 'critical', decision: 'deny', message: 'migrate:fresh' });
+    if (/\bdb\s*:\s*wipe\b/iu.test(text)) findings.push({ ruleId: 'legacy.laravel-db-wipe', category: 'database', severity: 'critical', decision: 'deny', message: 'db:wipe' });
+  }
+  if (/\bDROP\s+DATABASE\b/iu.test(text)) findings.push({ ruleId: 'legacy.drop-database', category: 'database', severity: 'critical', decision: 'deny', message: 'DROP DATABASE' });
+  if (/\b(?:RefreshDatabase|DatabaseMigrations)\b/u.test(text) && hasExplicitPersistentTarget(input) && !safeRuntime) {
+    findings.push({ ruleId: 'laravel.persistent-database-with-reset-trait', category: 'persistent-data', severity: 'critical', decision: 'deny', message: 'RefreshDatabase' });
+  } else if (/\b(?:RefreshDatabase|DatabaseMigrations)\b/u.test(text) && !safeRuntime) {
+    findings.push({ ruleId: 'framework.database-reset-isolation-unknown', category: 'environment-isolation', severity: 'medium', decision: 'review', message: 'Database-resetting test behavior is present but isolation was not confirmed.' });
+  }
+  if (hasExplicitPersistentTarget(input) && !safeRuntime) findings.push({ ruleId: 'generic.persistent-target-unknown', category: 'persistent-data', severity: 'critical', decision: 'deny', message: 'persistent database target is not confirmed as test-only' });
+  if (input.environment === 'production' || input.runtime?.productionAccess === true) findings.push({ ruleId: 'context.production-test', category: 'production-impact', severity: 'high', decision: 'review', message: 'The test may run against a production environment.' });
+  if (input.runtime?.networkAccess === true) findings.push({ ruleId: 'context.network-access', category: 'network', severity: 'medium', decision: 'review', message: 'The test has network access and external side effects were not necessarily mocked.' });
+  if (input.runtime?.credentialAccess === true) findings.push({ ruleId: 'context.credential-access', category: 'credential', severity: 'high', decision: 'review', message: 'The test may use real credentials.' });
+  if (findings.every((finding) => finding.decision !== 'deny') && !/\b(?:DROP\s+DATABASE|DROP\s+TABLE|TRUNCATE|migrate\s*:\s*fresh|db\s*:\s*wipe)\b/iu.test(text) && !safeRuntime && input.isolation === undefined && input.runtime === undefined) findings.push({ ruleId: 'generic.isolation-unknown', category: 'environment-isolation', severity: 'medium', decision: 'review', message: 'Test resource isolation was not confirmed.' });
+  return findings;
+}
+
+function toTestFindings(staticFindings: StaticFinding[], policyFindings: PolicyFinding[]): TestFinding[] {
+  return [
+    ...staticFindings.map((finding) => ({ ...finding, source: 'static' as const })),
+    ...policyFindings.map((finding) => ({ ruleId: finding.rule, source: finding.source, category: finding.category, severity: finding.severity, decision: finding.decision, message: finding.reason })),
+  ];
+}
+
+function scoring(findings: TestFinding[], dangerous: number): { risks: Partial<Record<RiskCategory, number>>; riskScore: number; categories: RiskCategory[] } {
+  const risks: Partial<Record<RiskCategory, number>> = {};
+  for (const finding of findings) risks[finding.category] = Math.max(risks[finding.category] ?? 0, SEVERITY_SCORE[finding.severity]);
+  if (dangerous > 0) risks.irreversibility = Math.max(risks.irreversibility ?? 0, dangerous);
+  return { risks, riskScore: Number(Math.max(dangerous, ...Object.values(risks), 0).toFixed(3)), categories: [...new Set(findings.map((finding) => finding.category))] };
+}
+
+function safeInput(input: TestCheckInput): TestCheckInput {
+  return { command: redact(input.command), ...(input.testCode === undefined ? {} : { testCode: redact(input.testCode) }), ...(input.diff === undefined ? {} : { diff: redact(input.diff) }), ...(input.cwd === undefined ? {} : { cwd: redact(input.cwd) }), ...(input.environment === undefined ? {} : { environment: input.environment }), ...(input.framework === undefined ? {} : { framework: input.framework }), ...(input.context === undefined ? {} : { context: redact(input.context) }), ...(input.isolation === undefined ? {} : { isolation: input.isolation }), ...(input.runtime === undefined ? {} : { runtime: input.runtime }), ...(input.runtimeDatabase === undefined ? {} : { runtimeDatabase: input.runtimeDatabase }), ...(input.configCache === undefined ? {} : { configCache: input.configCache }), ...(input.runtimeGuard === undefined ? {} : { runtimeGuard: input.runtimeGuard }), ...(input.persistentDatabaseAccess === undefined ? {} : { persistentDatabaseAccess: input.persistentDatabaseAccess }), ...(input.safetyProfilePath === undefined ? {} : { safetyProfilePath: redact(input.safetyProfilePath) }) };
+}
+
+function sharedSafetyFiles(root: string): Array<{ key: string; digest: string; bytes: number }> {
+  const candidates = ['tests/TestCase.php', 'test-safe.php', 'phpunit.xml', 'phpunit.xml.dist', 'package.json', 'pyproject.toml', 'pytest.ini', 'vitest.config.ts', 'vitest.config.js', '.jev/test-safety.json'];
+  return candidates.map((file) => fileDigest(root, file)).filter((item): item is { key: string; digest: string; bytes: number } => item !== undefined);
+}
+
+async function evaluateTestSingle(config: Config, input: TestCheckInput, targetKey = 'test'): Promise<TestCheckResult> {
   const validationError = validateInput(input);
-  const staticRisk = findStaticRisks(input);
-  const staticFindings = staticRisk.findings;
-  if (validationError !== undefined) {
-    return reviewResult(validationError, staticFindings, 'INVALID_INPUT');
-  }
-
-  const safeInput: TestCheckInput = {
-    command: redact(input.command),
-    ...(input.testCode === undefined ? {} : { testCode: redact(input.testCode) }),
-    ...(input.diff === undefined ? {} : { diff: redact(input.diff) }),
-    ...(input.context === undefined ? {} : { context: redact(input.context) }),
-    ...(input.runtimeDatabase === undefined ? {} : { runtimeDatabase: input.runtimeDatabase }),
-    ...(input.configCache === undefined ? {} : { configCache: input.configCache }),
-    ...(input.runtimeGuard === undefined ? {} : { runtimeGuard: input.runtimeGuard }),
-    ...(input.persistentDatabaseAccess === undefined ? {} : { persistentDatabaseAccess: input.persistentDatabaseAccess }),
+  const safety = assessSafetyProfile(input);
+  let policies;
+  try { policies = loadEffectiveTestPolicies(input.cwd, input.framework); } catch { return reviewResult('The test safety policy could not be loaded. Human review is required.', [], 'POLICY_ERROR'); }
+  const policyMatches = findPolicyMatches(policies, inputText(input));
+  const custom = customFindings(input);
+  const staticFindings = [...policyMatches.findings, ...custom];
+  const policyFindings = policyMatches.policyFindings;
+  const testFindings = toTestFindings(staticFindings, policyFindings);
+  const details = { policyFindings, policyVersion: policies.version, policiesApplied: policies.policies.map((policy) => policy.version), findings: testFindings, safetyProfile: safety.assessment };
+  const messages = staticFindings.map((finding) => finding.message);
+  if (validationError !== undefined) return reviewResult(validationError, messages, 'INVALID_INPUT', details);
+  const root = (() => { try { return realpathSync(resolve(input.cwd ?? process.cwd())); } catch { return resolve(input.cwd ?? process.cwd()); } })();
+  const pid = projectId(root);
+  const safe = safeInput(input);
+  const sharedFiles = sharedSafetyFiles(root);
+  const contextHash = sha256(canonicalJson({ shared: { safety: safety.jevContext, policyVersion: policies.version, policyHash: policies.hash, files: sharedFiles }, runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard }));
+  const runtimeHash = sha256(canonicalJson({ runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard, persistentDatabaseAccess: input.persistentDatabaseAccess }));
+  const fingerprint = buildFingerprint({ projectId: pid, targetType: 'test-file', targetKey, testSpecific: { command: safe.command, testCode: safe.testCode, diff: safe.diff, framework: safe.framework, environment: safe.environment, context: safe.context }, sharedContext: { safety: safety.jevContext, policyHash: policies.hash, profile: safety.assessment, files: sharedFiles }, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION });
+  const cacheKey: CacheKey = { projectId: pid, targetType: 'test-file', targetKey, fingerprint, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION };
+  let db;
+  try { db = openDatabase(); } catch { db = undefined; }
+  const staticDecision = strictestDecision(staticFindings.map((finding) => finding.decision).concat(policyFindings.map((finding) => finding.decision)));
+  const requestId = randomUUID();
+  const audit = (result: TestCheckResult, cacheStatus: 'disabled'|'miss'|'hit'|'error', jevDecision?: Decision, save = false): void => {
+    if (!db) return;
+    try { db.exec('BEGIN'); insertAudit(db, { requestId, projectId: pid, toolName: 'jev_check_test', targetType: 'test-file', targetKey, fingerprint, cacheStatus, staticDecision, jevDecision, finalDecision: result.decision, allowed: result.allowed, needsHumanReview: result.needsHumanReview, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION, reason: result.reason }); if (save) upsertCache(db, cacheKey, result.decision, result.decision === 'allow', new Date().toISOString()); db.exec('COMMIT'); } catch { try { db.exec('ROLLBACK'); } catch { /* best effort */ } logEvent('audit_persistence_error', { tool: 'jev_check_test' }); }
   };
-
-  try {
-    const response = await checkTestWithJev(config, {
-      ...safeInput,
-      staticFindings,
-    });
-    const dangerous = response.answers?.test_dangerous?.noul ?? response.answers?.command_dangerous?.noul;
-    if (dangerous === undefined) {
-      return reviewResult('Jev did not return a dangerousness score.', staticFindings, 'JEV_INVALID_RESPONSE');
-    }
-
-    if (staticRisk.blocking.length > 0 || dangerous >= 0.8) {
-      return {
-        ok: true,
-        dangerous,
-        allowed: false,
-        needsHumanReview: false,
-        decision: 'deny',
-        staticFindings,
-        reason: staticFindings.length > 0
-          ? 'Static analysis found a potentially destructive test or an unconfirmed persistent database target.'
-          : 'Jev found a high probability that the test may destroy or modify existing data.',
-        model: 'typesafe/jev',
-      };
-    }
-
-    if (!hasSufficientEnvironmentEvidence(input) || dangerous >= 0.4) {
-      return {
-        ok: true,
-        dangerous,
-        allowed: false,
-        needsHumanReview: true,
-        decision: 'review',
-        staticFindings,
-        reason: !hasSufficientEnvironmentEvidence(input)
-          ? 'The effective test database and configuration cache state were not sufficiently confirmed.'
-          : 'Jev found a moderate probability that the test may be destructive and requires human review.',
-        model: 'typesafe/jev',
-      };
-    }
-
-    return {
-      ok: true,
-      dangerous,
-      allowed: true,
-      needsHumanReview: false,
-      decision: 'allow',
-      staticFindings,
-      reason: 'The test environment is sufficiently isolated, no static destructive pattern was found, and Jev found no clear destructive risk.',
-      model: 'typesafe/jev',
-    };
-  } catch (error) {
-    if (error instanceof JevError) {
-      return reviewResult(
-        'Jev could not complete the test safety check. Human review is required before test execution.',
-        staticFindings,
-        error.code,
-      );
-    }
-    return reviewResult('An unexpected error occurred during the test safety check.', staticFindings, 'INTERNAL_ERROR');
+  if (validationError === undefined && staticDecision === 'allow' && db) {
+    try { if (lookupAllow(db, cacheKey)) { const result: TestCheckResult = { ...details, ok: true, dangerous: 0, allowed: true, needsHumanReview: false, decision: 'allow', staticFindings: messages, model: 'typesafe/jev', reason: 'An unchanged allow decision was reused from the Safety Fingerprint Cache.' }; audit(result, 'hit'); return result; } } catch { /* cache is unavailable; continue with Jev */ }
   }
+  try {
+    const response = await checkTestWithJev(config, { ...safe, safetyProfile: safety.assessment, safetyProfileContext: safety.jevContext, staticFindings: messages });
+    const dangerous = response.answers?.test_dangerous?.noul ?? response.answers?.command_dangerous?.noul;
+    if (dangerous === undefined) return reviewResult('Jev did not return a dangerousness score.', messages, 'JEV_INVALID_RESPONSE', details);
+    const scored = scoring(testFindings, dangerous);
+    const staticDecision = strictestDecision(staticFindings.map((finding) => finding.decision).concat(policyFindings.map((finding) => finding.decision)));
+    const jevDecision: Decision = dangerous >= 0.8 ? 'deny' : dangerous >= 0.4 ? 'review' : 'allow';
+    const profileDecision: Decision = safety.assessment.status === 'verified' ? 'allow' : safety.assessment.status === 'absent' ? (hasSafeRuntime(input) ? 'allow' : 'review') : 'review';
+    const decision = strictestDecision([staticDecision, jevDecision, profileDecision]);
+    const common = { ...details, ok: true, dangerous, ...scored, staticFindings: messages, model: 'typesafe/jev' as const };
+    if (decision === 'deny') { const result = { ...common, allowed: false, needsHumanReview: false, decision, reason: 'Static or contextual analysis found a potentially destructive test operation or persistent resource target.' }; audit(result, 'miss', jevDecision, false); return result; }
+    if (decision === 'review') {
+      const reason = safety.assessment.status === 'changed' || safety.assessment.status === 'unverified' || safety.assessment.status === 'invalid'
+        ? 'The Safety Profile is not verified for the current files or runtime context.'
+        : 'Test isolation or external side-effect safety could not be sufficiently confirmed.';
+      const result = { ...common, allowed: false, needsHumanReview: true, decision, reason }; audit(result, 'miss', jevDecision, false); return result;
+    }
+    const result = { ...common, allowed: true, needsHumanReview: false, decision, reason: safety.assessment.status === 'verified'
+      ? 'The verified Safety Profile matches the current files and runtime context, and no new risk was detected.'
+      : 'The test appears isolated, no destructive static finding was detected, and Jev found no clear high-risk behavior.' }; audit(result, 'miss', jevDecision, true); return result;
+  } catch (error) {
+    if (error instanceof JevError) { const result = reviewResult('Jev could not complete the test safety check. Human review is required before test execution.', messages, error.code, details); audit(result, 'miss'); return result; }
+    const result = reviewResult('An unexpected error occurred during the test safety check.', messages, 'INTERNAL_ERROR', details); audit(result, 'error'); return result;
+  }
+}
+
+export async function evaluateTest(config: Config, input: TestCheckInput): Promise<TestCheckResult> {
+  if (!input.testFiles || input.testFiles.length === 0) return evaluateTestSingle(config, input);
+  const results: TestCheckResult[] = [];
+  for (const file of input.testFiles) {
+    const root = resolve(input.cwd ?? process.cwd());
+    let content: string;
+    try { content = readFileSync(resolve(root, file), 'utf8'); } catch { results.push(reviewResult(`Unable to read test file: ${file}`, [], 'TEST_FILE_ERROR')); continue; }
+    results.push(await evaluateTestSingle(config, { ...input, testCode: content }, relativeTarget(root, file) ?? file.replaceAll('\\', '/')));
+  }
+  const decision = strictestDecision(results.map((result) => result.decision));
+  const first = results[0] ?? reviewResult('No test files were supplied.', [], 'INVALID_INPUT');
+  return { ...first, ok: results.every((result) => result.ok), allowed: decision === 'allow' && results.every((result) => result.allowed), needsHumanReview: results.some((result) => result.needsHumanReview), decision, reason: results.length === 1 ? first.reason : `Evaluated ${results.length} test files independently; aggregate decision is ${decision}.` };
 }

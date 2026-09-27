@@ -1,0 +1,13 @@
+{
+  "version": "1",
+  "rules": [
+    { "id": "test.drop-database", "pattern": "\\bDROP\\s+(?:DATABASE|SCHEMA|TABLE)\\b", "category": "destructive-operation", "severity": "critical", "decision": "deny", "message": "DROP DATABASE/TABLE" },
+    { "id": "test.truncate", "pattern": "\\bTRUNCATE\\b", "category": "persistent-data", "severity": "critical", "decision": "deny", "message": "TRUNCATE" },
+    { "id": "test.unrestricted-delete", "pattern": "\\bDELETE\\s+FROM\\s+[A-Za-z0-9_`\".]+\\s*(?:;|$)", "category": "persistent-data", "severity": "critical", "decision": "deny", "message": "The test may perform an unrestricted database delete." },
+    { "id": "test.recursive-delete", "pattern": "(?:rm|rmdir|Remove-Item)\\b[^\\n]*(?:-rf|-fr|--recursive|\\s-R\\b|\\s-Recurse\\b)", "category": "filesystem", "severity": "critical", "decision": "deny", "message": "The test may recursively delete filesystem data." },
+    { "id": "test.force-delete", "pattern": "(?:rm|rmdir|Remove-Item)\\b[^\\n]*(?:--force|\\s-f\\b|\\s-Force\\b)", "category": "destructive-operation", "severity": "high", "decision": "deny", "message": "The test may force-delete files or directories." },
+    { "id": "test.deployment-command", "pattern": "\\b(?:terraform\\s+(?:apply|destroy)|kubectl\\s+delete|helm\\s+uninstall|docker\\s+push|npm\\s+publish)\\b", "category": "production-impact", "severity": "critical", "decision": "deny", "message": "The test invokes a deployment or resource mutation command." },
+    { "id": "test.production-endpoint", "pattern": "https?://(?:api\\.)?(?:prod(?:uction)?|live)\\.[^\\s/]+", "category": "production-impact", "severity": "critical", "decision": "deny", "message": "The test references a production endpoint." },
+    { "id": "test.cloud-delete", "pattern": "\\b(?:aws|gcloud|az)\\b[^\\n]*(?:delete|destroy|terminate|remove)\\b", "category": "external-service", "severity": "critical", "decision": "deny", "message": "The test may delete a cloud resource." }
+  ]
+}

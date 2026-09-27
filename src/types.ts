@@ -3,9 +3,15 @@ export type Decision = 'allow' | 'review' | 'deny';
 export type CommandEnvironment = 'development' | 'testing' | 'staging' | 'production' | 'unknown';
 
 export type RiskCategory =
+  | 'persistent-data'
   | 'data-loss'
   | 'filesystem'
   | 'database'
+  | 'external-service'
+  | 'network'
+  | 'environment-isolation'
+  | 'configuration'
+  | 'destructive-operation'
   | 'git'
   | 'availability'
   | 'production-impact'
@@ -64,11 +70,47 @@ export interface TestCheckInput {
   command: string;
   testCode?: string;
   diff?: string;
+  cwd?: string;
+  environment?: CommandEnvironment;
+  framework?: string;
   context?: string;
+  isolation?: TestIsolationEvidence;
+  runtime?: TestRuntimeEvidence;
+  /** @deprecated Use runtime/isolation. Kept for Laravel compatibility. */
   runtimeDatabase?: RuntimeDatabaseEvidence;
+  /** @deprecated Use context/runtime. Kept for Laravel compatibility. */
   configCache?: ConfigCacheEvidence;
+  /** @deprecated Use runtime/isolation. Kept for Laravel compatibility. */
   runtimeGuard?: RuntimeGuardEvidence;
+  /** @deprecated Use runtime.persistentStorageAccess. */
   persistentDatabaseAccess?: boolean;
+  /** Automatically loads .jev/test-safety.json below cwd when present. */
+  safetyProfilePath?: string;
+  /** Optional test files. Each file is evaluated and cached independently. */
+  testFiles?: string[];
+}
+
+export interface TestIsolationEvidence {
+  ephemeralDatabase?: boolean | undefined;
+  temporaryFilesystem?: boolean | undefined;
+  mockedExternalServices?: boolean | undefined;
+  isolatedWorkspace?: boolean | undefined;
+}
+
+export interface TestRuntimeEvidence {
+  productionAccess?: boolean | undefined;
+  persistentStorageAccess?: boolean | undefined;
+  networkAccess?: boolean | undefined;
+  credentialAccess?: boolean | undefined;
+}
+
+export interface TestFinding {
+  ruleId: string;
+  source: PolicySource | 'static';
+  category: RiskCategory;
+  severity: StaticFinding['severity'];
+  decision: Decision;
+  message: string;
 }
 
 export interface RuntimeDatabaseEvidence {
@@ -96,9 +138,28 @@ export interface TestCheckResult {
   needsHumanReview: boolean;
   decision: Decision;
   staticFindings: string[];
+  findings?: TestFinding[];
+  categories?: RiskCategory[];
+  riskScore?: number | null;
+  risks?: Partial<Record<RiskCategory, number>>;
+  policyFindings?: PolicyFinding[];
+  policyVersion?: string;
+  policiesApplied?: string[];
   reason: string;
   model: 'typesafe/jev';
   errorCode?: string;
+  safetyProfile?: SafetyProfileAssessment;
+}
+
+export interface SafetyProfileAssessment {
+  status: 'absent' | 'invalid' | 'unverified' | 'verified' | 'changed';
+  profilePath?: string;
+  profileName?: string;
+  fingerprintMatched: boolean;
+  runtimeMatched: boolean;
+  profileDigest?: string;
+  safetyFingerprint?: string;
+  reason?: string;
 }
 
 export interface JevNoulAnswer {

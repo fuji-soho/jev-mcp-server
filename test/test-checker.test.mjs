@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test, afterEach } from 'node:test';
 import { evaluateTest } from '../dist/test-checker.js';
+import { verifySafetyProfile } from '../dist/test-safety-profile.js';
 
 const config = {
   accountId: 'test-account',
@@ -48,6 +52,73 @@ const safeRuntimeEvidence = {
 
 afterEach(() => {
   delete globalThis.fetch;
+  delete process.env.JEV_TEST_SAFETY_STATE_PATH;
+});
+
+function profileProject() {
+  const cwd = mkdtempSync('/tmp/jev-safety-');
+  mkdirSync(join(cwd, '.jev'));
+  writeFileSync(join(cwd, 'package.json'), '{"private":true}\n');
+  writeFileSync(join(cwd, '.jev', 'test-safety.json'), JSON.stringify({
+    version: 1,
+    name: 'vitest-isolated',
+    framework: 'vitest',
+    runner: { commands: ['npm test'], files: ['package.json'] },
+    safetyFiles: ['package.json'],
+    expected: {
+      environment: 'testing',
+      isolation: { temporaryFilesystem: true, mockedExternalServices: true },
+      runtime: { productionAccess: false, persistentStorageAccess: false, networkAccess: false },
+    },
+  }));
+  return cwd;
+}
+
+function profileInput(cwd) {
+  return {
+    command: 'npm test', cwd, framework: 'vitest', environment: 'testing',
+    isolation: { temporaryFilesystem: true, mockedExternalServices: true },
+    runtime: { productionAccess: false, persistentStorageAccess: false, networkAccess: false },
+  };
+}
+
+test('verified Safety Profile allows an unchanged isolated test', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = profileProject();
+  const statePath = join(cwd, 'state.json');
+  process.env.JEV_TEST_SAFETY_STATE_PATH = statePath;
+  const input = profileInput(cwd);
+  const verified = verifySafetyProfile(input);
+  assert.equal(verified.status, 'verified');
+  const result = await evaluateTest(config, input);
+  assert.equal(result.decision, 'allow');
+  assert.equal(result.safetyProfile?.status, 'verified');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('changed Safety Profile files require review', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = profileProject();
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+  const input = profileInput(cwd);
+  verifySafetyProfile(input);
+  writeFileSync(join(cwd, 'package.json'), '{"private":false}\n');
+  const result = await evaluateTest(config, input);
+  assert.equal(result.decision, 'review');
+  assert.equal(result.safetyProfile?.status, 'changed');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('verified Safety Profile never overrides a destructive finding', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = profileProject();
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+  const input = profileInput(cwd);
+  verifySafetyProfile(input);
+  const result = await evaluateTest(config, { ...input, command: 'npm test && DROP DATABASE app' });
+  assert.equal(result.decision, 'deny');
+  assert.equal(result.allowed, false);
+  rmSync(cwd, { recursive: true, force: true });
 });
 
 test('RefreshDatabase with MySQL/MariaDB is denied', async () => {
@@ -194,4 +265,92 @@ test('secret values are redacted before sending state to Jev', async () => {
   assert.equal(serialized.includes('super-secret'), false);
   assert.equal(serialized.includes('another-secret'), false);
   assert.equal(serialized.includes('secret-token'), false);
+});
+
+test('Vitest with mocked services and isolated resources can be allowed', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const result = await evaluateTest(config, {
+    command: 'npm test',
+    framework: 'vitest',
+    environment: 'testing',
+    isolation: { temporaryFilesystem: true, mockedExternalServices: true },
+    runtime: { productionAccess: false, persistentStorageAccess: false, networkAccess: false },
+  });
+  assert.equal(result.decision, 'allow');
+  assert.equal(result.allowed, true);
+});
+
+test('Vitest production API mutation is denied by static policy', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const result = await evaluateTest(config, {
+    command: 'npm test',
+    framework: 'vitest',
+    testCode: "await fetch('https://api.production.example/orders', { method: 'POST' })",
+    runtime: { productionAccess: true, networkAccess: true },
+  });
+  assert.equal(result.decision, 'deny');
+  assert.equal(result.allowed, false);
+  assert.ok(result.staticFindings.some((finding) => finding.includes('production')));
+});
+
+test('pytest with an ephemeral database can be allowed', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const result = await evaluateTest(config, {
+    command: 'pytest',
+    framework: 'pytest',
+    environment: 'testing',
+    isolation: { ephemeralDatabase: true },
+    runtime: { productionAccess: false, persistentStorageAccess: false },
+  });
+  assert.equal(result.decision, 'allow');
+});
+
+test('pytest truncating a persistent database is denied', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const result = await evaluateTest(config, {
+    command: 'pytest',
+    framework: 'pytest',
+    testCode: 'connection.execute("TRUNCATE users")',
+    runtime: { persistentStorageAccess: true },
+  });
+  assert.equal(result.decision, 'deny');
+  assert.ok(result.staticFindings.includes('TRUNCATE'));
+});
+
+test('framework omission with no isolation evidence requires review', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const result = await evaluateTest(config, { command: 'go test ./...' });
+  assert.equal(result.decision, 'review');
+  assert.equal(result.needsHumanReview, true);
+});
+
+test('evaluates and caches multiple test files independently', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  const cwd = mkdtempSync('/tmp/jev-files-');
+  mkdirSync(join(cwd, 'tests'));
+  for (const file of ['Test1.php', 'Test2.php', 'Test3.php']) writeFileSync(join(cwd, 'tests', file), `<?php // ${file}\n`);
+  const input = { command: 'vitest', cwd, framework: 'vitest', environment: 'testing', testFiles: ['tests/Test1.php', 'tests/Test2.php', 'tests/Test3.php'], isolation: { ephemeralDatabase: true, mockedExternalServices: true }, runtime: { productionAccess: false, persistentStorageAccess: false, networkAccess: false } };
+  await evaluateTest(config, input);
+  assert.equal(calls, 3);
+  writeFileSync(join(cwd, 'tests', 'Test4.php'), '<?php // Test4\n');
+  const second = await evaluateTest(config, { ...input, testFiles: [...input.testFiles, 'tests/Test4.php'] });
+  assert.equal(calls, 4);
+  assert.equal(second.decision, 'allow');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('shared safety context changes invalidate dependent test files', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  const cwd = mkdtempSync('/tmp/jev-shared-');
+  mkdirSync(join(cwd, 'tests'));
+  for (const file of ['Test1.php', 'Test2.php', 'Test3.php']) writeFileSync(join(cwd, 'tests', file), `<?php // ${file}\n`);
+  const input = { command: 'vitest', cwd, framework: 'vitest', environment: 'testing', testFiles: ['tests/Test1.php', 'tests/Test2.php', 'tests/Test3.php'], isolation: { ephemeralDatabase: true, mockedExternalServices: true }, runtime: { productionAccess: false, persistentStorageAccess: false, networkAccess: false } };
+  await evaluateTest(config, input);
+  assert.equal(calls, 3);
+  writeFileSync(join(cwd, 'tests', 'TestCase.php'), '<?php // changed shared context\n');
+  await evaluateTest(config, input);
+  assert.equal(calls, 6);
+  rmSync(cwd, { recursive: true, force: true });
 });

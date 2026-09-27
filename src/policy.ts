@@ -1,4 +1,5 @@
 import { lstatSync, readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,18 +27,24 @@ export interface LoadedPolicyRule {
   source: PolicySource; matcher: Matcher;
 }
 export interface LoadedPolicy { version: string; rules: LoadedPolicyRule[]; }
-export interface EffectivePolicies { policies: LoadedPolicy[]; version: string; }
+export interface EffectivePolicies { policies: LoadedPolicy[]; version: string; hash: string; }
 
 export class PolicyLoadError extends Error {
   readonly code = 'POLICY_ERROR';
   constructor(message: string) { super(message); this.name = 'PolicyLoadError'; }
 }
 
-function policyPath(): string { return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'policies', 'default.json'); }
+function policyRoot(): string { return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'policies'); }
+function policyPath(): string { return join(policyRoot(), 'default.json'); }
+function testPolicyPath(name: string): string { return join(policyRoot(), 'tests', `${name}.json`); }
+function fileHash(path: string): string {
+  try { return createHash('sha256').update(readFileSync(path)).digest('hex'); } catch { return `missing:${path}`; }
+}
+function policyHash(paths: string[]): string { return createHash('sha256').update(paths.map((path) => `${path}\0${fileHash(path)}\0`).sort().join('')).digest('hex'); }
 function isDecision(value: unknown): value is Decision { return value === 'allow' || value === 'review' || value === 'deny'; }
 function isSeverity(value: unknown): value is Severity { return value === 'low' || value === 'medium' || value === 'high' || value === 'critical'; }
 function isRiskCategory(value: unknown): value is RiskCategory {
-  return typeof value === 'string' && ['data-loss', 'filesystem', 'database', 'git', 'availability', 'production-impact', 'security', 'credential', 'irreversibility', 'scope', 'deployment', 'dependencies'].includes(value);
+  return typeof value === 'string' && ['persistent-data', 'data-loss', 'filesystem', 'database', 'external-service', 'network', 'environment-isolation', 'configuration', 'destructive-operation', 'git', 'availability', 'production-impact', 'security', 'credential', 'irreversibility', 'scope', 'deployment', 'dependencies'].includes(value);
 }
 function validateLimit(name: string, value: string, label: string): void {
   const max = label === 'reason' ? MAX_REASON_LENGTH : MAX_MATCH_LENGTH;
@@ -92,8 +99,8 @@ function externalPolicy(value: unknown, source: Exclude<PolicySource, 'builtin'>
   return { version: `${source}:1`, rules };
 }
 
-export function loadDefaultPolicy(): LoadedPolicy {
-  const parsed = readJsonFile(policyPath(), true);
+function loadBuiltinPolicyAt(path: string, versionPrefix: string): LoadedPolicy {
+  const parsed = readJsonFile(path, true);
   if (typeof parsed !== 'object' || parsed === null) throw new PolicyLoadError('The default safety policy has an invalid shape.');
   const candidate = parsed as Record<string, unknown>;
   if (typeof candidate.version !== 'string' || !Array.isArray(candidate.rules) || candidate.rules.length > MAX_RULES) throw new PolicyLoadError('The default safety policy has an invalid shape.');
@@ -106,7 +113,25 @@ export function loadDefaultPolicy(): LoadedPolicy {
       return { name: item.id, category: item.category, severity: item.severity, decision: item.decision, reason: item.message, source: 'builtin' as const, matcher: { test: (text: string) => { regex.lastIndex = 0; return regex.test(text); } } };
     } catch { throw new PolicyLoadError('The default safety policy contains an invalid regular expression.'); }
   });
-  return { version: `builtin:${candidate.version}`, rules };
+  return { version: `${versionPrefix}:${candidate.version}`, rules };
+}
+
+export function loadDefaultPolicy(): LoadedPolicy {
+  return loadBuiltinPolicyAt(policyPath(), 'builtin');
+}
+
+export function loadTestPolicies(framework?: string): LoadedPolicy[] {
+  const policies = [loadBuiltinPolicyAt(testPolicyPath('generic'), 'builtin:test:generic')];
+  const normalized = framework?.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  if (normalized !== undefined && normalized !== '' && normalized !== 'generic') {
+    const path = testPolicyPath(normalized);
+    try {
+      policies.push(loadBuiltinPolicyAt(path, `builtin:test:${normalized}`));
+    } catch (error) {
+      if (!(error instanceof PolicyLoadError) || !String(error.message).includes(path)) throw error;
+    }
+  }
+  return policies;
 }
 
 function configDirectory(environment: NodeJS.ProcessEnv, homeDirectory: string): string {
@@ -131,7 +156,34 @@ export function loadEffectivePolicies(cwd: string | undefined, environment: Node
       // A caller may provide a future/nonexistent working directory. There is no policy to load yet.
     }
   }
-  return { policies, version: policies.map((policy) => policy.version).join(';') };
+  const paths = [policyPath(), resolveUserPolicyPath(environment)];
+  if (cwd !== undefined) paths.push(resolveProjectPolicyPath(cwd));
+  return { policies, version: policies.map((policy) => policy.version).join(';'), hash: policyHash(paths) };
+}
+
+export function loadEffectiveTestPolicies(
+  cwd: string | undefined,
+  framework: string | undefined,
+  environment: NodeJS.ProcessEnv = process.env,
+): EffectivePolicies {
+  const policies: LoadedPolicy[] = [...loadTestPolicies(framework)];
+  const user = readJsonFile(resolveUserPolicyPath(environment), false);
+  if (user !== undefined) policies.push(externalPolicy(user, 'user'));
+  if (cwd !== undefined) {
+    try {
+      if (!statSync(resolve(cwd)).isDirectory()) throw new PolicyLoadError('Project cwd is not a directory.');
+      const project = readJsonFile(resolveProjectPolicyPath(cwd), false);
+      if (project !== undefined) policies.push(externalPolicy(project, 'project'));
+    } catch (error) {
+      if (error instanceof PolicyLoadError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new PolicyLoadError('Project cwd could not be inspected.');
+    }
+  }
+  const normalized = framework?.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const paths = [policyPath(), testPolicyPath('generic'), resolveUserPolicyPath(environment)];
+  if (normalized !== undefined && normalized !== '' && normalized !== 'generic') paths.push(testPolicyPath(normalized));
+  if (cwd !== undefined) paths.push(resolveProjectPolicyPath(cwd));
+  return { policies, version: policies.map((policy) => policy.version).join(';'), hash: policyHash(paths) };
 }
 
 export function findPolicyMatches(policies: EffectivePolicies, text: string): { findings: StaticFinding[]; policyFindings: PolicyFinding[] } {

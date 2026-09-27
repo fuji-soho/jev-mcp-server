@@ -1,0 +1,11 @@
+import type { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
+import { sanitizeAuditSummary, sanitizeAuditText } from '../audit-sanitizer.js';
+import type { Decision } from '../types.js';
+
+export interface AuditRecord { requestId?: string | undefined; projectId?: string | undefined; toolName: string; targetType?: string | undefined; targetKey?: string | undefined; fingerprint?: string | undefined; cacheStatus: 'disabled'|'miss'|'hit'|'stale'|'error'; staticDecision?: Decision | undefined; jevDecision?: Decision | undefined; finalDecision: Decision; allowed: boolean; needsHumanReview: boolean; policyHash?: string | undefined; contextHash?: string | undefined; safetyProfileHash?: string | undefined; runtimeHash?: string | undefined; modelVersion?: string | undefined; evaluatorVersion?: string | undefined; reason?: string | undefined; summary?: string | undefined; executionStatus?: string | undefined; }
+
+export function insertAudit(db: DatabaseSync, record: AuditRecord): void {
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO audit_log(timestamp,request_id,project_id,tool_name,target_type,target_key,fingerprint,cache_status,static_decision,jev_decision,final_decision,allowed,needs_human_review,policy_hash,context_hash,safety_profile_hash,runtime_hash,model_version,evaluator_version,reason,summary,execution_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(now, record.requestId ?? randomUUID(), record.projectId ?? null, record.toolName, record.targetType ?? null, record.targetKey ?? null, record.fingerprint ?? null, record.cacheStatus, record.staticDecision ?? null, record.jevDecision ?? null, record.finalDecision, record.allowed ? 1 : 0, record.needsHumanReview ? 1 : 0, record.policyHash ?? null, record.contextHash ?? null, record.safetyProfileHash ?? null, record.runtimeHash ?? null, record.modelVersion ?? null, record.evaluatorVersion ?? null, sanitizeAuditText(record.reason), sanitizeAuditSummary(record.summary), sanitizeAuditSummary(record.executionStatus), now);
+}
