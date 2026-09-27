@@ -5,6 +5,7 @@ import { test, afterEach } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase, resetDatabaseForTests } from '../dist/storage/sqlite.js';
 import { lookupAllow, upsertCache } from '../dist/storage/fingerprint-cache.js';
+import { createOrGetHumanReview, getHumanReview, lookupApprovedHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { insertAudit } from '../dist/storage/audit-log.js';
 import { sanitizeAuditText } from '../dist/audit-sanitizer.js';
 
@@ -16,8 +17,8 @@ function key() { return { projectId: 'sha256:project', targetType: 'test-file', 
 
 test('creates the cache directory, schema, and secure file permissions', () => {
   const path = databasePath(); const db = openDatabase(path);
-  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'fingerprint_cache', 'schema_meta']);
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '1');
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'fingerprint_cache', 'human_reviews', 'schema_meta']);
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '3');
 });
 
 test('stores and looks up reusable allow entries, but not review or deny', () => {
@@ -48,4 +49,31 @@ test('rejects a newer schema without deleting the database', () => {
 test('does not recreate a corrupt database automatically', () => {
   const path = databasePath(); writeFileSync(path, 'not sqlite', 'utf8');
   assert.throws(() => openDatabase(path));
+});
+
+test('stores, approves, rejects, and matches Human Reviews by every safety key', () => {
+  const db = openDatabase(databasePath());
+  const key = {
+    projectId: 'sha256:project', targetType: 'test-file', targetKey: 'tests/Test1.php', fingerprint: 'sha256:fingerprint',
+    commandHash: 'sha256:command', testFilesHash: 'sha256:files', cwdHash: 'sha256:cwd', policyHash: 'sha256:policy',
+    contextHash: 'sha256:context', safetyProfileHash: 'sha256:profile', runtimeHash: 'sha256:runtime',
+  };
+  const created = createOrGetHumanReview(db, key, '2026-09-27T00:00:00.000Z', '2026-09-27T01:00:00.000Z');
+  assert.match(created.reviewId, /^rev_/u);
+  assert.equal(created.status, 'pending');
+  const approved = transitionHumanReview(db, created.reviewId, 'approve', '2026-09-27T00:10:00.000Z');
+  assert.equal(approved.status, 'approved');
+  assert.ok(lookupApprovedHumanReview(db, key, '2026-09-27T00:20:00.000Z'));
+  assert.equal(lookupApprovedHumanReview(db, { ...key, commandHash: 'sha256:changed' }, '2026-09-27T00:20:00.000Z'), undefined);
+  assert.throws(() => transitionHumanReview(db, created.reviewId, 'reject', '2026-09-27T00:20:00.000Z'), /not pending/u);
+
+  const rejected = createOrGetHumanReview(db, { ...key, targetKey: 'tests/Test2.php', fingerprint: 'sha256:other' }, '2026-09-27T00:00:00.000Z');
+  assert.equal(transitionHumanReview(db, rejected.reviewId, 'reject', '2026-09-27T00:10:00.000Z').status, 'rejected');
+  assert.throws(() => transitionHumanReview(db, rejected.reviewId, 'approve', '2026-09-27T00:20:00.000Z'), /not pending/u);
+  const replacement = createOrGetHumanReview(db, { ...key, targetKey: 'tests/Test2.php', fingerprint: 'sha256:other' }, '2026-09-27T00:30:00.000Z');
+  assert.notEqual(replacement.reviewId, rejected.reviewId);
+  assert.equal(replacement.status, 'pending');
+  assert.equal(getHumanReview(db, 'rev_missing'), undefined);
+  assert.throws(() => transitionHumanReview(db, 'rev_missing', 'approve', '2026-09-27T00:20:00.000Z'), /Unknown review_id/u);
+  assert.equal(lookupApprovedHumanReview(db, { ...key, projectId: 'sha256:other-project' }, '2026-09-27T00:20:00.000Z'), undefined);
 });

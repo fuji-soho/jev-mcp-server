@@ -9,6 +9,7 @@ import { resolve } from 'node:path';
 import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
+import { createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
 import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, MODEL_VERSION, projectId, relativeTarget, sha256 } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 
@@ -18,6 +19,7 @@ const MAX_DIFF_LENGTH = 64_000;
 const MAX_CONTEXT_LENGTH = 32_000;
 const MAX_FIELD_LENGTH = 4_000;
 const SEVERITY_SCORE = { low: 0.25, medium: 0.5, high: 0.8, critical: 1 } as const;
+const HUMAN_REVIEW_TTL_SECONDS = 60 * 60;
 
 function reviewResult(reason: string, staticFindings: string[] = [], errorCode?: string, details: Partial<TestCheckResult> = {}): TestCheckResult {
   return { ok: false, dangerous: null, allowed: false, needsHumanReview: true, decision: 'review', staticFindings, reason, model: 'typesafe/jev', ...details, ...(errorCode === undefined ? {} : { errorCode }) };
@@ -143,6 +145,12 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const runtimeHash = sha256(canonicalJson({ runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard, persistentDatabaseAccess: input.persistentDatabaseAccess }));
   const fingerprint = buildFingerprint({ projectId: pid, targetType: 'test-file', targetKey, testSpecific: { command: safe.command, testCode: safe.testCode, diff: safe.diff, framework: safe.framework, environment: safe.environment, context: safe.context }, sharedContext: { safety: safety.jevContext, policyHash: policies.hash, profile: safety.assessment, files: sharedFiles }, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION });
   const cacheKey: CacheKey = { projectId: pid, targetType: 'test-file', targetKey, fingerprint, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION };
+  const humanReviewKey: HumanReviewKey = {
+    projectId: pid, targetType: 'test-file', targetKey, fingerprint,
+    commandHash: sha256(safe.command), testFilesHash: sha256(canonicalJson([targetKey])), cwdHash: sha256(root),
+    policyHash: policies.hash, contextHash, runtimeHash,
+    ...(safety.assessment.profileDigest === undefined ? {} : { safetyProfileHash: safety.assessment.profileDigest }),
+  };
   let db;
   try { db = openDatabase(); } catch { db = undefined; }
   const staticDecision = strictestDecision(staticFindings.map((finding) => finding.decision).concat(policyFindings.map((finding) => finding.decision)));
@@ -150,6 +158,18 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const audit = (result: TestCheckResult, cacheStatus: 'disabled'|'miss'|'hit'|'error', jevDecision?: Decision, save = false): void => {
     if (!db) return;
     try { db.exec('BEGIN'); insertAudit(db, { requestId, projectId: pid, toolName: 'jev_check_test', targetType: 'test-file', targetKey, fingerprint, cacheStatus, staticDecision, jevDecision, finalDecision: result.decision, allowed: result.allowed, needsHumanReview: result.needsHumanReview, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion: MODEL_VERSION, evaluatorVersion: EVALUATOR_VERSION, reason: result.reason }); if (save) upsertCache(db, cacheKey, result.decision, result.decision === 'allow', new Date().toISOString()); db.exec('COMMIT'); } catch { try { db.exec('ROLLBACK'); } catch { /* best effort */ } logEvent('audit_persistence_error', { tool: 'jev_check_test' }); }
+  };
+  const issueReview = (result: TestCheckResult): TestCheckResult => {
+    if (!db) return result;
+    try {
+      const now = new Date();
+      const expires = new Date(now.getTime() + HUMAN_REVIEW_TTL_SECONDS * 1000).toISOString();
+      const review = createOrGetHumanReview(db, humanReviewKey, now.toISOString(), expires);
+      return { ...result, reviewId: review.reviewId };
+    } catch {
+      logEvent('human_review_persistence_error', { tool: 'jev_check_test' });
+      return result;
+    }
   };
   if (validationError === undefined && staticDecision === 'allow' && db) {
     try { if (lookupAllow(db, cacheKey)) { const result: TestCheckResult = { ...details, ok: true, dangerous: 0, allowed: true, needsHumanReview: false, decision: 'allow', staticFindings: messages, model: 'typesafe/jev', reason: 'An unchanged allow decision was reused from the Safety Fingerprint Cache.' }; audit(result, 'hit'); return result; } } catch { /* cache is unavailable; continue with Jev */ }
@@ -169,7 +189,19 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
       const reason = safety.assessment.status === 'changed' || safety.assessment.status === 'unverified' || safety.assessment.status === 'invalid'
         ? 'The Safety Profile is not verified for the current files or runtime context.'
         : 'Test isolation or external side-effect safety could not be sufficiently confirmed.';
-      const result = { ...common, allowed: false, needsHumanReview: true, decision, reason }; audit(result, 'miss', jevDecision, false); return result;
+      const pendingResult = { ...common, allowed: false, needsHumanReview: true, decision, reason };
+      if (db) {
+        const approved = lookupApprovedHumanReview(db, humanReviewKey, new Date().toISOString());
+        if (approved) {
+          const result = { ...common, allowed: true, needsHumanReview: false, decision: 'allow' as const, reason: 'A valid Human Approval matches the current Safety Fingerprint and all safety context.' };
+          markHumanReviewUsed(db, approved.reviewId, new Date().toISOString());
+          audit(result, 'miss', jevDecision, true);
+          return result;
+        }
+      }
+      const result = issueReview(pendingResult);
+      audit(result, 'miss', jevDecision, false);
+      return result;
     }
     const result = { ...common, allowed: true, needsHumanReview: false, decision, reason: safety.assessment.status === 'verified'
       ? 'The verified Safety Profile matches the current files and runtime context, and no new risk was detected.'
@@ -191,5 +223,11 @@ export async function evaluateTest(config: Config, input: TestCheckInput): Promi
   }
   const decision = strictestDecision(results.map((result) => result.decision));
   const first = results[0] ?? reviewResult('No test files were supplied.', [], 'INVALID_INPUT');
-  return { ...first, ok: results.every((result) => result.ok), allowed: decision === 'allow' && results.every((result) => result.allowed), needsHumanReview: results.some((result) => result.needsHumanReview), decision, reason: results.length === 1 ? first.reason : `Evaluated ${results.length} test files independently; aggregate decision is ${decision}.` };
+  const reviewIds = results.flatMap((result) => result.reviewId === undefined ? [] : [result.reviewId]);
+  return {
+    ...first, ok: results.every((result) => result.ok), allowed: decision === 'allow' && results.every((result) => result.allowed),
+    needsHumanReview: results.some((result) => result.needsHumanReview), decision,
+    reason: results.length === 1 ? first.reason : `Evaluated ${results.length} test files independently; aggregate decision is ${decision}.`,
+    ...(reviewIds.length === 0 ? {} : { reviewIds, ...(reviewIds.length === 1 ? { reviewId: reviewIds[0] } : {}) }),
+  };
 }

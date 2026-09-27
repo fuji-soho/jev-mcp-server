@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { test, afterEach } from 'node:test';
 import { evaluateTest } from '../dist/test-checker.js';
 import { verifySafetyProfile } from '../dist/test-safety-profile.js';
+import { openDatabase } from '../dist/storage/sqlite.js';
+import { transitionHumanReview } from '../dist/storage/human-review.js';
 
 const config = {
   accountId: 'test-account',
@@ -179,6 +181,96 @@ test('php artisan test without database evidence requires human review', async (
   assert.equal(result.allowed, false);
   assert.equal(result.needsHumanReview, true);
   assert.equal(result.decision, 'review');
+});
+
+test('review approval allows only the unchanged Safety Fingerprint', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const input = { command: 'php artisan test --filter=HumanReviewApprovalTest' };
+  const first = await evaluateTest(config, input);
+  assert.equal(first.decision, 'review');
+  assert.ok(first.reviewId);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+  const approved = await evaluateTest(config, input);
+  assert.equal(approved.decision, 'allow');
+  assert.equal(approved.allowed, true);
+  const changed = await evaluateTest(config, { ...input, command: 'php artisan test --filter=HumanReviewApprovalTestChanged' });
+  assert.equal(changed.decision, 'review');
+  assert.notEqual(changed.reviewId, first.reviewId);
+});
+
+test('rejected review cannot become allow', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const input = { command: 'php artisan test --filter=HumanReviewRejectTest' };
+  const first = await evaluateTest(config, input);
+  assert.ok(first.reviewId);
+  transitionHumanReview(openDatabase(), first.reviewId, 'reject', new Date().toISOString());
+  const second = await evaluateTest(config, input);
+  assert.equal(second.decision, 'review');
+  assert.equal(second.allowed, false);
+});
+
+test('Human Approval cannot override a later deny', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const input = { command: 'php artisan test --filter=HumanReviewThenDenyTest' };
+  const first = await evaluateTest(config, input);
+  assert.ok(first.reviewId);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+  const denied = await evaluateTest(config, { ...input, command: 'php artisan test --filter=HumanReviewThenDenyTest && DROP DATABASE app' });
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.allowed, false);
+});
+
+test('changing a supplied test file invalidates its Human Approval', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = mkdtempSync('/tmp/jev-human-file-');
+  mkdirSync(join(cwd, 'tests'));
+  writeFileSync(join(cwd, 'tests', 'Approval.test.js'), 'test("original", () => {});\n');
+  const input = { command: 'npm test -- Approval.test.js', cwd, testFiles: ['tests/Approval.test.js'] };
+  const first = await evaluateTest(config, input);
+  assert.equal(first.decision, 'review');
+  assert.ok(first.reviewId);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(config, input)).decision, 'allow');
+  writeFileSync(join(cwd, 'tests', 'Approval.test.js'), 'test("changed", () => {});\n');
+  const changed = await evaluateTest(config, input);
+  assert.equal(changed.decision, 'review');
+  assert.notEqual(changed.reviewId, first.reviewId);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('all per-file Human Reviews are required for a multi-file test request', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = mkdtempSync('/tmp/jev-human-files-');
+  mkdirSync(join(cwd, 'tests'));
+  writeFileSync(join(cwd, 'tests', 'One.test.js'), 'test("one", () => {});\n');
+  writeFileSync(join(cwd, 'tests', 'Two.test.js'), 'test("two", () => {});\n');
+  const input = { command: 'npm test', cwd, testFiles: ['tests/One.test.js', 'tests/Two.test.js'] };
+  const first = await evaluateTest(config, input);
+  assert.equal(first.decision, 'review');
+  assert.equal(first.reviewIds.length, 2);
+  transitionHumanReview(openDatabase(), first.reviewIds[0], 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(config, input)).decision, 'review');
+  transitionHumanReview(openDatabase(), first.reviewIds[1], 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(config, input)).decision, 'allow');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('changing Project Policy invalidates approval and a new deny remains deny', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = mkdtempSync('/tmp/jev-human-policy-');
+  const policyPath = join(cwd, '.jev-policy.json');
+  writeFileSync(policyPath, JSON.stringify({ version: 1, rules: [{ name: 'review-test', match: { type: 'contains', value: 'npm test' }, decision: 'review', category: 'scope', reason: 'Project review.' }] }));
+  const input = { command: 'npm test', cwd };
+  const first = await evaluateTest(config, input);
+  assert.equal(first.decision, 'review');
+  assert.ok(first.reviewId);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(config, input)).decision, 'allow');
+  writeFileSync(policyPath, JSON.stringify({ version: 1, rules: [{ name: 'deny-test', match: { type: 'contains', value: 'npm test' }, decision: 'deny', category: 'scope', reason: 'Project deny.' }] }));
+  const denied = await evaluateTest(config, input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.allowed, false);
+  rmSync(cwd, { recursive: true, force: true });
 });
 
 test('isolated test environment can be allowed when Jev reports low risk', async () => {

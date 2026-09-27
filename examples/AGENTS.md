@@ -34,7 +34,7 @@ If the result is:
 
 do not execute the command.
 
-For `review`, explain the identified risk to the user and wait for explicit approval before proceeding.
+For `review`, explain the identified risk to the user and wait for explicit approval before proceeding. For `jev_check_command`, approval is not recorded by this server; re-run the exact command check after the user's decision and continue only if it returns `allow`.
 
 For `deny`, do not execute the command. Explain why it was blocked and propose a safer alternative when possible.
 
@@ -82,7 +82,7 @@ If there is uncertainty about whether an operation is read-only, use `jev_check_
 
 Use `jev_check_test` to evaluate any test command that may interact with databases, filesystems, external services, networks, credentials, production resources, or other persistent state. `jev_check_test` is language- and framework-independent; use `framework` when known, such as `laravel`, `vitest`, `pytest`, `rspec`, `go`, or `cargo`.
 
-Provide the exact command and, when available, `cwd`, `environment`, `framework`, `testCode`, `diff`, and `context`. Prefer structured evidence for isolation and runtime access:
+Provide the exact command and, when available, `cwd`, `environment`, `framework`, `testCode`, `diff`, and `context`. For multiple test files, provide `testFiles` when supported. Each file is evaluated and cached independently; do not combine unrelated test files into one large `testCode` value. Prefer structured evidence for isolation and runtime access:
 
 ```json
 {
@@ -113,6 +113,16 @@ After preparing the test input:
    - `needsHumanReview=false`
 
 If either check returns `review`, `deny`, `allowed=false`, or `needsHumanReview=true`, do not execute the test. Explain the finding or request explicit human direction as appropriate.
+
+#### Human Review for tests
+
+When `jev_check_test` returns `decision=review`, `allowed=false`, `needsHumanReview=true`, and a `reviewId`, present the reason and relevant safety context to the user and ask for explicit approval. If the user explicitly approves the exact test, call `jev_review_approve` with only the returned `reviewId`; never invent or supply `approved`, `fingerprint`, `command`, `testFiles`, or `projectId` fields. If the user declines, call `jev_review_reject` with the `reviewId` when appropriate.
+
+After approval, call `jev_check_test` again with the exact same command, test files, working directory, policy context, and runtime/isolation evidence. Execute the test only if the new result has `allowed=true`, `decision=allow`, and `needsHumanReview=false`. An approval is tied to the server-issued review, project, command, test files, Safety Fingerprint, Policy, Safety Profile, and runtime context. Any safety-relevant change invalidates the old approval and requires a new review. A rejected, expired, unknown, or cross-project review ID cannot be used.
+
+Human Review never overrides `deny` from Static Check, Jev, Built-in Policy, User Policy, or Project Policy. Do not execute a test merely because `jev_review_approve` succeeded; the final `jev_check_test` result is required.
+
+`jev_check_test` may return `decision=allow` from an unchanged Safety Fingerprint Cache entry or from a valid Human Approval for the same Safety Fingerprint. This is still subject to the same `allowed` and `needsHumanReview` checks. Cache hits and Human Review decisions are stored in the server's SQLite database for audit. A cache hit does not mean that Jev was called for that request. Changes to the command, test file, shared safety files, policies, Safety Profile, working directory/project, runtime/isolation evidence, evaluator version, or Jev model version invalidate reuse and cause re-evaluation.
 
 For Laravel, set `framework` to `laravel`. Existing Laravel evidence fields such as `runtimeDatabase`, `configCache`, `runtimeGuard`, and `persistentDatabaseAccess` remain supported. `RefreshDatabase`, `DatabaseMigrations`, `DatabaseTruncation`, `migrate:fresh`, `db:wipe`, persistent database targets, and test/runtime configuration mismatches must be treated as safety findings.
 

@@ -105,6 +105,8 @@ You can add your own rules. On Linux/macOS, User policy is located at `$XDG_CONF
 
 `jev_check_test` evaluates test execution safety across languages and frameworks, including persistent-resource access, database and filesystem mutation, external service side effects, production access, credentials, network access, destructive cleanup, and isolation. It never runs the test, command, or database connection; the supplied command is untrusted input sent only for evaluation.
 
+When the final decision is `review`, the server creates a short-lived Human Review record and returns a `reviewId`. After an explicit human approval, call `jev_review_approve` with only that `reviewId`. The server loads the stored project, command, files, policy, runtime context, and Safety Fingerprint; caller-supplied fingerprints or commands are not accepted. A matching approval may allow the unchanged fingerprint on later checks, but any changed safety input is re-evaluated. `deny` always wins and cannot be overridden by Human Approval. `jev_review_reject` permanently rejects a pending review.
+
 The minimal input is:
 
 ```json

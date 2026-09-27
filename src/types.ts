@@ -1,5 +1,8 @@
 export type Decision = 'allow' | 'review' | 'deny';
 
+export type HumanReviewStatus = 'pending' | 'approved' | 'rejected' | 'expired';
+export type HumanApprovalKind = 'approve_fingerprint' | 'approve_once';
+
 export type CommandEnvironment = 'development' | 'testing' | 'staging' | 'production' | 'unknown';
 
 export type RiskCategory =
@@ -149,6 +152,31 @@ export interface TestCheckResult {
   model: 'typesafe/jev';
   errorCode?: string;
   safetyProfile?: SafetyProfileAssessment;
+  reviewId?: string;
+  reviewIds?: string[];
+}
+
+export interface HumanReviewRecord {
+  reviewId: string;
+  projectId: string;
+  targetType: 'test-file';
+  targetKey: string;
+  fingerprint: string;
+  commandHash: string;
+  testFilesHash: string;
+  cwdHash: string;
+  policyHash: string;
+  contextHash: string;
+  safetyProfileHash?: string;
+  runtimeHash: string;
+  decision: 'review';
+  status: HumanReviewStatus;
+  approvalKind?: HumanApprovalKind;
+  createdAt: string;
+  approvedAt?: string;
+  rejectedAt?: string;
+  expiresAt?: string;
+  usedAt?: string;
 }
 
 export interface SafetyProfileAssessment {

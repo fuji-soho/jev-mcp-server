@@ -105,6 +105,8 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 
 `jev_check_test`は、言語やフレームワークを問わず、テスト実行時の永続データ、データベース、ファイルシステム、外部サービス、本番環境、credential、ネットワーク、破壊的cleanup、隔離状態を評価します。テスト、コマンド、DB接続は絶対に実行せず、入力されたcommandは評価のための未信頼データとしてのみ扱います。
 
+最終判定が`review`の場合、Serverは短時間だけ有効なHuman Reviewを保存し、`reviewId`を返します。人間が明示的に承認した後は、`jev_review_approve`へその`reviewId`だけを渡してください。Serverが保存済みのproject、command、対象ファイル、Policy、runtime context、Safety Fingerprintを読み出して照合します。呼び出し側からfingerprintやcommandを指定して承認対象を変更することはできません。同じFingerprintの安全条件が維持されている場合だけ後続チェックで利用でき、変更があれば再評価されます。`deny`は常に優先され、Human Approvalで覆すことはできません。`jev_review_reject`でpending reviewを恒久的に拒否できます。
+
 最小入力は次の形式です。
 
 ```json

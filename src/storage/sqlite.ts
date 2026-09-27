@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_DB_PATH = join(PROJECT_ROOT, 'cache', 'jev.sqlite');
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 let shared: DatabaseSync | undefined;
 let sharedPath: string | undefined;
@@ -48,6 +48,73 @@ function migrate(db: DatabaseSync): void {
       UPDATE schema_meta SET value = '1' WHERE key = 'schema_version';
     `);
     if (row === undefined) db.prepare("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')").run();
+  }
+  if (version <= 1) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS human_reviews (
+        id INTEGER PRIMARY KEY,
+        review_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        command_hash TEXT NOT NULL,
+        test_files_hash TEXT NOT NULL,
+        cwd_hash TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        safety_profile_hash TEXT,
+        runtime_hash TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision = 'review'),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+        approval_kind TEXT CHECK (approval_kind IS NULL OR approval_kind IN ('approve_fingerprint', 'approve_once')),
+        created_at TEXT NOT NULL,
+        approved_at TEXT,
+        rejected_at TEXT,
+        expires_at TEXT,
+        used_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_human_reviews_lookup ON human_reviews(project_id, target_type, target_key, fingerprint, policy_hash, context_hash, runtime_hash);
+      CREATE INDEX IF NOT EXISTS idx_human_reviews_review_id ON human_reviews(review_id);
+      CREATE INDEX IF NOT EXISTS idx_human_reviews_audit ON human_reviews(status, created_at);
+      UPDATE schema_meta SET value = '2' WHERE key = 'schema_version';
+    `);
+  }
+  if (version <= 2) {
+    db.exec(`
+      ALTER TABLE human_reviews RENAME TO human_reviews_legacy;
+      CREATE TABLE human_reviews (
+        id INTEGER PRIMARY KEY,
+        review_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        command_hash TEXT NOT NULL,
+        test_files_hash TEXT NOT NULL,
+        cwd_hash TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        safety_profile_hash TEXT,
+        runtime_hash TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision = 'review'),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+        approval_kind TEXT CHECK (approval_kind IS NULL OR approval_kind IN ('approve_fingerprint', 'approve_once')),
+        created_at TEXT NOT NULL,
+        approved_at TEXT,
+        rejected_at TEXT,
+        expires_at TEXT,
+        used_at TEXT
+      );
+      INSERT INTO human_reviews(id,review_id,project_id,target_type,target_key,fingerprint,command_hash,test_files_hash,cwd_hash,policy_hash,context_hash,safety_profile_hash,runtime_hash,decision,status,approval_kind,created_at,approved_at,rejected_at,expires_at,used_at)
+        SELECT id,review_id,project_id,target_type,target_key,fingerprint,command_hash,test_files_hash,cwd_hash,policy_hash,context_hash,safety_profile_hash,runtime_hash,decision,status,approval_kind,created_at,approved_at,rejected_at,expires_at,used_at FROM human_reviews_legacy;
+      DROP TABLE human_reviews_legacy;
+      CREATE UNIQUE INDEX idx_human_reviews_active ON human_reviews(project_id,target_type,target_key,fingerprint,policy_hash,context_hash,runtime_hash) WHERE status IN ('pending', 'approved');
+      CREATE INDEX IF NOT EXISTS idx_human_reviews_lookup ON human_reviews(project_id, target_type, target_key, fingerprint, policy_hash, context_hash, runtime_hash);
+      CREATE INDEX IF NOT EXISTS idx_human_reviews_review_id ON human_reviews(review_id);
+      CREATE INDEX IF NOT EXISTS idx_human_reviews_audit ON human_reviews(status, created_at);
+      UPDATE schema_meta SET value = '3' WHERE key = 'schema_version';
+    `);
   }
 }
 

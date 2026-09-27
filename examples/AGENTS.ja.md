@@ -32,7 +32,7 @@
 - `allowed=false`
 - `needsHumanReview=true`
 
-`review` の場合は、検出されたリスクをユーザーへ説明し、明示的な承認を得るまで実行しないでください。
+`review` の場合は、検出されたリスクをユーザーへ説明し、明示的な承認を得るまで実行しないでください。`jev_check_command` の判定はこのServerに承認記録を保存しないため、ユーザーの判断後も完全に同じコマンドを再チェックし、`allow` の場合だけ続行してください。
 
 `deny` の場合は実行しないでください。ブロックされた理由を説明し、可能であればより安全な代替手段を提示してください。
 
@@ -99,7 +99,7 @@
 
 データベース、ファイルシステム、外部サービス、ネットワーク、credential、本番リソース、その他の永続的な状態へ影響する可能性があるテストコマンドは、言語やフレームワークを問わず `jev_check_test` へ渡して評価してください。フレームワークが分かる場合は、`laravel`、`vitest`、`pytest`、`rspec`、`go`、`cargo` などの `framework` を指定してください。
 
-正確なコマンドに加えて、可能な場合は `cwd`、`environment`、`framework`、`testCode`、`diff`、`context` を渡してください。隔離状態とruntimeアクセスは、次のような構造化情報を優先します。
+正確なコマンドに加えて、可能な場合は `cwd`、`environment`、`framework`、`testCode`、`diff`、`context` を渡してください。複数のテストファイルを指定する場合は、対応している `testFiles` を使用してください。各ファイルは個別に評価・キャッシュされるため、独立したテストファイルを1つの巨大な `testCode` にまとめないでください。隔離状態とruntimeアクセスは、次のような構造化情報を優先します。
 
 ```json
 {
@@ -130,6 +130,16 @@
    - `needsHumanReview=false`
 
 どちらか一方でも `review`、`deny`、`allowed=false`、`needsHumanReview=true` の場合はテストを実行しないでください。検出された理由を説明し、必要に応じてユーザーへ明示的な判断を求めてください。
+
+#### テストのHuman Review
+
+`jev_check_test` が `decision=review`、`allowed=false`、`needsHumanReview=true` と `reviewId` を返した場合は、理由と安全性に関係するContextをユーザーへ提示し、明示的な承認を求めてください。ユーザーがそのテストを明示的に承認した場合だけ、返された `reviewId` だけを指定して `jev_review_approve` を呼び出してください。`approved`、`fingerprint`、`command`、`testFiles`、`projectId` などをAI側で追加・生成・書き換えてはいけません。ユーザーが拒否した場合は、必要に応じて同じ `reviewId` を指定して `jev_review_reject` を呼び出してください。
+
+承認後は、同じcommand、テストファイル、作業ディレクトリ、Policy Context、runtime/isolation情報を指定して `jev_check_test` を再実行してください。再チェック結果が `allowed=true`、`decision=allow`、`needsHumanReview=false` の場合のみテストを実行できます。承認はServerが発行したreview、project、command、対象ファイル、Safety Fingerprint、Policy、Safety Profile、runtime Contextに紐付いています。安全性に関係する変更が1つでもあれば過去の承認は無効となり、再審査が必要です。reject済み、期限切れ、存在しない、または別projectのreview IDは使用できません。
+
+Human ApprovalでStatic Check、Jev、Built-in Policy、User Policy、Project Policyの `deny` を覆してはいけません。`jev_review_approve` が成功しただけでテストを実行せず、最終的な `jev_check_test` の判定を必ず確認してください。
+
+`jev_check_test` は、変更されていないSafety Fingerprint Cache、または同一Safety Fingerprintに対する有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev model versionが変化した場合は再利用できず、再評価されます。
 
 Laravelでは `framework` に `laravel` を指定してください。既存の `runtimeDatabase`、`configCache`、`runtimeGuard`、`persistentDatabaseAccess` も引き続き利用できます。`RefreshDatabase`、`DatabaseMigrations`、`DatabaseTruncation`、`migrate:fresh`、`db:wipe`、永続DBのターゲット、テスト設定とruntime設定の不一致は安全性のfindingとして扱ってください。
 
