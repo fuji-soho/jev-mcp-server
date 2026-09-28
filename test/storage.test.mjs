@@ -8,6 +8,8 @@ import { lookupAllow, upsertCache } from '../dist/storage/fingerprint-cache.js';
 import { createOrGetHumanReview, getHumanReview, lookupApprovedHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { insertAudit } from '../dist/storage/audit-log.js';
 import { sanitizeAuditText } from '../dist/audit-sanitizer.js';
+import { createOrGetEnvironmentReview, lookupEnvironmentApproval, revokeEnvironmentApproval, transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
+import { consumeExecutionTicket, issueExecutionTicket } from '../dist/storage/execution-ticket.js';
 
 const directories = [];
 afterEach(() => { resetDatabaseForTests(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -17,8 +19,44 @@ function key() { return { projectId: 'sha256:project', targetType: 'test-file', 
 
 test('creates the cache directory, schema, and secure file permissions', () => {
   const path = databasePath(); const db = openDatabase(path);
-  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'fingerprint_cache', 'human_reviews', 'schema_meta']);
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '3');
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'environment_approvals', 'execution_tickets', 'fingerprint_cache', 'human_reviews', 'schema_meta']);
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '4');
+});
+
+test('environment approvals are exact, expiring, and revocable', () => {
+  const db = openDatabase(databasePath());
+  const key = { projectId: 'sha256:project', profileDigest: 'sha256:profile', environmentFingerprint: 'sha256:environment', scopeJson: '{"runner":"safe"}', verifierVersion: 'jev-mcp-server@1.1.0' };
+  const pending = createOrGetEnvironmentReview(db, key, '2026-09-28T00:00:00.000Z', '2026-09-28T01:00:00.000Z');
+  assert.equal(pending.status, 'pending');
+  const approved = transitionEnvironmentApproval(db, pending.approvalId, 'approve', '2026-09-28T00:10:00.000Z', '2026-10-28T00:10:00.000Z');
+  assert.equal(approved.status, 'approved');
+  assert.ok(lookupEnvironmentApproval(db, key, '2026-09-28T00:20:00.000Z', approved.approvalId));
+  assert.equal(lookupEnvironmentApproval(db, { ...key, environmentFingerprint: 'sha256:changed' }, '2026-09-28T00:20:00.000Z'), undefined);
+  assert.equal(revokeEnvironmentApproval(db, approved.approvalId, '2026-09-28T00:30:00.000Z').status, 'revoked');
+  assert.equal(lookupEnvironmentApproval(db, key, '2026-09-28T00:40:00.000Z'), undefined);
+});
+
+test('execution tickets are exact and single-use', () => {
+  const db = openDatabase(databasePath());
+  const environmentKey = { projectId: 'sha256:project', profileDigest: 'sha256:profile', environmentFingerprint: 'sha256:environment', scopeJson: '{}', verifierVersion: 'jev-mcp-server@1.1.0' };
+  const pending = createOrGetEnvironmentReview(db, environmentKey, '2026-09-28T00:00:00.000Z', '2026-09-28T01:00:00.000Z');
+  transitionEnvironmentApproval(db, pending.approvalId, 'approve', '2026-09-28T00:00:30.000Z', '2026-10-28T00:00:30.000Z');
+  const key = { approvalId: pending.approvalId, projectId: 'sha256:project', environmentFingerprint: 'sha256:environment', codeFingerprint: 'sha256:code', executionFingerprint: 'sha256:execution' };
+  const ticket = issueExecutionTicket(db, key, '2026-09-28T00:00:00.000Z', '2026-09-28T00:05:00.000Z');
+  assert.equal(consumeExecutionTicket(db, ticket.token, { ...key, executionFingerprint: 'sha256:changed' }, '2026-09-28T00:01:00.000Z'), false);
+  assert.equal(consumeExecutionTicket(db, ticket.token, key, '2026-09-28T00:01:00.000Z'), true);
+  assert.equal(consumeExecutionTicket(db, ticket.token, key, '2026-09-28T00:02:00.000Z'), false);
+});
+
+test('revoking an environment approval invalidates outstanding execution tickets', () => {
+  const db = openDatabase(databasePath());
+  const environmentKey = { projectId: 'sha256:project', profileDigest: 'sha256:profile', environmentFingerprint: 'sha256:environment', scopeJson: '{}', verifierVersion: 'jev-mcp-server@1.1.0' };
+  const pending = createOrGetEnvironmentReview(db, environmentKey, '2026-09-28T00:00:00.000Z', '2026-09-28T01:00:00.000Z');
+  transitionEnvironmentApproval(db, pending.approvalId, 'approve', '2026-09-28T00:00:30.000Z', '2026-10-28T00:00:30.000Z');
+  const key = { approvalId: pending.approvalId, projectId: 'sha256:project', environmentFingerprint: 'sha256:environment', codeFingerprint: 'sha256:code', executionFingerprint: 'sha256:execution' };
+  const ticket = issueExecutionTicket(db, key, '2026-09-28T00:01:00.000Z', '2026-09-28T00:06:00.000Z');
+  revokeEnvironmentApproval(db, pending.approvalId, '2026-09-28T00:02:00.000Z');
+  assert.equal(consumeExecutionTicket(db, ticket.token, key, '2026-09-28T00:03:00.000Z'), false);
 });
 
 test('stores and looks up reusable allow entries, but not review or deny', () => {

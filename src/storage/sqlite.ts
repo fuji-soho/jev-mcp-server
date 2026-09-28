@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_DB_PATH = join(PROJECT_ROOT, 'cache', 'jev.sqlite');
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 let shared: DatabaseSync | undefined;
 let sharedPath: string | undefined;
@@ -114,6 +114,46 @@ function migrate(db: DatabaseSync): void {
       CREATE INDEX IF NOT EXISTS idx_human_reviews_review_id ON human_reviews(review_id);
       CREATE INDEX IF NOT EXISTS idx_human_reviews_audit ON human_reviews(status, created_at);
       UPDATE schema_meta SET value = '3' WHERE key = 'schema_version';
+    `);
+  }
+  if (version <= 3) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS environment_approvals (
+        id INTEGER PRIMARY KEY,
+        approval_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        profile_digest TEXT NOT NULL,
+        environment_fingerprint TEXT NOT NULL,
+        scope_json TEXT NOT NULL,
+        verifier_version TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','revoked','expired')),
+        created_at TEXT NOT NULL,
+        approved_at TEXT,
+        rejected_at TEXT,
+        revoked_at TEXT,
+        expires_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_environment_approvals_active
+        ON environment_approvals(project_id, environment_fingerprint)
+        WHERE status IN ('pending','approved');
+      CREATE INDEX IF NOT EXISTS idx_environment_approvals_lookup
+        ON environment_approvals(project_id, environment_fingerprint, status, expires_at);
+
+      CREATE TABLE IF NOT EXISTS execution_tickets (
+        id INTEGER PRIMARY KEY,
+        ticket_hash TEXT NOT NULL UNIQUE,
+        approval_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        environment_fingerprint TEXT NOT NULL,
+        code_fingerprint TEXT NOT NULL,
+        execution_fingerprint TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_execution_tickets_expiry ON execution_tickets(expires_at);
+      UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';
     `);
   }
 }

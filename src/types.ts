@@ -2,6 +2,7 @@ export type Decision = 'allow' | 'review' | 'deny';
 
 export type HumanReviewStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 export type HumanApprovalKind = 'approve_fingerprint' | 'approve_once';
+export type EnvironmentApprovalStatus = 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired';
 
 export type CommandEnvironment = 'development' | 'testing' | 'staging' | 'production' | 'unknown';
 
@@ -91,6 +92,16 @@ export interface TestCheckInput {
   safetyProfilePath?: string;
   /** Optional test files. Each file is evaluated and cached independently. */
   testFiles?: string[];
+  /** Structured execution selection for Safety Profile v2. */
+  execution?: TestExecutionSelection;
+  /** Optional exact environment approval to require. */
+  environmentApprovalId?: string;
+}
+
+export interface TestExecutionSelection {
+  runnerId: string;
+  files: string[];
+  filter?: string;
 }
 
 export interface TestIsolationEvidence {
@@ -154,6 +165,35 @@ export interface TestCheckResult {
   safetyProfile?: SafetyProfileAssessment;
   reviewId?: string;
   reviewIds?: string[];
+  environmentReviewId?: string;
+  environmentAssessment?: EnvironmentAssessment;
+  codeAssessment?: CodeAssessment;
+  executionAssessment?: ExecutionAssessment;
+}
+
+export interface EnvironmentAssessment {
+  status: 'not-applicable' | 'missing' | 'pending' | 'approved' | 'changed' | 'expired' | 'revoked' | 'invalid';
+  approvalId?: string;
+  environmentFingerprint?: string;
+  fingerprintMatched: boolean;
+  reapprovalRequired: boolean;
+  reason?: string;
+  scope?: Record<string, unknown>;
+}
+
+export interface CodeAssessment {
+  status: 'cache-hit' | 'evaluated' | 'stale' | 'not-evaluated';
+  fingerprint?: string;
+  dependencyFingerprint?: string;
+}
+
+export interface ExecutionAssessment {
+  runnerMatched: boolean;
+  selectorsAllowed: boolean;
+  executionFingerprint?: string;
+  ticket?: string;
+  ticketExpiresAt?: string;
+  reason?: string;
 }
 
 export interface HumanReviewRecord {
@@ -188,6 +228,25 @@ export interface SafetyProfileAssessment {
   profileDigest?: string;
   safetyFingerprint?: string;
   reason?: string;
+  version?: 1 | 2;
+  environmentFingerprint?: string;
+  dependencyFingerprint?: string;
+  runnerId?: string;
+}
+
+export interface EnvironmentApprovalRecord {
+  approvalId: string;
+  projectId: string;
+  profileDigest: string;
+  environmentFingerprint: string;
+  scopeJson: string;
+  verifierVersion: string;
+  status: EnvironmentApprovalStatus;
+  createdAt: string;
+  approvedAt?: string;
+  rejectedAt?: string;
+  revokedAt?: string;
+  expiresAt?: string;
 }
 
 export interface JevNoulAnswer {

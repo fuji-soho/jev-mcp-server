@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, afterEach } from 'node:test';
 import { evaluateTest } from '../dist/test-checker.js';
-import { verifySafetyProfile } from '../dist/test-safety-profile.js';
+import { assessSafetyProfile, verifySafetyProfile } from '../dist/test-safety-profile.js';
 import { openDatabase } from '../dist/storage/sqlite.js';
 import { transitionHumanReview } from '../dist/storage/human-review.js';
+import { transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
 
 const config = {
   accountId: 'test-account',
@@ -109,6 +110,29 @@ test('changed Safety Profile files require review', async () => {
   assert.equal(result.decision, 'review');
   assert.equal(result.safetyProfile?.status, 'changed');
   rmSync(cwd, { recursive: true, force: true });
+});
+
+test('nested Safety Profile changes invalidate v1 verification', () => {
+  const cwd = profileProject();
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+  const input = profileInput(cwd);
+  verifySafetyProfile(input);
+  const profilePath = join(cwd, '.jev', 'test-safety.json');
+  const profile = JSON.parse(readFileSync(profilePath, 'utf8'));
+  profile.runner.commands = ['npm test --changed'];
+  writeFileSync(profilePath, JSON.stringify(profile));
+  assert.equal(assessSafetyProfile(input).assessment.status, 'changed');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('v1 verification state cannot be reused across projects', () => {
+  const first = profileProject();
+  const second = profileProject();
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(first, 'shared-state.json');
+  verifySafetyProfile(profileInput(first));
+  assert.equal(assessSafetyProfile(profileInput(second)).assessment.status, 'changed');
+  rmSync(first, { recursive: true, force: true });
+  rmSync(second, { recursive: true, force: true });
 });
 
 test('verified Safety Profile never overrides a destructive finding', async () => {
@@ -444,5 +468,153 @@ test('shared safety context changes invalidate dependent test files', async () =
   writeFileSync(join(cwd, 'tests', 'TestCase.php'), '<?php // changed shared context\n');
   await evaluateTest(config, input);
   assert.equal(calls, 6);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+function profileV2Project() {
+  const cwd = mkdtempSync('/tmp/jev-environment-v2-');
+  for (const directory of ['.jev', 'bin', 'config', 'app', 'tests/Support', 'tests/Feature']) mkdirSync(join(cwd, directory), { recursive: true });
+  writeFileSync(join(cwd, 'bin', 'safe-test-runner'), '#!/bin/sh\nexit 1\n');
+  writeFileSync(join(cwd, 'phpunit.xml'), '<phpunit/>\n');
+  writeFileSync(join(cwd, 'config', 'database.php'), '<?php return [];\n');
+  writeFileSync(join(cwd, 'app', 'Service.php'), '<?php class Service {}\n');
+  writeFileSync(join(cwd, 'tests', 'Support', 'Helper.php'), '<?php trait Helper {}\n');
+  writeFileSync(join(cwd, 'composer.lock'), '{}\n');
+  writeFileSync(join(cwd, '.jev', 'test-safety.json'), JSON.stringify({
+    version: 2,
+    name: 'laravel-safe-runner',
+    framework: 'laravel',
+    environment: 'testing',
+    runner: {
+      id: 'laravel-safe-v1', executable: 'bin/safe-test-runner', files: ['bin/safe-test-runner'], fixedArgs: [], shell: false,
+      selectors: { filePatterns: ['tests/**'], allowFilter: true },
+    },
+    environmentFiles: ['phpunit.xml', 'config/database.php'],
+    codeReviewRoots: ['app', 'tests/Support', 'composer.lock'],
+    resources: {
+      database: { policy: 'sqlite-memory', rejectFallback: true, rejectAdditionalConnections: true },
+      filesystem: { writableRoots: ['storage/framework/testing'] },
+      network: { policy: 'deny' }, credentials: { policy: 'deny' },
+    },
+  }));
+  return cwd;
+}
+
+function profileV2Input(cwd, file = 'tests/Feature/SafeTest.php', filter) {
+  return {
+    command: 'bin/safe-test-runner', cwd, framework: 'laravel', environment: 'testing', testFiles: [file],
+    execution: { runnerId: 'laravel-safe-v1', files: [file], ...(filter === undefined ? {} : { filter }) },
+  };
+}
+
+test('Safety Profile v2 separates one-time environment approval from changed test review', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  const cwd = profileV2Project();
+  const testPath = join(cwd, 'tests', 'Feature', 'SafeTest.php');
+  writeFileSync(testPath, '<?php use Illuminate\\Foundation\\Testing\\RefreshDatabase; class SafeTest { use RefreshDatabase; }\n');
+  const input = profileV2Input(cwd);
+  const pending = await evaluateTest(config, input);
+  assert.equal(pending.decision, 'review');
+  assert.equal(pending.environmentAssessment.status, 'pending');
+  assert.ok(pending.environmentReviewId);
+  assert.equal(pending.environmentAssessment.scope.runner.id, 'laravel-safe-v1');
+  assert.equal(pending.environmentAssessment.scope.resources.database.policy, 'sqlite-memory');
+  assert.equal(calls, 0);
+  const now = new Date();
+  transitionEnvironmentApproval(openDatabase(), pending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+
+  const approved = await evaluateTest(config, input);
+  assert.equal(approved.decision, 'allow');
+  assert.equal(approved.environmentAssessment.status, 'approved');
+  assert.ok(approved.executionAssessment.ticket);
+  assert.equal(calls, 1);
+
+  writeFileSync(testPath, '<?php use Illuminate\\Foundation\\Testing\\RefreshDatabase; class SafeTest { use RefreshDatabase; public function testChanged() { $this->assertTrue(true); } }\n');
+  const changed = await evaluateTest(config, input);
+  assert.equal(changed.decision, 'allow');
+  assert.equal(changed.environmentAssessment.approvalId, approved.environmentAssessment.approvalId);
+  assert.equal(calls, 2);
+
+  const filtered = await evaluateTest(config, profileV2Input(cwd, 'tests/Feature/SafeTest.php', 'SafeTest::testChanged'));
+  assert.equal(filtered.decision, 'allow');
+  assert.equal(filtered.codeAssessment.status, 'cache-hit');
+  assert.equal(filtered.environmentAssessment.approvalId, approved.environmentAssessment.approvalId);
+  assert.equal(calls, 2);
+
+  writeFileSync(join(cwd, 'tests', 'Feature', 'NewTest.php'), '<?php class NewTest { public function testNew() { $this->assertTrue(true); } }\n');
+  const added = await evaluateTest(config, profileV2Input(cwd, 'tests/Feature/NewTest.php'));
+  assert.equal(added.decision, 'allow');
+  assert.equal(added.environmentAssessment.approvalId, approved.environmentAssessment.approvalId);
+  assert.equal(calls, 3);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('Safety Profile v2 invalidates code cache and environment approval on the correct boundaries', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  const cwd = profileV2Project();
+  const testPath = join(cwd, 'tests', 'Feature', 'BoundaryTest.php');
+  writeFileSync(testPath, '<?php class BoundaryTest {}\n');
+  const input = profileV2Input(cwd, 'tests/Feature/BoundaryTest.php');
+  const pending = await evaluateTest(config, input);
+  const now = new Date();
+  transitionEnvironmentApproval(openDatabase(), pending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+  assert.equal((await evaluateTest(config, input)).decision, 'allow');
+  assert.equal(calls, 1);
+
+  writeFileSync(join(cwd, 'app', 'Service.php'), '<?php class Service { public function changed() {} }\n');
+  const appChanged = await evaluateTest(config, input);
+  assert.equal(appChanged.decision, 'allow');
+  assert.equal(appChanged.environmentAssessment.status, 'approved');
+  assert.equal(calls, 2);
+
+  writeFileSync(join(cwd, 'config', 'database.php'), '<?php return ["default" => "mysql"];\n');
+  const environmentChanged = await evaluateTest(config, input);
+  assert.equal(environmentChanged.decision, 'review');
+  assert.equal(environmentChanged.environmentAssessment.status, 'pending');
+  assert.notEqual(environmentChanged.environmentReviewId, pending.environmentReviewId);
+  assert.equal(calls, 2);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('Safety Profile v2 never lets environment approval override deny or selector scope', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const cwd = profileV2Project();
+  writeFileSync(join(cwd, 'tests', 'Feature', 'DenyTest.php'), '<?php class DenyTest { public function testIt() { DB::statement("DROP DATABASE app"); } }\n');
+  const input = profileV2Input(cwd, 'tests/Feature/DenyTest.php');
+  const denied = await evaluateTest(config, input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.environmentReviewId, undefined);
+
+  writeFileSync(join(cwd, 'OutsideTest.php'), '<?php class OutsideTest {}\n');
+  const outside = await evaluateTest(config, profileV2Input(cwd, 'OutsideTest.php'));
+  assert.equal(outside.decision, 'review');
+  assert.equal(outside.errorCode, 'INVALID_EXECUTION_SELECTION');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('Safety Profile v2 does not turn policy review or Jev failure into allow', async () => {
+  const cwd = profileV2Project();
+  writeFileSync(join(cwd, 'tests', 'Feature', 'ReviewTest.php'), '<?php class ReviewTest {}\n');
+  const input = profileV2Input(cwd, 'tests/Feature/ReviewTest.php');
+  globalThis.fetch = async () => lowRiskResponse();
+  const pending = await evaluateTest(config, input);
+  const now = new Date();
+  transitionEnvironmentApproval(openDatabase(), pending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+  writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify({ version: 1, rules: [{ name: 'manual-review', match: { type: 'contains', value: 'safe-test-runner' }, decision: 'review', category: 'scope', reason: 'Manual review remains required.' }] }));
+  const policyReview = await evaluateTest(config, input);
+  assert.equal(policyReview.environmentAssessment.status, 'approved');
+  assert.equal(policyReview.decision, 'review');
+  assert.equal(policyReview.allowed, false);
+
+  writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify({ version: 1, rules: [] }));
+  writeFileSync(join(cwd, 'tests', 'Feature', 'ReviewTest.php'), '<?php class ReviewTest { public function changed() {} }\n');
+  globalThis.fetch = async () => { throw new Error('network failure'); };
+  const jevFailure = await evaluateTest(config, input);
+  assert.equal(jevFailure.environmentAssessment.status, 'approved');
+  assert.equal(jevFailure.decision, 'review');
+  assert.equal(jevFailure.allowed, false);
+  assert.equal(jevFailure.errorCode, 'JEV_NETWORK_ERROR');
   rmSync(cwd, { recursive: true, force: true });
 });

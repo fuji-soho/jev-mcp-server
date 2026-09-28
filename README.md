@@ -141,6 +141,41 @@ After human verification, an unchanged profile, matching fingerprint, matching r
 
 The server only evaluates supplied evidence; it does not inspect a live process, connect to a database, or prove that runtime claims are truthful.
 
+#### Safety Profile v2 and Environment Approval
+
+Profile v2 separates the human-approved execution environment from test code reviewed on each change. Changes to `environmentFiles` or the runner require new environment approval. Tests, assertions, permitted file selectors, and filters do not. Changes under `codeReviewRoots` invalidate only code-review cache entries.
+
+```json
+{
+  "version": 2,
+  "name": "laravel-safe-runner",
+  "framework": "laravel",
+  "environment": "testing",
+  "runner": {
+    "id": "laravel-safe-v1",
+    "executable": "bin/safe-test-runner",
+    "files": ["bin/safe-test-runner"],
+    "fixedArgs": [],
+    "shell": false,
+    "selectors": { "filePatterns": ["tests/**"], "allowFilter": true }
+  },
+  "environmentFiles": ["phpunit.xml", "bootstrap/app.php", "config/database.php"],
+  "codeReviewRoots": ["app", "tests/Support", "composer.json", "composer.lock"],
+  "resources": {
+    "database": { "policy": "sqlite-memory", "rejectFallback": true, "rejectAdditionalConnections": true },
+    "filesystem": { "writableRoots": ["storage/framework/testing"] },
+    "network": { "policy": "deny" },
+    "credentials": { "policy": "deny" }
+  }
+}
+```
+
+With Profile v2, pass a structured `execution` selecting the same files as `testFiles`. `command` names only the project-relative approved runner; targets and filters are not appended to a shell command.
+
+The first check returns `environmentReviewId` and `decision=review`. After a human checks the runner and resource scope, pass only that ID to `jev_environment_approve`. Approval lasts 30 days by default and can be immediately revoked with `jev_environment_revoke`.
+
+An approved environment plus static and Jev allow returns a single-use, five-minute Execution Ticket. The safe runner must recheck current environment/code/execution fingerprints, the effective database connection, config cache, fallback/additional connections, filesystem, and network immediately before consuming it. MCP allow and caller-supplied evidence do not replace runtime enforcement.
+
 ## Safety and privacy
 
 - Does not execute commands or tests, or connect to databases.

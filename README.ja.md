@@ -129,6 +129,41 @@ npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verifi
 
 本サーバーは入力されたevidenceを評価するだけで、実行中プロセスやDBへ接続したり、runtimeの申告が正しいことを証明したりはしません。
 
+#### Safety Profile v2とEnvironment Approval
+
+Profile v2では、人が初回確認する実行環境と、変更ごとに自動審査するテストコードを分離します。`environmentFiles`またはrunner本体が変わると環境再承認が必要ですが、テスト、assertion、許可された対象ファイル、filterの変更では環境承認を失効させません。`codeReviewRoots`の変更はコード審査キャッシュだけを失効させます。
+
+```json
+{
+  "version": 2,
+  "name": "laravel-safe-runner",
+  "framework": "laravel",
+  "environment": "testing",
+  "runner": {
+    "id": "laravel-safe-v1",
+    "executable": "bin/safe-test-runner",
+    "files": ["bin/safe-test-runner"],
+    "fixedArgs": [],
+    "shell": false,
+    "selectors": { "filePatterns": ["tests/**"], "allowFilter": true }
+  },
+  "environmentFiles": ["phpunit.xml", "bootstrap/app.php", "config/database.php"],
+  "codeReviewRoots": ["app", "tests/Support", "composer.json", "composer.lock"],
+  "resources": {
+    "database": { "policy": "sqlite-memory", "rejectFallback": true, "rejectAdditionalConnections": true },
+    "filesystem": { "writableRoots": ["storage/framework/testing"] },
+    "network": { "policy": "deny" },
+    "credentials": { "policy": "deny" }
+  }
+}
+```
+
+Profile v2では`testFiles`と同じファイルを示す構造化`execution`を`jev_check_test`へ渡します。`command`にはrunnerの相対パスだけを指定し、対象やfilterをshell文字列へ連結しません。
+
+初回は`environmentReviewId`と`decision=review`が返ります。人がrunnerとresource scopeを確認した後、`jev_environment_approve`へそのIDだけを渡します。承認は既定で30日有効で、`jev_environment_revoke`により即時取消できます。
+
+承認済み環境で静的検査とJevがallowの場合、5分間・1回だけ有効なExecution Ticketが返ります。安全runnerは実行直前にenvironment/code/execution fingerprint、実DB接続、設定キャッシュ、fallback・追加接続、filesystem、networkを再確認してからTicketを消費してください。MCPのallowやAI申告値だけでは実行時保護の代わりになりません。
+
 ## 安全とプライバシー
 
 - コマンド、テスト、DBへ接続しません。
