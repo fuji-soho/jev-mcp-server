@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, afterEach } from 'node:test';
@@ -454,6 +454,65 @@ test('evaluates and caches multiple test files independently', async () => {
   assert.equal(calls, 4);
   assert.equal(second.decision, 'allow');
   rmSync(cwd, { recursive: true, force: true });
+});
+
+test('reports missing test files before calling Jev', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  const cwd = mkdtempSync('/tmp/jev-missing-file-');
+  mkdirSync(join(cwd, 'tests'));
+  const result = await evaluateTest(config, { command: 'npm test', cwd, testFiles: ['tests/Missing.test.js'] });
+  assert.equal(result.ok, false);
+  assert.equal(result.allowed, false);
+  assert.equal(result.needsHumanReview, false);
+  assert.equal(result.errorCode, 'TEST_FILE_VALIDATION_ERROR');
+  assert.deepEqual(result.fileErrors?.map(({ file, code }) => ({ file, code })), [{ file: 'tests/Missing.test.js', code: 'TEST_FILE_NOT_FOUND' }]);
+  assert.deepEqual(result.categories, []);
+  assert.equal(result.riskScore, null);
+  assert.equal(result.policyVersion, 'unavailable');
+  assert.equal(result.reviewId, undefined);
+  assert.equal(calls, 0);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('preflights all requested test files before evaluating any of them', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  const cwd = mkdtempSync('/tmp/jev-preflight-files-');
+  mkdirSync(join(cwd, 'tests'));
+  writeFileSync(join(cwd, 'tests', 'Present.test.js'), 'test("present", () => {});\n');
+  const result = await evaluateTest(config, { command: 'npm test', cwd, testFiles: ['tests/Present.test.js', 'tests/Missing1.test.js', 'tests/Missing2.test.js'] });
+  assert.equal(result.errorCode, 'TEST_FILE_VALIDATION_ERROR');
+  assert.deepEqual(result.fileErrors?.map((error) => error.code), ['TEST_FILE_NOT_FOUND', 'TEST_FILE_NOT_FOUND']);
+  assert.equal(calls, 0);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test('reports an MCP-invisible cwd as an input error', async () => {
+  const parent = mkdtempSync('/tmp/jev-missing-cwd-');
+  const cwd = join(parent, 'not-present');
+  const result = await evaluateTest(config, { command: 'npm test', cwd, testFiles: ['tests/Example.test.js'] });
+  assert.equal(result.errorCode, 'TEST_CWD_NOT_FOUND');
+  assert.equal(result.needsHumanReview, false);
+  assert.deepEqual(result.categories, []);
+  assert.equal(result.riskScore, null);
+  assert.equal(result.policyVersion, 'unavailable');
+  rmSync(parent, { recursive: true, force: true });
+});
+
+test('distinguishes outside-cwd, symlink, and non-regular test files', async () => {
+  const parent = mkdtempSync('/tmp/jev-invalid-files-');
+  const cwd = join(parent, 'project');
+  mkdirSync(join(cwd, 'tests'), { recursive: true });
+  writeFileSync(join(parent, 'outside.test.js'), 'test("outside", () => {});\n');
+  symlinkSync(join(parent, 'outside.test.js'), join(cwd, 'tests', 'Link.test.js'));
+  mkdirSync(join(cwd, 'tests', 'Directory.test.js'));
+  const result = await evaluateTest(config, {
+    command: 'npm test', cwd,
+    testFiles: ['../outside.test.js', 'tests/Link.test.js', 'tests/Directory.test.js'],
+  });
+  assert.deepEqual(result.fileErrors?.map((error) => error.code), ['TEST_FILE_OUTSIDE_CWD', 'TEST_FILE_SYMLINK', 'TEST_FILE_NOT_REGULAR']);
+  rmSync(parent, { recursive: true, force: true });
 });
 
 test('shared safety context changes invalidate dependent test files', async () => {

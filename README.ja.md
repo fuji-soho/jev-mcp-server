@@ -115,6 +115,8 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 
 必要に応じて`testCode`、`diff`、`cwd`、`environment`、`framework`、`context`、`isolation`、`runtime`を追加できます。generic policyは常に適用され、`framework`指定時だけframework-specific policyが追加適用されます。Laravel固有ルールは[`policies/tests/laravel.json`](policies/tests/laravel.json)にあります。
 
+`testFiles`を指定した場合、ServerはPolicy、Cache、Human Review、Environment Approval、Jevによる審査より前に、指定された全ファイルを検証して読み込みます。`cwd`はMCP Serverのfilesystem上に存在し、各テストファイルはその内側にある通常ファイルかつ非symbolic linkでなければなりません。検証に失敗した場合、MCPの出力検証エラーではなく、`isError=true`、`ok=false`、`allowed=false`、`needsHumanReview=false`と構造化エラーを返します。不正な`cwd`は`TEST_CWD_NOT_FOUND`、`TEST_CWD_NOT_DIRECTORY`、`TEST_CWD_UNREADABLE`で識別できます。`TEST_FILE_VALIDATION_ERROR`では、`fileErrors`に`TEST_FILE_NOT_FOUND`、`TEST_FILE_OUTSIDE_CWD`、`TEST_FILE_SYMLINK`、`TEST_FILE_NOT_REGULAR`、`TEST_FILE_UNREADABLE`などのファイル別理由が入ります。パスまたはmountを修正して再試行してください。これらは入力エラーであり、Human Reviewは作成されず、承認で通過させることもできません。
+
 ### Safety Profile
 
 プロジェクトは`.jev/test-safety.json`で、再利用するテスト安全条件を定義できます。ProfileはLaravel専用ではなく、安全関連ファイル、test runner、DB、隔離、runtime条件を宣言します。Profileは許可証や安全保証ではなく、Built-in／User／Project PolicyやJevの`deny`を上書きしません。

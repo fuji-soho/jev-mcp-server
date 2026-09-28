@@ -131,6 +131,11 @@ const testOutputSchema = {
     message: z.string(),
   })).optional(),
   policiesApplied: z.array(z.string()).optional(),
+  fileErrors: z.array(z.object({
+    file: z.string(),
+    code: z.enum(['TEST_FILE_NOT_FOUND', 'TEST_FILE_OUTSIDE_CWD', 'TEST_FILE_SYMLINK', 'TEST_FILE_NOT_REGULAR', 'TEST_FILE_UNREADABLE']),
+    message: z.string(),
+  })).optional(),
 };
 
 const reviewActionOutputSchema = {
@@ -158,6 +163,13 @@ function resultText(result: CommandCheckResult): string {
 
 function testResultText(result: TestCheckResult): string {
   return JSON.stringify(result);
+}
+
+function isTestInputError(result: TestCheckResult): boolean {
+  return result.errorCode === 'TEST_CWD_NOT_FOUND'
+    || result.errorCode === 'TEST_CWD_NOT_DIRECTORY'
+    || result.errorCode === 'TEST_CWD_UNREADABLE'
+    || result.errorCode === 'TEST_FILE_VALIDATION_ERROR';
 }
 
 let selectedConfigPath = 'unresolved';
@@ -302,7 +314,7 @@ async function main(): Promise<void> {
         command: z.string().describe('The test command to evaluate; it will not be executed.'),
         testCode: z.string().optional().describe('Optional target or related test code; it will not be executed.'),
         diff: z.string().optional().describe('Optional related git diff.'),
-        cwd: z.string().optional().describe('Optional project working directory used for project policy lookup.'),
+        cwd: z.string().optional().describe('Optional MCP-visible project root used to read project policy, Safety Profiles, and testFiles.'),
         environment: z.enum(['development', 'testing', 'staging', 'production', 'unknown']).optional().describe('Optional test environment.'),
         framework: z.string().optional().describe('Optional framework or test runner, such as vitest, pytest, or laravel.'),
         context: z.string().optional().describe('Optional project and runtime safety context.'),
@@ -313,7 +325,7 @@ async function main(): Promise<void> {
         runtimeGuard: runtimeGuardSchema.optional().describe('Optional evidence about runtime database guards.'),
         persistentDatabaseAccess: z.boolean().optional().describe('Whether the test can access a persistent database.'),
         safetyProfilePath: z.string().optional().describe('Optional Safety Profile path. It must be inside cwd; the default is .jev/test-safety.json.'),
-        testFiles: z.array(z.string()).max(128).optional().describe('Optional test files. Each file is evaluated and cached independently.'),
+        testFiles: z.array(z.string()).max(128).optional().describe('Optional test files inside cwd. All files are read and validated before each file is evaluated and cached independently.'),
         execution: executionSelectionSchema.optional().describe('Structured runner and test selectors required by Safety Profile v2.'),
         environmentApprovalId: z.string().regex(/^env_[A-Za-z0-9_-]+$/u).optional().describe('Optional exact Environment Approval to require.'),
       },
@@ -346,6 +358,7 @@ async function main(): Promise<void> {
       return {
         content: [{ type: 'text' as const, text: testResultText(result) }],
         structuredContent: { ...result },
+        ...(isTestInputError(result) ? { isError: true } : {}),
       };
     },
   );

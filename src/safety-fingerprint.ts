@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import type { TestFileError } from './types.js';
 
 export const FINGERPRINT_SCHEMA_VERSION = 2;
 export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0';
@@ -55,6 +56,50 @@ export function fileDigest(root: string, file: string): { key: string; digest: s
     const contents = readFileSync(path);
     return { key, digest: sha256(contents), bytes: contents.byteLength };
   } catch { return undefined; }
+}
+
+export type TestRootResolution =
+  | { ok: true; root: string }
+  | { ok: false; code: 'TEST_CWD_NOT_FOUND' | 'TEST_CWD_NOT_DIRECTORY' | 'TEST_CWD_UNREADABLE'; message: string };
+
+export type TestFileResolution =
+  | { ok: true; target: string; content: string; digest: string; bytes: number }
+  | { ok: false; error: TestFileError };
+
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
+}
+
+export function resolveTestRoot(root: string): TestRootResolution {
+  const requested = resolve(root);
+  try {
+    const actual = realpathSync(requested);
+    if (!lstatSync(actual).isDirectory()) return { ok: false, code: 'TEST_CWD_NOT_DIRECTORY', message: 'cwd is not a directory in the MCP server filesystem.' };
+    return { ok: true, root: actual };
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { ok: false, code: 'TEST_CWD_NOT_FOUND', message: 'cwd does not exist in the MCP server filesystem.' };
+    if (errorCode(error) === 'ENOTDIR') return { ok: false, code: 'TEST_CWD_NOT_DIRECTORY', message: 'cwd is not a directory in the MCP server filesystem.' };
+    return { ok: false, code: 'TEST_CWD_UNREADABLE', message: 'cwd could not be read from the MCP server filesystem.' };
+  }
+}
+
+/** Resolve and read an explicitly requested test file without following a file symlink. */
+export function readTestFile(root: string, file: string): TestFileResolution {
+  const target = relativeTarget(root, file);
+  if (target === undefined) return { ok: false, error: { file, code: 'TEST_FILE_OUTSIDE_CWD', message: 'The requested test file resolves outside cwd in the MCP server filesystem.' } };
+  const path = resolve(root, target);
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return { ok: false, error: { file, code: 'TEST_FILE_SYMLINK', message: 'The requested test file must not be a symbolic link.' } };
+    if (!stat.isFile()) return { ok: false, error: { file, code: 'TEST_FILE_NOT_REGULAR', message: 'The requested test file is not a regular file.' } };
+    const actual = realpathSync(path);
+    if (relativeTarget(root, actual) === undefined) return { ok: false, error: { file, code: 'TEST_FILE_OUTSIDE_CWD', message: 'The requested test file resolves outside cwd in the MCP server filesystem.' } };
+    const contents = readFileSync(actual);
+    return { ok: true, target, content: contents.toString('utf8'), digest: sha256(contents), bytes: contents.byteLength };
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { ok: false, error: { file, code: 'TEST_FILE_NOT_FOUND', message: 'The requested test file does not exist under cwd in the MCP server filesystem.' } };
+    return { ok: false, error: { file, code: 'TEST_FILE_UNREADABLE', message: 'The requested test file could not be read from the MCP server filesystem.' } };
+  }
 }
 
 const MAX_MANIFEST_FILES = 20_000;

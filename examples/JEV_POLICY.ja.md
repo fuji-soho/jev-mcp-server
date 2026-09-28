@@ -130,6 +130,8 @@
 
 `testFiles` の絶対パスが有効なのは、MCP Serverのfilesystem上で `cwd` の内側に解決される場合だけです。コンテナ内だけで有効なパスを絶対パスにしても、MCP Serverから読み取れるようにはなりません。MCP Serverが指定されたテストファイルを読み取れない場合は、ファイルの説明文で代用せず、審査失敗として扱ってください。
 
+`jev_check_test`が`isError=true`と`TEST_CWD_NOT_FOUND`、`TEST_CWD_NOT_DIRECTORY`、`TEST_CWD_UNREADABLE`、または`TEST_FILE_VALIDATION_ERROR`を返した場合は、Human Reviewを要求せず、テストも実行しないでください。`fileErrors`がある場合はその内容を確認し、MCP Serverから見える`cwd`、mount、またはファイルパスを修正してから`jev_check_test`を再実行してください。これらは承認可能な`reviewId`を持たない入力エラーなので、`jev_review_approve`を呼び出してはいけません。
+
 ```json
 {
   "command": "npm test",

@@ -125,6 +125,8 @@ Optional `testCode`, `diff`, `cwd`, `environment`, `framework`, `context`, `isol
 }
 ```
 
+When `testFiles` is supplied, the server validates and reads every requested file before policy, cache, Human Review, Environment Approval, or Jev evaluation. `cwd` must exist in the MCP server's filesystem, and every test file must be a regular, non-symbolic file inside it. If validation fails, the tool returns `isError=true`, `ok=false`, `allowed=false`, `needsHumanReview=false`, and a structured error instead of an MCP output-validation error. `TEST_CWD_NOT_FOUND`, `TEST_CWD_NOT_DIRECTORY`, and `TEST_CWD_UNREADABLE` identify an invalid `cwd`; `TEST_FILE_VALIDATION_ERROR` includes per-file `fileErrors` such as `TEST_FILE_NOT_FOUND`, `TEST_FILE_OUTSIDE_CWD`, `TEST_FILE_SYMLINK`, `TEST_FILE_NOT_REGULAR`, or `TEST_FILE_UNREADABLE`. Correct the path or mount and retry; these input errors do not create a Human Review and cannot be approved.
+
 Generic test policy is always applied. A framework-specific policy is added only when `framework` is supplied; Laravel rules are provided as an example under [`policies/tests/laravel.json`](policies/tests/laravel.json). Built-in, User, Project, and Jev decisions use `allow < review < deny`.
 
 ### Safety Profile

@@ -90,7 +90,7 @@ export interface TestCheckInput {
   persistentDatabaseAccess?: boolean;
   /** Automatically loads .jev/test-safety.json below cwd when present. */
   safetyProfilePath?: string;
-  /** Optional test files. Each file is evaluated and cached independently. */
+  /** Optional test files inside the MCP-visible cwd. Files are preflighted, then evaluated and cached independently. */
   testFiles?: string[];
   /** Structured execution selection for Safety Profile v2. */
   execution?: TestExecutionSelection;
@@ -127,6 +127,19 @@ export interface TestFinding {
   message: string;
 }
 
+export type TestFileErrorCode =
+  | 'TEST_FILE_NOT_FOUND'
+  | 'TEST_FILE_OUTSIDE_CWD'
+  | 'TEST_FILE_SYMLINK'
+  | 'TEST_FILE_NOT_REGULAR'
+  | 'TEST_FILE_UNREADABLE';
+
+export interface TestFileError {
+  file: string;
+  code: TestFileErrorCode;
+  message: string;
+}
+
 export interface RuntimeDatabaseEvidence {
   connection: 'sqlite' | 'mysql' | 'mariadb' | 'pgsql' | 'sqlsrv' | 'other' | 'unknown';
   database: string;
@@ -153,12 +166,13 @@ export interface TestCheckResult {
   decision: Decision;
   staticFindings: string[];
   findings?: TestFinding[];
-  categories?: RiskCategory[];
-  riskScore?: number | null;
+  categories: RiskCategory[];
+  riskScore: number | null;
   risks?: Partial<Record<RiskCategory, number>>;
   policyFindings?: PolicyFinding[];
-  policyVersion?: string;
+  policyVersion: string;
   policiesApplied?: string[];
+  fileErrors?: TestFileError[];
   reason: string;
   model: 'typesafe/jev';
   errorCode?: string;

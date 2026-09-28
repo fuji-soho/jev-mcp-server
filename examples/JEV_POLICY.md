@@ -113,6 +113,8 @@ For example, if Podman mounts `/host/projects/app` at `/app` inside a container,
 
 An absolute `testFiles` entry is valid only when it resolves inside `cwd` in the MCP server's filesystem. Making a container-only path absolute does not make it readable by the MCP server. If the MCP server cannot read a requested test file, treat the check as failed rather than substituting a description of the file.
 
+If `jev_check_test` returns `isError=true` with `TEST_CWD_NOT_FOUND`, `TEST_CWD_NOT_DIRECTORY`, `TEST_CWD_UNREADABLE`, or `TEST_FILE_VALIDATION_ERROR`, do not request Human Review and do not execute the test. Inspect `fileErrors` when present, correct the MCP-visible `cwd`, mount, or file paths, and run `jev_check_test` again. Never call `jev_review_approve` for these input errors; they do not have an approvable `reviewId`.
+
 ```json
 {
   "command": "npm test",

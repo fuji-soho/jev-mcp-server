@@ -2,15 +2,15 @@ import type { Config } from './config.js';
 import { checkTestWithJev, JevError } from './cloudflare-jev.js';
 import { findPolicyMatches, loadEffectiveTestPolicies, strictestDecision } from './policy.js';
 import { assessSafetyProfile, ENVIRONMENT_VERIFIER_VERSION, validateExecutionSelection, type ExecutionSelectionResult } from './test-safety-profile.js';
-import type { Decision, EnvironmentAssessment, PolicyFinding, RiskCategory, StaticFinding, TestCheckInput, TestCheckResult, TestFinding } from './types.js';
+import type { Decision, EnvironmentAssessment, PolicyFinding, RiskCategory, StaticFinding, TestCheckInput, TestCheckResult, TestFileError, TestFinding } from './types.js';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, realpathSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
 import { createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
-import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, MODEL_VERSION, projectId, relativeTarget, sha256 } from './safety-fingerprint.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, MODEL_VERSION, projectId, readTestFile, resolveTestRoot, sha256 } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, type EnvironmentApprovalKey } from './storage/environment-approval.js';
 import { issueExecutionTicket } from './storage/execution-ticket.js';
@@ -27,7 +27,11 @@ const ENVIRONMENT_REVIEW_TTL_SECONDS = 60 * 60;
 const EXECUTION_TICKET_TTL_SECONDS = 5 * 60;
 
 function reviewResult(reason: string, staticFindings: string[] = [], errorCode?: string, details: Partial<TestCheckResult> = {}): TestCheckResult {
-  return { ok: false, dangerous: null, allowed: false, needsHumanReview: true, decision: 'review', staticFindings, reason, model: 'typesafe/jev', ...details, ...(errorCode === undefined ? {} : { errorCode }) };
+  return { ok: false, dangerous: null, allowed: false, needsHumanReview: true, decision: 'review', categories: [], riskScore: null, policyVersion: 'unavailable', staticFindings, reason, model: 'typesafe/jev', ...details, ...(errorCode === undefined ? {} : { errorCode }) };
+}
+
+function inputErrorResult(reason: string, errorCode: string, fileErrors?: TestFileError[]): TestCheckResult {
+  return { ...reviewResult(reason, [], errorCode), needsHumanReview: false, ...(fileErrors === undefined ? {} : { fileErrors }) };
 }
 
 function redact(value: string): string {
@@ -170,7 +174,7 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
     const v2Details = { ...initialDetails, environmentAssessment, executionAssessment, codeAssessment: { status: 'not-evaluated' as const, dependencyFingerprint } };
     if (!executionSelection.valid) return reviewResult(executionSelection.reason ?? 'The execution selection is outside the approved runner scope.', messages, 'INVALID_EXECUTION_SELECTION', v2Details);
     if (environmentFingerprint === undefined || profileDigest === undefined || scopeJson === undefined) return reviewResult('The environment fingerprint is incomplete.', messages, 'INVALID_SAFETY_PROFILE', { ...v2Details, environmentAssessment: { ...environmentAssessment, status: 'invalid' } });
-    if (staticDecision === 'deny') return { ...v2Details, ok: true, dangerous: 1, allowed: false, needsHumanReview: false, decision: 'deny', staticFindings: messages, model: 'typesafe/jev', reason: 'Static policy denied the test before environment approval could be considered.' };
+    if (staticDecision === 'deny') return { ...v2Details, ...scoring(testFindings, 1), ok: true, dangerous: 1, allowed: false, needsHumanReview: false, decision: 'deny', staticFindings: messages, model: 'typesafe/jev', reason: 'Static policy denied the test before environment approval could be considered.' };
     if (!db) return reviewResult('The Environment Approval store is unavailable.', messages, 'ENVIRONMENT_APPROVAL_STORE_ERROR', v2Details);
     const environmentKey: EnvironmentApprovalKey = { projectId: pid, profileDigest, environmentFingerprint, scopeJson, verifierVersion: ENVIRONMENT_VERIFIER_VERSION };
     const now = new Date();
@@ -229,7 +233,7 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
     } catch { return { ...result, allowed: false, needsHumanReview: true, decision: 'review', errorCode: 'EXECUTION_TICKET_ERROR', reason: 'An execution ticket could not be issued.' }; }
   };
   if (validationError === undefined && staticDecision === 'allow' && db) {
-    try { if (lookupAllow(db, cacheKey)) { const result: TestCheckResult = attachTicket({ ...details, codeAssessment: { status: 'cache-hit', fingerprint, dependencyFingerprint }, ok: true, dangerous: 0, allowed: true, needsHumanReview: false, decision: 'allow', staticFindings: messages, model: 'typesafe/jev', reason: 'An unchanged allow decision was reused from the Safety Fingerprint Cache.' }); audit(result, 'hit'); return result; } } catch { /* cache is unavailable; continue with Jev */ }
+    try { if (lookupAllow(db, cacheKey)) { const result: TestCheckResult = attachTicket({ ...details, ...scoring(testFindings, 0), codeAssessment: { status: 'cache-hit', fingerprint, dependencyFingerprint }, ok: true, dangerous: 0, allowed: true, needsHumanReview: false, decision: 'allow', staticFindings: messages, model: 'typesafe/jev', reason: 'An unchanged allow decision was reused from the Safety Fingerprint Cache.' }); audit(result, 'hit'); return result; } } catch { /* cache is unavailable; continue with Jev */ }
   }
   try {
     const response = await checkTestWithJev(config, { ...safe, safetyProfile: effectiveSafetyAssessment, safetyProfileContext: { ...safety.jevContext, environmentApprovalId: environmentApprovalId ?? null, environmentApproved: environmentApprovalId !== undefined }, staticFindings: messages });
@@ -271,22 +275,36 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
 
 export async function evaluateTest(config: Config, input: TestCheckInput): Promise<TestCheckResult> {
   if (!input.testFiles || input.testFiles.length === 0) return evaluateTestSingle(config, input);
+  const rootResult = resolveTestRoot(input.cwd ?? process.cwd());
+  if (!rootResult.ok) return inputErrorResult(rootResult.message, rootResult.code);
+  const root = rootResult.root;
+  const files = input.testFiles.map((file) => readTestFile(root, file));
+  const fileErrors = files.flatMap((file) => file.ok ? [] : [file.error]);
+  if (fileErrors.length > 0) {
+    return inputErrorResult('One or more requested test files could not be read from the MCP server filesystem.', 'TEST_FILE_VALIDATION_ERROR', fileErrors);
+  }
   const results: TestCheckResult[] = [];
-  const root = (() => { try { return realpathSync(resolve(input.cwd ?? process.cwd())); } catch { return resolve(input.cwd ?? process.cwd()); } })();
-  for (const file of input.testFiles) {
-    let content: string;
-    const target = relativeTarget(root, file);
-    const digest = fileDigest(root, file);
-    if (target === undefined || digest === undefined) { results.push(reviewResult(`Test file must be a regular non-symbolic file inside cwd: ${file}`, [], 'TEST_FILE_ERROR')); continue; }
-    try { content = readFileSync(realpathSync(resolve(root, target)), 'utf8'); } catch { results.push(reviewResult(`Unable to read test file: ${file}`, [], 'TEST_FILE_ERROR')); continue; }
-    results.push(await evaluateTestSingle(config, { ...input, testCode: content }, target, false));
+  for (const file of files) {
+    if (!file.ok) continue;
+    results.push(await evaluateTestSingle(config, { ...input, cwd: root, testCode: file.content }, file.target, false));
   }
   const decision = strictestDecision(results.map((result) => result.decision));
   const first = results[0] ?? reviewResult('No test files were supplied.', [], 'INVALID_INPUT');
   const reviewIds = results.flatMap((result) => result.reviewId === undefined ? [] : [result.reviewId]);
+  const categories = [...new Set(results.flatMap((result) => result.categories))];
+  const riskScores = results.flatMap((result) => result.riskScore === null ? [] : [result.riskScore]);
+  const dangerousScores = results.flatMap((result) => result.dangerous === null ? [] : [result.dangerous]);
+  const risks: Partial<Record<RiskCategory, number>> = {};
+  for (const result of results) for (const [category, score] of Object.entries(result.risks ?? {})) risks[category as RiskCategory] = Math.max(risks[category as RiskCategory] ?? 0, score);
+  const staticFindings = [...new Set(results.flatMap((result) => result.staticFindings))];
+  const findings = [...new Map(results.flatMap((result) => result.findings ?? []).map((finding) => [canonicalJson(finding), finding])).values()];
+  const policyFindings = [...new Map(results.flatMap((result) => result.policyFindings ?? []).map((finding) => [canonicalJson(finding), finding])).values()];
+  const policiesApplied = [...new Set(results.flatMap((result) => result.policiesApplied ?? []))];
   let aggregate: TestCheckResult = {
-    ...first, ok: results.every((result) => result.ok), allowed: decision === 'allow' && results.every((result) => result.allowed),
-    needsHumanReview: results.some((result) => result.needsHumanReview), decision,
+    ...first, ok: results.every((result) => result.ok), dangerous: dangerousScores.length === 0 ? null : Math.max(...dangerousScores),
+    allowed: decision === 'allow' && results.every((result) => result.allowed), needsHumanReview: results.some((result) => result.needsHumanReview), decision,
+    categories, riskScore: riskScores.length === 0 ? null : Math.max(...riskScores), risks,
+    staticFindings, findings, policyFindings, policyVersion: results.find((result) => result.policyVersion !== 'unavailable')?.policyVersion ?? 'unavailable', policiesApplied,
     reason: results.length === 1 ? first.reason : `Evaluated ${results.length} test files independently; aggregate decision is ${decision}.`,
     ...(reviewIds.length === 0 ? {} : { reviewIds, ...(reviewIds.length === 1 ? { reviewId: reviewIds[0] } : {}) }),
   };
