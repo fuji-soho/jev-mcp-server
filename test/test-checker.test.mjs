@@ -10,8 +10,10 @@ import { transitionHumanReview } from '../dist/storage/human-review.js';
 import { transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
 
 const config = {
+  provider: 'cloudflare',
   accountId: 'test-account',
   apiToken: 'test-token',
+  requestedModel: 'typesafe/jev',
 };
 
 const lowRiskResponse = () => new Response(JSON.stringify({
@@ -220,6 +222,27 @@ test('review approval allows only the unchanged Safety Fingerprint', async () =>
   const changed = await evaluateTest(config, { ...input, command: 'php artisan test --filter=HumanReviewApprovalTestChanged' });
   assert.equal(changed.decision, 'review');
   assert.notEqual(changed.reviewId, first.reviewId);
+});
+
+test('provider changes and API failures cannot reuse a prior Human Approval', async () => {
+  globalThis.fetch = async () => lowRiskResponse();
+  const input = { command: 'php artisan test --filter=ProviderApprovalBoundaryTest' };
+  const first = await evaluateTest(config, input);
+  assert.ok(first.reviewId);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+
+  const direct = { provider: 'typesafe', apiKey: 'typesafe-secret', requestedModel: 'jev-1.13.0' };
+  globalThis.fetch = async () => { throw new Error('network failure'); };
+  const changedProvider = await evaluateTest(direct, input);
+  assert.equal(changedProvider.decision, 'review');
+  assert.equal(changedProvider.allowed, false);
+  assert.equal(changedProvider.errorCode, 'JEV_NETWORK_ERROR');
+  assert.notEqual(changedProvider.reviewId, first.reviewId);
+
+  const sameProviderFailure = await evaluateTest(config, input);
+  assert.equal(sameProviderFailure.decision, 'review');
+  assert.equal(sameProviderFailure.allowed, false);
+  assert.equal(sameProviderFailure.errorCode, 'JEV_NETWORK_ERROR');
 });
 
 test('rejected review cannot become allow', async () => {
@@ -661,6 +684,13 @@ test('Safety Profile v2 does not turn policy review or Jev failure into allow', 
   const pending = await evaluateTest(config, input);
   const now = new Date();
   transitionEnvironmentApproval(openDatabase(), pending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+  const direct = { provider: 'typesafe', apiKey: 'typesafe-secret', requestedModel: 'jev-1.13.0' };
+  globalThis.fetch = async () => new Response(JSON.stringify({ model: 'jev-1.13.0', answers: { test_dangerous: { type: 'noul', noul: 0.1 } }, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  const providerChanged = await evaluateTest(direct, input);
+  assert.equal(providerChanged.environmentAssessment.status, 'approved');
+  assert.equal(providerChanged.codeAssessment.status, 'evaluated');
+
+  globalThis.fetch = async () => lowRiskResponse();
   writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify({ version: 1, rules: [{ name: 'manual-review', match: { type: 'contains', value: 'safe-test-runner' }, decision: 'review', category: 'scope', reason: 'Manual review remains required.' }] }));
   const policyReview = await evaluateTest(config, input);
   assert.equal(policyReview.environmentAssessment.status, 'approved');

@@ -5,9 +5,29 @@ import { fileURLToPath } from 'node:url';
 const DEFAULT_ENV_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', '.env');
 const ENV_PATH_ENV_VAR = 'JEV_ENV_PATH';
 
-export interface Config {
+export interface CloudflareConfig {
+  provider: 'cloudflare';
   accountId: string;
   apiToken: string;
+  requestedModel: 'typesafe/jev';
+}
+
+export interface TypeSafeConfig {
+  provider: 'typesafe';
+  apiKey: string;
+  requestedModel: string;
+}
+
+export type Config = CloudflareConfig | TypeSafeConfig;
+
+export const DEFAULT_TYPESAFE_MODEL = 'jev-1.13.0';
+
+export function evaluationIdentity(config: Config): string {
+  return `${config.provider}:${config.requestedModel}`;
+}
+
+export function isEvaluationCacheReusable(config: Config): boolean {
+  return config.provider === 'cloudflare' || /^jev-\d+\.\d+\.\d+$/u.test(config.requestedModel);
 }
 
 function commandLineEnvPath(args: readonly string[]): string | undefined {
@@ -98,8 +118,21 @@ export function loadConfig(path = resolveConfigPath()): Config {
   }
 
   const values = parseEnvFile(contents);
-  return {
-    accountId: requiredValue(values, 'CLOUDFLARE_ACCOUNT_ID'),
-    apiToken: requiredValue(values, 'CLOUDFLARE_API_TOKEN'),
-  };
+  const provider = values.get('JEV_PROVIDER')?.trim() || 'cloudflare';
+  if (provider === 'cloudflare') {
+    return {
+      provider,
+      accountId: requiredValue(values, 'CLOUDFLARE_ACCOUNT_ID'),
+      apiToken: requiredValue(values, 'CLOUDFLARE_API_TOKEN'),
+      requestedModel: 'typesafe/jev',
+    };
+  }
+  if (provider === 'typesafe') {
+    return {
+      provider,
+      apiKey: requiredValue(values, 'TYPESAFE_API_KEY'),
+      requestedModel: values.get('TYPESAFE_MODEL')?.trim() || DEFAULT_TYPESAFE_MODEL,
+    };
+  }
+  throw new Error(`Unknown JEV_PROVIDER: ${provider}`);
 }

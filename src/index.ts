@@ -77,6 +77,9 @@ const outputSchema = {
   })).optional(),
   policyVersion: z.string(),
   model: z.enum(['typesafe/jev', 'static', 'combined']),
+  jevProvider: z.enum(['cloudflare', 'typesafe']).optional(),
+  requestedModel: z.string().optional(),
+  actualModel: z.string().optional(),
   errorCode: z.string().optional(),
   safetyProfile: z.object({
     status: z.enum(['absent', 'invalid', 'unverified', 'verified', 'changed']),

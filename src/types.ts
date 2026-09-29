@@ -67,6 +67,9 @@ export interface CommandCheckResult {
   policyFindings?: PolicyFinding[];
   policyVersion: string;
   model: 'typesafe/jev' | 'static' | 'combined';
+  jevProvider?: 'cloudflare' | 'typesafe';
+  requestedModel?: string;
+  actualModel?: string;
   errorCode?: string;
 }
 
@@ -175,6 +178,9 @@ export interface TestCheckResult {
   fileErrors?: TestFileError[];
   reason: string;
   model: 'typesafe/jev';
+  jevProvider?: 'cloudflare' | 'typesafe';
+  requestedModel?: string;
+  actualModel?: string;
   errorCode?: string;
   safetyProfile?: SafetyProfileAssessment;
   reviewId?: string;
@@ -269,8 +275,8 @@ export interface JevNoulAnswer {
 }
 
 export interface JevResponse {
-  model?: string;
-  answers?: {
+  model: string;
+  answers: {
     command_dangerous?: JevNoulAnswer;
     test_dangerous?: JevNoulAnswer;
   };

@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_DB_PATH = join(PROJECT_ROOT, 'cache', 'jev.sqlite');
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 let shared: DatabaseSync | undefined;
 let sharedPath: string | undefined;
@@ -154,6 +154,15 @@ function migrate(db: DatabaseSync): void {
       );
       CREATE INDEX IF NOT EXISTS idx_execution_tickets_expiry ON execution_tickets(expires_at);
       UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';
+    `);
+  }
+  if (version <= 4) {
+    db.exec(`
+      ALTER TABLE fingerprint_cache ADD COLUMN actual_model TEXT;
+      ALTER TABLE audit_log ADD COLUMN jev_provider TEXT;
+      ALTER TABLE audit_log ADD COLUMN requested_model TEXT;
+      ALTER TABLE audit_log ADD COLUMN actual_model TEXT;
+      UPDATE schema_meta SET value = '5' WHERE key = 'schema_version';
     `);
   }
 }

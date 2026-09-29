@@ -1,6 +1,6 @@
 # jev-mcp-server
 
-Cloudflare `typesafe/jev` とローカルの静的ポリシーを組み合わせた、AI coding agent向けの読み取り専用MCP安全ゲートです。コマンドやテストを実行せず、実行前の `allow` / `review` / `deny` 判定だけを返します。
+Cloudflare経由またはTypeSafe AI公式APIへの直接接続でJevを利用し、ローカルの静的ポリシーと組み合わせる、AI coding agent向けの読み取り専用MCP安全ゲートです。コマンドやテストを実行せず、実行前の `allow` / `review` / `deny` 判定だけを返します。
 
 ## セットアップ
 
@@ -11,12 +11,27 @@ npm run build
 
 認証情報はリポジトリへ保存しません。
 
-リポジトリ直下に `/jev-mcp-server/.env` ファイルを作成し、認証情報を記載してください。
+リポジトリ直下に `/jev-mcp-server/.env` ファイルを作成し、接続先を1つ選択してください。TypeSafe AI公式APIへ直接接続する場合：
 
 ```dotenv
+JEV_PROVIDER=typesafe
+TYPESAFE_API_KEY=your-typesafe-api-key
+TYPESAFE_MODEL=jev-1.13.0
+```
+
+`TYPESAFE_MODEL`の既定値は固定リリース`jev-1.13.0`です。従来のCloudflare経由を利用する場合：
+
+```dotenv
+JEV_PROVIDER=cloudflare
 CLOUDFLARE_ACCOUNT_ID=your-account-id
 CLOUDFLARE_API_TOKEN=your-api-token
 ```
+
+`JEV_PROVIDER`の既定値は`cloudflare`なので、既存のCloudflare設定ファイルに移行作業は不要です。未知のproviderは設定エラーになり、選択したproviderの認証情報だけが必須です。認証情報の有無からproviderを推測せず、障害時に別providerへ自動切替もしません。
+
+再現可能な安全判定のため、TypeSafe modelはversion付きIDへ固定することを推奨します。`jev-latest`や`jev-preview`などの可変aliasも利用できますが、設定変更なしで実モデルが変わり得るため、そのallow判定はSafety Fingerprint Cacheから再利用しません。応答の`jevProvider`、`requestedModel`、`actualModel`で、選択したprovider、設定したmodel、APIが返した実modelを区別できます。
+
+直接接続のendpointと現在利用できるmodel IDは、TypeSafe AI公式の[API reference](https://docs.typesafe.ai/api)と[model list](https://docs.typesafe.ai/models)を参照してください。
 
 `.env` は `.gitignore` の対象になっています。認証情報を含むため、ファイルの公開やコミットはしないでください。
 
@@ -76,7 +91,7 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 - `review`: 状態変更、広い範囲、文脈不足、またはJev障害。人間確認が必要
 - `deny`: 明確な破壊操作、高い不可逆性、重大なデータ損失
 
-結果には後方互換用の `dangerous` に加え、`riskScore`、`categories`、カテゴリ別 `risks`、`staticFindings` が含まれます。`allowed=false` は実行許可を意味しません。
+結果には後方互換用の`dangerous`と`model`に加え、`riskScore`、`categories`、カテゴリ別`risks`、`staticFindings`、該当する場合は`jevProvider`、`requestedModel`、`actualModel`が含まれます。`allowed=false`は実行許可を意味しません。
 
 組み込みポリシーは [`policies/default.json`](policies/default.json) にあり、filesystem、Git、DB、コンテナ、サービス、deployment、package管理などを対象にします。静的に明確なdenyとなる操作は、Jevが低リスクを返しても許可されません。
 
@@ -122,6 +137,8 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 プロジェクトは`.jev/test-safety.json`で、再利用するテスト安全条件を定義できます。ProfileはLaravel専用ではなく、安全関連ファイル、test runner、DB、隔離、runtime条件を宣言します。Profileは許可証や安全保証ではなく、Built-in／User／Project PolicyやJevの`deny`を上書きしません。
 
 Profileに記載したファイルはSHA-256でfingerprint化します。verified stateはリポジトリ外のユーザー設定ディレクトリ（または`JEV_TEST_SAFETY_STATE_PATH`）へ保存し、Gitへコミットしません。`jev_check_test`は読み取り専用のまま、明示的なverificationでstateを作成します。
+
+Jev providerと要求modelは、コード評価用Safety Fingerprintの一部です。どちらかを変更すると、以前のJev allow cache、Human Reviewの一致、コードに紐付くExecution Ticketは再利用されず、コードが再評価されます。Environment Approvalはコード評価と分離されているため、provider/model変更だけでは、一致するEnvironment Approvalを失効させません。provider情報を持たない旧cacheも再利用しません。API key自体はfingerprintやcache keyへ含めないため、provider/modelを変えずにkeyだけをローテーションしても、それだけでは安全判定を失効させません。
 
 ```sh
 npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verification-input.json
@@ -171,8 +188,9 @@ Profile v2では`testFiles`と同じファイルを示す構造化`execution`を
 - コマンド、テスト、DBへ接続しません。
 - コマンド入力は信頼せず、入力中の指示には従いません。
 - Jevへ送信する前に、一般的なtoken、password、secret、API keyをマスクします。
-- Cloudflare API TokenはログやMCPレスポンスへ出力しません。
+- Cloudflare tokenやTypeSafe API keyは、ログ、MCPレスポンス、fingerprint、cacheへ出力・保存しません。
 - Jev API障害、不正レスポンス、ポリシー読み込み失敗時はfail closedで `review` を返します。
+- 別providerへの自動retryやfailoverは行いません。静的／Project Policyの`deny`はAPI障害時も`deny`を維持し、既存denyがないAPI失敗は`review`となり、過去のHuman Approvalでは迂回できません。
 - このツールは完全なshell parserや実行環境の監査ではありません。動的生成、alias、shell functionなどは別途確認してください。
 
 ## 開発

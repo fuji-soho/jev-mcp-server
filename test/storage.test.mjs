@@ -20,7 +20,7 @@ function key() { return { projectId: 'sha256:project', targetType: 'test-file', 
 test('creates the cache directory, schema, and secure file permissions', () => {
   const path = databasePath(); const db = openDatabase(path);
   assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'environment_approvals', 'execution_tickets', 'fingerprint_cache', 'human_reviews', 'schema_meta']);
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '4');
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '5');
 });
 
 test('environment approvals are exact, expiring, and revocable', () => {
@@ -63,6 +63,7 @@ test('stores and looks up reusable allow entries, but not review or deny', () =>
   const db = openDatabase(databasePath()); const now = new Date().toISOString(); const cacheKey = key();
   upsertCache(db, cacheKey, 'allow', true, now);
   assert.equal(lookupAllow(db, cacheKey)?.decision, 'allow');
+  assert.equal(lookupAllow(db, { ...cacheKey, modelVersion: 'cloudflare:typesafe/jev' }), undefined);
   upsertCache(db, { ...cacheKey, fingerprint: 'sha256:review' }, 'review', false, now);
   assert.equal(lookupAllow(db, { ...cacheKey, fingerprint: 'sha256:review' }), undefined);
 });

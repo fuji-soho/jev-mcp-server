@@ -43,13 +43,15 @@
 以下のような場合が該当します。
 
 - MCPを利用できない
-- Jev / Cloudflare APIを利用できない
+- 選択したJev provider API（CloudflareまたはTypeSafe AI）を利用できない
 - タイムアウト
 - 不正なレスポンス
 - Policyの読み込みエラー
 - 安全性を判断するための情報不足
 
 これらは人手確認が必要な状態として扱ってください。
+
+障害後にproviderを切り替えたり、存在する認証情報からproviderを推測したり、別provider経由でretryしてはいけません。Static、Built-in、User、Project Policyのいずれかがすでに`deny`を返している場合は、その`deny`を維持します。それ以外のAPI error、認証error、timeout、不正responseは`review`として扱います。過去のHuman Approvalで、現在のJev評価失敗を迂回してはいけません。
 
 `review` または `deny` を回避することだけを目的として、コマンドの表記、Shell構文、実行方法、使用ツールなどを変更して安全ゲートを迂回してはいけません。
 
@@ -170,13 +172,13 @@
 
 Human ApprovalでStatic Check、Jev、Built-in Policy、User Policy、Project Policyの `deny` を覆してはいけません。`jev_review_approve` が成功しただけでテストを実行せず、最終的な `jev_check_test` の判定を必ず確認してください。
 
-`jev_check_test` は、変更されていないSafety Fingerprint Cache、または同一Safety Fingerprintに対する有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev model versionが変化した場合は再利用できず、再評価されます。
+`jev_check_test` は、変更されていないSafety Fingerprint Cache、または同一Safety Fingerprintに対する有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。`jev-latest`などの可変model aliasは毎回評価し、allow cacheを再利用しません。API keyはfingerprintの入力に含めません。
 
 Laravelでは `framework` に `laravel` を指定してください。既存の `runtimeDatabase`、`configCache`、`runtimeGuard`、`persistentDatabaseAccess` も引き続き利用できます。`RefreshDatabase`、`DatabaseMigrations`、`DatabaseTruncation`、`migrate:fresh`、`db:wipe`、永続DBのターゲット、テスト設定とruntime設定の不一致は安全性のfindingとして扱ってください。
 
 テスト用設定、`.env.testing`、ドキュメント、環境名などに「テスト環境」と記載されているという理由だけで、環境が安全に分離されていると判断してはいけません。
 
-Safety Profile v2を使用するプロジェクトでは、承認済みrunnerだけを`command`へ指定し、テスト対象は構造化された`execution`で渡してください。`jev_check_test`が`environmentReviewId`を返した場合は、runnerとresource scopeを人に提示し、明示的な承認後に限って`jev_environment_approve`を呼び出します。Environment Approvalはテストコード、Policy finding、Jev findingを承認しません。
+Safety Profile v2を使用するプロジェクトでは、承認済みrunnerだけを`command`へ指定し、テスト対象は構造化された`execution`で渡してください。`jev_check_test`が`environmentReviewId`を返した場合は、runnerとresource scopeを人に提示し、明示的な承認後に限って`jev_environment_approve`を呼び出します。Environment Approvalはテストコード、Policy finding、Jev findingを承認しません。provider/model変更時はコードを再評価しますが、その変更だけを理由に、一致するEnvironment Approvalを失効させません。
 
 allow結果にExecution Ticketが含まれる場合は、承認済み安全runnerだけを使用します。runnerは実行直前に環境・コード・実行指定のfingerprint、実DB接続、設定キャッシュ、fallback接続、filesystem、networkを再確認してTicketを消費しなければなりません。Ticketをraw commandのshell実行許可として扱ってはいけません。
 

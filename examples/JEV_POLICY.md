@@ -45,13 +45,15 @@ If `jev_check_command` cannot complete successfully, do not assume the command i
 This includes:
 
 - MCP unavailable
-- Jev/Cloudflare API unavailable
+- selected Jev provider API (Cloudflare or TypeSafe AI) unavailable
 - timeout
 - invalid response
 - policy loading failure
 - insufficient context for a safety decision
 
 Treat these conditions as requiring human review.
+
+Do not switch providers, infer a provider from available credentials, or retry through a different provider after failure. If a static, Built-in, User, or Project Policy already returned `deny`, preserve that `deny`; otherwise an API error, authentication error, timeout, or invalid response requires `review`. A previous Human Approval must not be used to bypass a failed current Jev evaluation.
 
 Do not bypass or retry around the safety gate by changing the spelling, shell syntax, command structure, execution method, or tool solely to avoid a `review` or `deny` decision.
 
@@ -153,13 +155,13 @@ After approval, call `jev_check_test` again with the exact same command, test fi
 
 Human Review never overrides `deny` from Static Check, Jev, Built-in Policy, User Policy, or Project Policy. Do not execute a test merely because `jev_review_approve` succeeded; the final `jev_check_test` result is required.
 
-`jev_check_test` may return `decision=allow` from an unchanged Safety Fingerprint Cache entry or from a valid Human Approval for the same Safety Fingerprint. This is still subject to the same `allowed` and `needsHumanReview` checks. Cache hits and Human Review decisions are stored in the server's SQLite database for audit. A cache hit does not mean that Jev was called for that request. Changes to the command, test file, shared safety files, policies, Safety Profile, working directory/project, runtime/isolation evidence, evaluator version, or Jev model version invalidate reuse and cause re-evaluation.
+`jev_check_test` may return `decision=allow` from an unchanged Safety Fingerprint Cache entry or from a valid Human Approval for the same Safety Fingerprint. This is still subject to the same `allowed` and `needsHumanReview` checks. Cache hits and Human Review decisions are stored in the server's SQLite database for audit. A cache hit does not mean that Jev was called for that request. Changes to the command, test file, shared safety files, policies, Safety Profile, working directory/project, runtime/isolation evidence, evaluator version, Jev provider, or requested model invalidate reuse and cause code re-evaluation. Cache entries without provider identity are not reusable. Moving model aliases such as `jev-latest` are evaluated on every check and do not reuse an allow cache entry. API keys are not fingerprint inputs.
 
 For Laravel, set `framework` to `laravel`. Existing Laravel evidence fields such as `runtimeDatabase`, `configCache`, `runtimeGuard`, and `persistentDatabaseAccess` remain supported. `RefreshDatabase`, `DatabaseMigrations`, `DatabaseTruncation`, `migrate:fresh`, `db:wipe`, persistent database targets, and test/runtime configuration mismatches must be treated as safety findings.
 
 Never assume a test environment is isolated solely because a test configuration file, `.env.testing`, documentation, or environment name indicates that it is a test environment.
 
-For a Safety Profile v2 project, pass only the approved runner as `command` and pass test targets through the structured `execution` object. If `jev_check_test` returns an `environmentReviewId`, show the exact runner and resource scope to the user and call `jev_environment_approve` only after explicit human approval. Environment Approval does not approve test code, policy findings, or Jev findings.
+For a Safety Profile v2 project, pass only the approved runner as `command` and pass test targets through the structured `execution` object. If `jev_check_test` returns an `environmentReviewId`, show the exact runner and resource scope to the user and call `jev_environment_approve` only after explicit human approval. Environment Approval does not approve test code, policy findings, or Jev findings. A provider/model change requires code re-evaluation but does not, by itself, invalidate an otherwise matching Environment Approval.
 
 When an allow result contains an Execution Ticket, invoke only the approved safe runner. The runner must validate and consume the ticket after rechecking current environment, code, and execution fingerprints, effective database connections, config cache, fallback connections, filesystem, and network. Never treat the ticket as permission to execute the raw `command` through a shell.
 

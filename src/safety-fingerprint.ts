@@ -5,7 +5,6 @@ import type { TestFileError } from './types.js';
 
 export const FINGERPRINT_SCHEMA_VERSION = 2;
 export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0';
-export const MODEL_VERSION = process.env.JEV_MODEL_VERSION?.trim() || 'typesafe/jev';
 
 function normalize(value: unknown): unknown {
   if (typeof value === 'string') return value.replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n').normalize('NFC');

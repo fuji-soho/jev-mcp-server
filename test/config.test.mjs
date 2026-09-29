@@ -50,9 +50,48 @@ test('loads required credentials from the selected file', async () => {
   ].join('\n'));
 
   assert.deepEqual(loadConfig(path), {
+    provider: 'cloudflare',
     accountId: 'account',
     apiToken: 'token',
+    requestedModel: 'typesafe/jev',
   });
+});
+
+test('loads TypeSafe credentials without requiring Cloudflare credentials', async () => {
+  const path = await temporaryEnvFile([
+    'JEV_PROVIDER=typesafe',
+    'TYPESAFE_API_KEY="typesafe-token"',
+  ].join('\n'));
+
+  assert.deepEqual(loadConfig(path), {
+    provider: 'typesafe',
+    apiKey: 'typesafe-token',
+    requestedModel: 'jev-1.13.0',
+  });
+});
+
+test('loads an explicit TypeSafe model', async () => {
+  const path = await temporaryEnvFile([
+    'JEV_PROVIDER=typesafe',
+    'TYPESAFE_API_KEY=typesafe-token',
+    'TYPESAFE_MODEL=jev-latest',
+  ].join('\n'));
+  assert.equal(loadConfig(path).requestedModel, 'jev-latest');
+});
+
+test('rejects an unknown provider without inferring from credentials', async () => {
+  const path = await temporaryEnvFile([
+    'JEV_PROVIDER=other',
+    'CLOUDFLARE_ACCOUNT_ID=account',
+    'CLOUDFLARE_API_TOKEN=token',
+    'TYPESAFE_API_KEY=typesafe-token',
+  ].join('\n'));
+  assert.throws(() => loadConfig(path), { message: 'Unknown JEV_PROVIDER: other' });
+});
+
+test('requires only the selected provider credentials', async () => {
+  const path = await temporaryEnvFile('JEV_PROVIDER=typesafe\n');
+  assert.throws(() => loadConfig(path), { message: 'Missing required configuration: TYPESAFE_API_KEY' });
 });
 
 test('rejects a configuration file missing a required credential', async () => {

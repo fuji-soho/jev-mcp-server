@@ -5,7 +5,7 @@ import { afterEach, test } from 'node:test';
 import { evaluateCommand } from '../dist/command-checker.js';
 import { findPolicyMatches, loadEffectivePolicies } from '../dist/policy.js';
 
-const config = { accountId: 'test-account', apiToken: 'test-token' };
+const config = { provider: 'cloudflare', accountId: 'test-account', apiToken: 'test-token', requestedModel: 'typesafe/jev' };
 const temporaryDirectories = [];
 
 function jevResponse(score) {

@@ -1,6 +1,6 @@
 # jev-mcp-server
 
-A read-only MCP safety gate for AI coding agents that combines Cloudflare `typesafe/jev` with local static policies. It does not execute commands or tests; it only returns an `allow` / `review` / `deny` decision before execution.
+A read-only MCP safety gate for AI coding agents that combines Jev, through either Cloudflare or the TypeSafe AI official API, with local static policies. It does not execute commands or tests; it only returns an `allow` / `review` / `deny` decision before execution.
 
 ## Setup
 
@@ -11,12 +11,27 @@ npm run build
 
 Do not store credentials in the repository.
 
-Create an `/jev-mcp-server/.env` file at the repository root and add your credentials:
+Create an `/jev-mcp-server/.env` file at the repository root and select one provider. To call the TypeSafe AI official API directly:
 
 ```dotenv
+JEV_PROVIDER=typesafe
+TYPESAFE_API_KEY=your-typesafe-api-key
+TYPESAFE_MODEL=jev-1.13.0
+```
+
+`TYPESAFE_MODEL` defaults to the pinned `jev-1.13.0` release. To continue using Cloudflare:
+
+```dotenv
+JEV_PROVIDER=cloudflare
 CLOUDFLARE_ACCOUNT_ID=your-account-id
 CLOUDFLARE_API_TOKEN=your-api-token
 ```
+
+`JEV_PROVIDER` defaults to `cloudflare`, so existing Cloudflare configuration files require no migration. Unknown providers are rejected, and only the selected provider's credentials are required. The server never infers a provider from available credentials and never fails over to the other provider.
+
+Pin a versioned TypeSafe model for reproducible safety decisions. Moving aliases such as `jev-latest` and `jev-preview` can resolve to a different model without a configuration change; they are accepted, but their allow decisions are not reused from the Safety Fingerprint Cache. The response fields `jevProvider`, `requestedModel`, and `actualModel` distinguish the selected provider, configured model, and version reported by the API.
+
+See the TypeSafe AI [API reference](https://docs.typesafe.ai/api) and [model list](https://docs.typesafe.ai/models) for the direct endpoint and currently available model IDs.
 
 `.env` is included in `.gitignore`. Because it contains credentials, do not publish or commit it.
 
@@ -76,7 +91,7 @@ Main decisions:
 - `review`: The operation changes state, has a broad scope, lacks context, or Jev is unavailable. Human confirmation is required.
 - `deny`: The operation is clearly destructive, highly irreversible, or likely to cause significant data loss.
 
-Results include the backward-compatible `dangerous` field as well as `riskScore`, `categories`, category-specific `risks`, and `staticFindings`. `allowed=false` does not mean that execution is authorized.
+Results include the backward-compatible `dangerous` and `model` fields as well as `riskScore`, `categories`, category-specific `risks`, `staticFindings`, and, when applicable, `jevProvider`, `requestedModel`, and `actualModel`. `allowed=false` does not mean that execution is authorized.
 
 The built-in policy is located at [`policies/default.json`](policies/default.json) and covers filesystem, Git, databases, containers, services, deployments, package management, and more. Operations that are clearly denied statically remain denied even if Jev returns a low-risk result.
 
@@ -141,6 +156,8 @@ npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verifi
 
 After human verification, an unchanged profile, matching fingerprint, matching runtime context, and low-risk Jev result can return `allow` without repeating the same review. Profile changes, missing files, runner/framework changes, isolation changes, invalid profiles, policy findings, or new risks return `review` or `deny`. Do not put credentials or `.env` values in a profile or verified state.
 
+The Jev provider and requested model are part of the code-evaluation Safety Fingerprint. Changing either invalidates old Jev allow-cache entries, Human Review matches, and code-bound Execution Tickets, so code is re-evaluated. Provider/model changes alone do not invalidate a matching Environment Approval because environment approval is kept separate from code evaluation. Legacy cache entries without provider identity are not reused. API keys are never included in fingerprints or cache keys; rotating a key without changing provider/model does not itself invalidate a safety decision.
+
 The server only evaluates supplied evidence; it does not inspect a live process, connect to a database, or prove that runtime claims are truthful.
 
 #### Safety Profile v2 and Environment Approval
@@ -183,8 +200,9 @@ An approved environment plus static and Jev allow returns a single-use, five-min
 - Does not execute commands or tests, or connect to databases.
 - Does not trust command input or follow instructions contained in it.
 - Masks common tokens, passwords, secrets, and API keys before sending input to Jev.
-- Does not output the Cloudflare API Token to logs or MCP responses.
+- Does not output Cloudflare tokens or TypeSafe API keys to logs, MCP responses, fingerprints, or caches.
 - Returns `review` fail-closed when the Jev API is unavailable, the response is invalid, or a policy cannot be loaded.
+- Does not automatically retry through or fail over to a different provider. A static or project-policy `deny` remains `deny` during API failures, while an API failure with no existing deny returns `review` and cannot be bypassed by an earlier Human Approval.
 - This tool is not a complete shell parser or execution-environment audit. Review dynamic command generation, aliases, shell functions, and similar cases separately.
 
 ## Development
