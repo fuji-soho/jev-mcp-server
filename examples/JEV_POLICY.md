@@ -65,6 +65,18 @@ If the command, arguments, target, working directory, environment, shell pipelin
 
 For compound commands, pipelines, command substitutions, scripts, or commands using `&&`, `||`, `;`, pipes, redirects, wildcards, recursive options, or force options, provide the complete command to the safety check.
 
+### Command review scope and cache
+
+`jev_check_command` does not reuse allow-cache entries for any provider/model. Once input and policy validation succeed, each check without a static `deny` evaluates Jev again. Old command cache rows are history only; test-cache behavior is unchanged.
+
+The supported scope is simple `ls`, `cat`, `mkdir`, `rmdir`, `touch`, `cp`, `mv`, `rm`; `pwd` with only optional `-L`/`-P`; `git status` with the limited options documented in the README; and `git diff --no-ext-diff --no-textconv` with the documented options and paths after `--`. Tokens use only ASCII letters/digits and `_./:=+-`, separated by spaces/tabs. Quotes, escapes, newlines, shell operators/expansion, wrappers, unknown executables, and unsupported Git options/subcommands require review. This classification does not verify PATH, aliases/functions, binary integrity, Git configuration (including fsmonitor), or runtime resources. Use the README's exact supported syntax; never infer support from a similar command.
+
+When `staticFindings` contains `command.execution-content-unreviewed`, stop. Script bodies, dependency/configuration contents, or dynamic execution have not been evaluated. Scripts such as `node task.js`, `python task.py`, `./task.sh`, and dispatchers such as `npm run`, `make`, or `composer run-script` remain `review` even after a low-risk Jev result. No command `reviewId` is issued. Do not call `jev_review_approve`, add an allow policy, put code/approval claims in `context`, or treat human approval alone as clearing missing evidence. Explain that repeating the unsupported command cannot produce automatic approval in this release. Static/Jev `deny` still wins. Never simplify or rewrite a command solely to evade this condition.
+
+Recheck when script bodies, related configuration/dependencies, or other execution inputs change, even if the command string is unchanged. Checks do not lock files or enforce execution-time integrity; preserve the checked inputs through execution.
+
+After the `command-scope-v1:no-command-cache-v1` update, stop old server processes, rebuild/restart the updated server, and recheck. SQLite remains at schema 6; history and existing test-cache/Human Review/Environment Approval/Execution Ticket behavior are preserved by this command-only update. Never use an older server or old command allow to bypass the new review conditions.
+
 ### Read-only operations
 
 Clearly read-only inspection commands may be executed without a Jev check when they cannot reasonably modify persistent state.
@@ -157,7 +169,7 @@ Human Review never overrides `deny` from Static Check, Jev, Built-in Policy, Use
 
 Human Reviews expire one hour after creation; approval does not extend the deadline. Human Approval never creates a reusable allow-cache entry. Checks requiring approval evaluate Jev again before matching the approval's status, expiry, full safety context, and API-reported actual model. Present `jevProvider`, `requestedModel`, and `actualModel` with the review context. The server's approval fingerprint includes the code fingerprint and exact command/files/cwd context plus actual model; do not equate it with `codeAssessment.fingerprint`. A changed actual model requires a new Human Review when approval is still needed, even if the requested alias is unchanged. Expired pending or approved reviews require a newly issued review ID and new explicit approval.
 
-Only pinned TypeSafe `jev-X.Y.Z` models whose actual model matched the requested model may reuse automatic allow-cache entries. TypeSafe moving aliases and Cloudflare `typesafe/jev` call the API whenever Jev evaluation is required. If `JEV_MODEL_ID_UNVERIFIED` is returned, stop: there is no approvable `reviewId`. Correct the provider/model reporting and recheck. Never use an earlier approval to bypass API failure or a later `deny`.
+For `jev_check_test`, only pinned TypeSafe `jev-X.Y.Z` models whose actual model matched the requested model may reuse automatic allow-cache entries. TypeSafe moving aliases and Cloudflare `typesafe/jev` call the API whenever Jev evaluation is required. If `JEV_MODEL_ID_UNVERIFIED` is returned, stop: there is no approvable `reviewId`. Correct the provider/model reporting and recheck. Never use an earlier approval to bypass API failure or a later `deny`.
 
 After upgrading to SQLite schema 6, old cache entries are non-reusable and old Human Reviews are history only. Obtain a newly issued Human Review and explicit approval when required; do not try to reuse an old review ID. Audit history and matching Environment Approvals are preserved, and provider/model changes alone do not require new Environment Approval.
 

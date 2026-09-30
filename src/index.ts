@@ -373,7 +373,7 @@ async function main(): Promise<void> {
     {
       title: 'Check command safety with Jev',
       description:
-        'Evaluate whether a command may destroy or irreversibly modify existing data, databases, files, credentials, or systems.',
+        'Evaluate whether a command may destroy or irreversibly modify existing data, databases, files, credentials, or systems. Never reuses command allow cache. Scripts, wrappers, and unsupported direct-command syntax require review even with low Jev risk; no command reviewId is issued.',
       inputSchema: {
         command: z.string().describe('The command to evaluate; it will not be executed.'),
         cwd: z.string().optional().describe('Optional working directory or project path.'),

@@ -31,7 +31,7 @@ CLOUDFLARE_API_TOKEN=your-api-token
 
 再現可能な安全判定のため、TypeSafe modelはversion付きIDへ固定することを推奨します。`jev-latest`や`jev-preview`などの可変aliasも利用できますが、設定変更なしで実モデルが変わり得るため、そのallow判定はSafety Fingerprint Cacheから再利用しません。応答の`jevProvider`、`requestedModel`、`actualModel`で、選択したprovider、設定したmodel、APIが返した実modelを区別できます。
 
-Cloudflareの`typesafe/jev`も可変modelとして扱い、Jev評価が必要なチェックでは毎回APIを呼び出します。自動判定のallowを再利用できるのは、固定したTypeSafeの`jev-X.Y.Z`で、APIが返した実modelと要求modelが一致していた場合だけです。Human Approvalによるallowは再利用可能なallow cacheへ保存しません。
+Cloudflareの`typesafe/jev`も可変modelとして扱い、Jev評価が必要なチェックでは毎回APIを呼び出します。`jev_check_test`で自動判定のallowを再利用できるのは、固定したTypeSafeの`jev-X.Y.Z`で、APIが返した実modelと要求modelが一致していた場合だけです。Human Approvalによるallowは再利用可能なallow cacheへ保存しません。
 
 直接接続のendpointと現在利用できるmodel IDは、TypeSafe AI公式の[API reference](https://docs.typesafe.ai/api)と[model list](https://docs.typesafe.ai/models)を参照してください。
 
@@ -96,6 +96,23 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 結果には後方互換用の`dangerous`と`model`に加え、`riskScore`、`categories`、カテゴリ別`risks`、`staticFindings`、該当する場合は`jevProvider`、`requestedModel`、`actualModel`が含まれます。`allowed=false`は実行許可を意味しません。
 
 組み込みポリシーは [`policies/default.json`](policies/default.json) にあり、filesystem、Git、DB、コンテナ、サービス、deployment、package管理などを対象にします。静的に明確なdenyとなる操作は、Jevが低リスクを返しても許可されません。
+
+### コマンドの審査範囲とキャッシュ
+
+`jev_check_command`は、固定TypeSafe modelの場合も含め、再利用可能なallow cacheを読み書きしません。入力とPolicyの検証に成功し、静的`deny`のないチェックでは、毎回Jevを呼び出します。旧コマンドcacheは参照せず履歴として保持し、監査記録には`cacheStatus=disabled`を記録します。テストのcache動作は変更しません。
+
+対応する直接コマンドの構文は、次に限定します。
+
+- `ls`、`cat`、`mkdir`、`rmdir`、`touch`、`cp`、`mv`、`rm`。引数も以下の構文に従います。
+- `pwd`。任意の引数は`-L`または`-P`だけです。
+- `git status`。任意の引数は`--short`, `-s`, `--branch`, `-b`, `--show-stash`, `--porcelain`, `--porcelain=v1`, `--porcelain=v2`, `--long`, `--untracked-files`, `--untracked-files=no`, `--untracked-files=normal`, `--untracked-files=all`, `--ignored`, `--ignored=traditional`, `--ignored=matching`, `--ignored=no`だけです。
+- `git diff`。`--no-ext-diff`と`--no-textconv`の両方が必須です。任意の`--`より前では、この2つと`--stat`、`--name-only`、`--name-status`、`--cached`、`--staged`だけに対応し、パスは`--`の後に指定できます。
+
+tokenに使える文字はASCII英字・数字、`_`、`.`、`/`、`:`、`=`、`+`、`-`だけで、spaceまたはtabで区切ります。先頭・末尾のspaceとtabも許容します。実行ファイル名は上記の名前との完全一致が必要です。引用符、escape、改行、置換、展開、pipeline、redirect、複合コマンド、wrapper、その他のGit option／subcommand、未知の実行ファイルは対象外です。構文一致は毎回の静的検査・Jev評価の対象になるだけで、自動的なallowを意味しません。実行ファイルの解決、PATH、alias／function、インストール済みbinaryの同一性、fsmonitorを含むGit設定、runtime resourceは監査しません。
+
+スクリプト（`node task.js`、`python task.py`、`./task.sh`）、dispatcher（`npm run`、`make`、`composer run-script`）、wrapper、その他の非対応構文は、`staticFindings`に`command.execution-content-unreviewed`を追加します。Serverは本文を読み込まず、依存関係・設定も解決しません。Jevが低リスクでも最低限`decision=review`、`allowed=false`、`needsHumanReview=true`を返し、静的検査またはJevの`deny`は優先します。`context`へコードや承認の申告を追加したり、allow policyを設定したりしても、このfindingは解除されません。コマンドチェックでは`reviewId`を発行せず、`jev_review_approve`や人の承認だけで実行内容の不足を解除することもできません。同じ非対応コマンドの再チェックは引き続き`review`となり、このリリースではスクリプトの自動承認を提供しません。
+
+移行：旧Serverのプロセスを停止し、更新後に`npm run build`を実行して再起動し、実行前に再チェックしてください。コマンド用evaluatorに`command-scope-v1:no-command-cache-v1`を追加します。SQLiteはschema 6のままで、新しいDB移行・削除は不要です。このコマンド専用の更新によって、既存の監査／cache履歴、テストcache、テストのHuman Review、一致するEnvironment Approval、テストのExecution Ticketは失効しません。旧Serverは旧コマンドcacheを再利用できるため、同じcacheとの併用や、reviewを迂回するためのダウングレードは行わないでください。
 
 ### User / Project policy
 
@@ -213,7 +230,7 @@ Profile v2では`testFiles`と同じファイルを示す構造化`execution`を
 - Cloudflare tokenやTypeSafe API keyは、ログ、MCPレスポンス、fingerprint、cacheへ出力・保存しません。
 - Jev API障害、不正レスポンス、ポリシー読み込み失敗時はfail closedで `review` を返します。
 - 別providerへの自動retryやfailoverは行いません。静的／Project Policyの`deny`はAPI障害時も`deny`を維持し、既存denyがないAPI失敗は`review`となり、過去のHuman Approvalでは迂回できません。
-- このツールは完全なshell parserや実行環境の監査ではありません。動的生成、alias、shell functionなどは別途確認してください。
+- このツールは完全なshell parserや実行環境の監査ではありません。コマンドチェックでは非対応構文や未審査スクリプトを`review`とし、対応する直接コマンドでも実行ファイルの解決やruntime resourceを検証しません。
 
 ## 開発
 

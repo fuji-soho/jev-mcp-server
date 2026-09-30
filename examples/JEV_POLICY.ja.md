@@ -82,6 +82,18 @@
 - 再帰オプション
 - forceオプション
 
+### コマンドの審査範囲とキャッシュ
+
+`jev_check_command`は、provider／modelによらずallow cacheを再利用しません。入力とPolicyの検証に成功し、静的`deny`のないチェックでは、毎回Jevを評価します。旧コマンドcacheは履歴としてのみ扱い、テストのcache動作は変更しません。
+
+対応範囲は単純な`ls`、`cat`、`mkdir`、`rmdir`、`touch`、`cp`、`mv`、`rm`、任意の引数が`-L`／`-P`だけの`pwd`、READMEに記載した限定optionの`git status`、記載したoptionと`--`以降のパスを使う`git diff --no-ext-diff --no-textconv`です。tokenはASCII英字・数字と`_./:=+-`だけで、space／tabで区切ります。引用符、escape、改行、shell演算子／展開、wrapper、未知の実行ファイル、非対応のGit option／subcommandはreviewが必要です。この分類はPATH、alias／function、binaryの同一性、fsmonitorを含むGit設定、runtime resourceを検証しません。READMEの正確な対応構文を確認し、似たコマンドから対応を推測しないでください。
+
+`staticFindings`に`command.execution-content-unreviewed`がある場合は停止してください。スクリプト本文、依存関係／設定の内容、動的な実行内容は審査されていません。`node task.js`、`python task.py`、`./task.sh`などのスクリプトや、`npm run`、`make`、`composer run-script`などのdispatcherは、Jevが低リスクでも`review`のままです。コマンド用の`reviewId`は発行しません。`jev_review_approve`の呼び出し、allow policyの追加、`context`へのコード／承認申告の追加、人の承認だけで内容不足を解除してはいけません。このリリースでは、同じ非対応コマンドを繰り返しても自動承認されないことを説明してください。静的検査／Jevの`deny`は優先します。この条件を回避することだけを目的としてコマンドを簡略化・書き換えてはいけません。
+
+コマンド文字列が同じでも、スクリプト本文、関連設定／依存関係、その他の実行入力が変われば再チェックしてください。チェックはファイルをlockせず、実行時の同一性も強制しません。チェックした入力を実行まで維持してください。
+
+`command-scope-v1:no-command-cache-v1`への更新では、旧Serverのプロセスを停止し、更新済みServerを再build／再起動して再チェックしてください。SQLiteはschema 6のままで、このコマンド専用更新により履歴や、既存テストcache／Human Review／Environment Approval／Execution Ticketの動作は変更しません。旧Serverや旧コマンドallowで新しいreview条件を迂回してはいけません。
+
 ### 読み取り専用操作
 
 永続的な状態を変更しないことが明確な読み取り専用コマンドについては、Jevチェックを省略できます。
@@ -174,7 +186,7 @@ Human ApprovalでStatic Check、Jev、Built-in Policy、User Policy、Project Po
 
 Human Reviewの期限は作成時から1時間で、承認によって延長されません。Human Approvalによるallowは再利用可能なallow cacheへ保存しません。承認が必要なチェックではJevを再評価してから、承認の状態・期限・安全Contextの完全一致・APIが返した実modelを照合します。reviewのContextとともに`jevProvider`、`requestedModel`、`actualModel`を人に提示してください。Serverの承認用fingerprintにはコードfingerprint、正確なcommand・対象ファイル・cwdのContext、実modelを含むため、`codeAssessment.fingerprint`と同一視してはいけません。同じ要求aliasでも実modelが変わり、引き続き承認が必要なら新しいHuman Reviewが必要です。期限切れのpending／approved reviewには、新しく発行されたreview IDと新しい明示的承認が必要です。
 
-自動判定のallow cacheを再利用できるのは、実modelと要求modelが一致していた固定TypeSafe modelの`jev-X.Y.Z`だけです。TypeSafeの可変aliasとCloudflareの`typesafe/jev`は、Jev評価が必要な場合に毎回APIを呼び出します。`JEV_MODEL_ID_UNVERIFIED`の場合は停止してください。承認可能な`reviewId`は存在しません。provider／modelの応答を修正して再チェックしてください。API失敗や後続の`deny`を過去の承認で迂回してはいけません。
+`jev_check_test`で自動判定のallow cacheを再利用できるのは、実modelと要求modelが一致していた固定TypeSafe modelの`jev-X.Y.Z`だけです。TypeSafeの可変aliasとCloudflareの`typesafe/jev`は、Jev評価が必要な場合に毎回APIを呼び出します。`JEV_MODEL_ID_UNVERIFIED`の場合は停止してください。承認可能な`reviewId`は存在しません。provider／modelの応答を修正して再チェックしてください。API失敗や後続の`deny`を過去の承認で迂回してはいけません。
 
 SQLite schema 6への更新後、旧cacheは再利用不可となり、旧Human Reviewは履歴としてのみ残ります。必要に応じて新しいHuman Reviewの発行と明示的承認を受け、古いreview IDを再利用しようとしないでください。監査履歴と、一致するEnvironment Approvalは保持され、provider／model変更だけではEnvironment Approvalの再承認は不要です。
 

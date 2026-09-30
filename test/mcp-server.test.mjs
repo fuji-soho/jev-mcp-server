@@ -1,9 +1,40 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+test('jev_check_command returns unreviewed-content findings through MCP without approval IDs', async () => {
+  const temporary = mkdtempSync('/tmp/jev-mcp-command-scope-');
+  const envPath = join(temporary, 'jev.env');
+  const preload = join(temporary, 'mock-fetch.mjs');
+  writeFileSync(envPath, 'JEV_PROVIDER=typesafe\nTYPESAFE_API_KEY=mock-key\nTYPESAFE_MODEL=jev-1.13.0\n');
+  writeFileSync(preload, `globalThis.fetch = async () => new Response(JSON.stringify({ model: 'jev-1.13.0', answers: { command_dangerous: { type: 'noul', noul: 0.1 } }, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });`);
+  const environment = Object.fromEntries(Object.entries(process.env).filter((entry) => entry[1] !== undefined));
+  environment.JEV_ENV_PATH = envPath;
+  environment.JEV_CACHE_DB_PATH = ':memory:';
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--import', pathToFileURL(preload).href, resolve('dist/index.js')], cwd: process.cwd(), env: environment, stderr: 'pipe' });
+  const client = new Client({ name: 'jev-command-test-client', version: '1.0.0' });
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'jev_check_command', arguments: { command: 'node task.js', cwd: temporary } });
+    assert.equal(result.isError ?? false, false);
+    assert.equal(result.structuredContent.ok, true);
+    assert.equal(result.structuredContent.decision, 'review');
+    assert.equal(result.structuredContent.allowed, false);
+    assert.equal(result.structuredContent.needsHumanReview, true);
+    assert.equal(result.structuredContent.reviewId, undefined);
+    assert.equal(result.structuredContent.actualModel, 'jev-1.13.0');
+    assert.ok(result.structuredContent.staticFindings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed'));
+    const direct = await client.callTool({ name: 'jev_check_command', arguments: { command: 'pwd', cwd: temporary } });
+    assert.equal(direct.structuredContent.decision, 'allow');
+  } finally {
+    await client.close();
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
 
 test('jev_check_test returns structured file errors and related-code findings through MCP', async () => {
   const temporary = mkdtempSync('/tmp/jev-mcp-missing-file-');

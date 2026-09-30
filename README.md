@@ -31,7 +31,7 @@ CLOUDFLARE_API_TOKEN=your-api-token
 
 Pin a versioned TypeSafe model for reproducible safety decisions. Moving aliases such as `jev-latest` and `jev-preview` can resolve to a different model without a configuration change; they are accepted, but their allow decisions are not reused from the Safety Fingerprint Cache. The response fields `jevProvider`, `requestedModel`, and `actualModel` distinguish the selected provider, configured model, and version reported by the API.
 
-Cloudflare's `typesafe/jev` is also treated as a moving model: every check requiring Jev calls the API. Only pinned TypeSafe `jev-X.Y.Z` models can reuse an automatic allow decision, and only when the API-reported actual model matched the requested model. Human Approval never populates the reusable allow cache.
+Cloudflare's `typesafe/jev` is also treated as a moving model: every check requiring Jev calls the API. For `jev_check_test`, only pinned TypeSafe `jev-X.Y.Z` models can reuse an automatic allow decision, and only when the API-reported actual model matched the requested model. Human Approval never populates the reusable allow cache.
 
 See the TypeSafe AI [API reference](https://docs.typesafe.ai/api) and [model list](https://docs.typesafe.ai/models) for the direct endpoint and currently available model IDs.
 
@@ -96,6 +96,23 @@ Main decisions:
 Results include the backward-compatible `dangerous` and `model` fields as well as `riskScore`, `categories`, category-specific `risks`, `staticFindings`, and, when applicable, `jevProvider`, `requestedModel`, and `actualModel`. `allowed=false` does not mean that execution is authorized.
 
 The built-in policy is located at [`policies/default.json`](policies/default.json) and covers filesystem, Git, databases, containers, services, deployments, package management, and more. Operations that are clearly denied statically remain denied even if Jev returns a low-risk result.
+
+### Command review scope and cache
+
+`jev_check_command` never reads or writes reusable allow-cache entries, including for pinned TypeSafe models. Once input and policy validation succeed, each check without a static `deny` calls Jev again. Existing command cache rows are ignored and retained as history; audit records use `cacheStatus=disabled`. Test-cache behavior is unchanged.
+
+The supported direct-command syntax is deliberately limited:
+
+- `ls`, `cat`, `mkdir`, `rmdir`, `touch`, `cp`, `mv`, and `rm`, with arguments in the syntax below.
+- `pwd`, optionally followed only by `-L` or `-P`.
+- `git status`, optionally followed only by `--short`, `-s`, `--branch`, `-b`, `--show-stash`, `--porcelain`, `--porcelain=v1`, `--porcelain=v2`, `--long`, `--untracked-files`, `--untracked-files=no`, `--untracked-files=normal`, `--untracked-files=all`, `--ignored`, `--ignored=traditional`, `--ignored=matching`, `--ignored=no`.
+- `git diff` with both `--no-ext-diff` and `--no-textconv`. Before an optional `--`, only those two flags plus `--stat`, `--name-only`, `--name-status`, `--cached`, and `--staged` are supported. Paths may follow `--`.
+
+Tokens must use only ASCII letters, digits, `_`, `.`, `/`, `:`, `=`, `+`, and `-`, separated by spaces or tabs; leading/trailing spaces and tabs are accepted. Executable names must match the names above exactly. Quotes, escapes, newlines, substitutions, expansions, pipelines, redirects, compound commands, wrapper commands, other Git options/subcommands, and unknown executables are outside this scope. Matching this syntax only permits fresh static/Jev evaluation; it is not an automatic allow. Executable resolution, PATH, aliases/functions, installed binary integrity, Git configuration (including fsmonitor), and runtime resources are not audited.
+
+Scripts (`node task.js`, `python task.py`, `./task.sh`), dispatchers (`npm run`, `make`, `composer run-script`), wrappers, and any unsupported syntax add `command.execution-content-unreviewed` to `staticFindings`. The server does not read their bodies or resolve dependencies/configuration. Even a low-risk Jev result returns at least `decision=review`, `allowed=false`, `needsHumanReview=true`; static or Jev `deny` still wins. Putting code or approval claims in `context`, or adding an allow policy, does not remove this finding. No `reviewId` is issued for command checks, and `jev_review_approve` or human approval alone cannot clear missing execution evidence. Repeating the same unsupported command remains `review`; this release does not provide automatic script approval.
+
+Migration: stop old server processes, update and run `npm run build`, restart, and recheck before execution. The command evaluator adds `command-scope-v1:no-command-cache-v1`; SQLite remains at schema 6, with no new DB migration or deletion. Existing audit/cache history, test caches, test Human Reviews, matching Environment Approvals, and test Execution Tickets are preserved by this command-only update. Do not run an older server against the shared cache or downgrade to bypass review: it can still reuse old command entries.
 
 ### User / Project policy
 
@@ -225,7 +242,7 @@ An approved environment plus static and Jev allow returns a single-use, five-min
 - Does not output Cloudflare tokens or TypeSafe API keys to logs, MCP responses, fingerprints, or caches.
 - Returns `review` fail-closed when the Jev API is unavailable, the response is invalid, or a policy cannot be loaded.
 - Does not automatically retry through or fail over to a different provider. A static or project-policy `deny` remains `deny` during API failures, while an API failure with no existing deny returns `review` and cannot be bypassed by an earlier Human Approval.
-- This tool is not a complete shell parser or execution-environment audit. Review dynamic command generation, aliases, shell functions, and similar cases separately.
+- This tool is not a complete shell parser or execution-environment audit. Command checks require `review` for unsupported syntax and unreviewed scripts; even supported direct commands do not verify executable resolution or runtime resources.
 
 ## Development
 
