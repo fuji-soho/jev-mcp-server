@@ -10,7 +10,7 @@ import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
 import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
-import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256 } from './safety-fingerprint.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256, testInputIdentity, type TestFileIdentity } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, type EnvironmentApprovalKey } from './storage/environment-approval.js';
 import { issueExecutionTicket } from './storage/execution-ticket.js';
@@ -124,7 +124,7 @@ function sharedSafetyFiles(root: string): Array<{ key: string; digest: string; b
   return candidates.map((file) => fileDigest(root, file)).filter((item): item is { key: string; digest: string; bytes: number } => item !== undefined);
 }
 
-async function evaluateTestSingle(config: Config, input: TestCheckInput, targetKey = 'test', createTicket = true): Promise<TestCheckResult> {
+async function evaluateTestSingle(config: Config, input: TestCheckInput, targetKey = 'test', createTicket = true, fileIdentity?: TestFileIdentity): Promise<TestCheckResult> {
   const evaluation = { jevProvider: config.provider, requestedModel: config.requestedModel } as const;
   const modelVersion = evaluationIdentity(config);
   const cacheReusable = isEvaluationCacheReusable(config);
@@ -150,14 +150,12 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const dependencyFingerprint = safety.assessment.dependencyFingerprint ?? sha256(canonicalJson(sharedFiles));
   const contextHash = sha256(canonicalJson({ shared: { safety: safety.jevContext, policyVersion: policies.version, policyHash: policies.hash, files: sharedFiles, dependencyFingerprint }, runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard }));
   const runtimeHash = sha256(canonicalJson({ runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard, persistentDatabaseAccess: input.persistentDatabaseAccess }));
-  const testSpecific = safety.profileV2 === undefined
-    ? { command: safe.command, testCode: safe.testCode, diff: safe.diff, framework: safe.framework, environment: safe.environment, context: safe.context }
-    : { testCode: safe.testCode, diff: safe.diff, framework: safe.framework, context: safe.context };
+  const testSpecific = testInputIdentity(input, fileIdentity, safety.profileV2 !== undefined);
   const fingerprint = buildFingerprint({ projectId: pid, targetType: 'test-file', targetKey, testSpecific, sharedContext: { safety: safety.jevContext, policyHash: policies.hash, profile: safety.assessment, files: sharedFiles, dependencyFingerprint }, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION });
   const cacheKey: CacheKey = { projectId: pid, targetType: 'test-file', targetKey, fingerprint, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION };
   const humanReviewContext: Omit<HumanReviewKey, 'actualModel'> = {
     projectId: pid, targetType: 'test-file', targetKey, fingerprint,
-    commandHash: sha256(safe.command), testFilesHash: sha256(canonicalJson([targetKey])), cwdHash: sha256(root),
+    commandHash: sha256(input.command), testFilesHash: sha256(canonicalJson([targetKey])), cwdHash: sha256(root),
     policyHash: policies.hash, contextHash, runtimeHash,
     ...(safety.assessment.profileDigest === undefined ? {} : { safetyProfileHash: safety.assessment.profileDigest }),
   };
@@ -300,7 +298,7 @@ export async function evaluateTest(config: Config, input: TestCheckInput): Promi
   const results: TestCheckResult[] = [];
   for (const file of files) {
     if (!file.ok) continue;
-    results.push(await evaluateTestSingle(config, { ...input, cwd: root, testCode: file.content }, file.target, false));
+    results.push(await evaluateTestSingle(config, { ...input, cwd: root, testCode: file.content }, file.target, false, { digest: file.digest, bytes: file.bytes }));
   }
   const decision = strictestDecision(results.map((result) => result.decision));
   const first = results[0] ?? reviewResult('No test files were supplied.', [], 'INVALID_INPUT');

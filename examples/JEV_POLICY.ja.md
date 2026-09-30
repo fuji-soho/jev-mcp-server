@@ -178,7 +178,11 @@ Human Reviewの期限は作成時から1時間で、承認によって延長さ�
 
 SQLite schema 6への更新後、旧cacheは再利用不可となり、旧Human Reviewは履歴としてのみ残ります。必要に応じて新しいHuman Reviewの発行と明示的承認を受け、古いreview IDを再利用しようとしないでください。監査履歴と、一致するEnvironment Approvalは保持され、provider／model変更だけではEnvironment Approvalの再承認は不要です。
 
-`jev_check_test` は、変更されていない再利用条件を満たす自動判定のSafety Fingerprint Cache、または実modelに紐付いた有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。API keyはfingerprintの入力に含めません。
+`jev_check_test` は、変更されていない再利用条件を満たす自動判定のSafety Fingerprint Cache、または実modelに紐付いた有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。Jev接続用のAPI keyはfingerprintの入力に含めません。
+
+API送信用のマスク結果を入力の同一性とみなしてはいけません。テストファイルは元バイト列のdigestで識別し、インラインの`testCode`、`diff`、`context`、該当するテストcommandはマスク前にハッシュ化します。マスク対象の値だけの変更でも`jev_check_test`を再実行し、APIへ送るマスク済みのテキストが同じという理由でcacheやHuman Approvalを再利用できると判断してはいけません。新しい結果がHuman Reviewを要求する場合は、新しく発行されたreview IDと明示的承認を受けてください。変更を説明するために平文の秘密情報を送信・記録してはいけません。Jev接続用認証情報は引き続き対象外ですが、評価対象のコードやテスト引数内の認証情報はdigestへ影響します。テストコードだけの変更では一致するProfile v2のEnvironment Approvalを維持し、許可されたfilterだけの変更ではコード評価を再利用できます。
+
+`raw-test-input-v1`へのevaluator更新後は、SQLiteがschema 6のままでも旧cacheとHuman Reviewは新しい同一性に一致しません。再チェックし、必要なら新しいHuman Reviewを受け、現在のコードfingerprintに対する新しいExecution Ticketを取得してください。監査履歴と、一致するEnvironment Approvalは保持されます。更新したServerを使用し、古いevaluatorや古いreview／Ticketへ戻して再評価を迂回してはいけません。
 
 Laravelでは `framework` に `laravel` を指定してください。既存の `runtimeDatabase`、`configCache`、`runtimeGuard`、`persistentDatabaseAccess` も引き続き利用できます。`RefreshDatabase`、`DatabaseMigrations`、`DatabaseTruncation`、`migrate:fresh`、`db:wipe`、永続DBのターゲット、テスト設定とruntime設定の不一致は安全性のfindingとして扱ってください。
 

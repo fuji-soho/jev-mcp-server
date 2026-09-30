@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import type { TestFileError } from './types.js';
+import type { TestCheckInput, TestFileError } from './types.js';
 
 export const FINGERPRINT_SCHEMA_VERSION = 2;
-export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1';
+export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1';
 
 function normalize(value: unknown): unknown {
   if (typeof value === 'string') return value.replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n').normalize('NFC');
@@ -17,6 +17,22 @@ function normalize(value: unknown): unknown {
 
 export function canonicalJson(value: unknown): string { return JSON.stringify(normalize(value)); }
 export function sha256(value: string | Buffer): string { return `sha256:${createHash('sha256').update(value).digest('hex')}`; }
+
+export interface TestFileIdentity { digest: string; bytes: number; }
+
+/** Hash before redaction or canonical normalization; never include raw input in the returned identity. */
+export function testInputIdentity(input: TestCheckInput, file?: TestFileIdentity, profileV2 = false): unknown {
+  const digest = (value: string | undefined): string | null => value === undefined ? null : sha256(Buffer.from(value, 'utf8'));
+  return {
+    schemaVersion: 1,
+    source: file === undefined ? { kind: 'inline', digest: digest(input.testCode) } : { kind: 'file', digest: file.digest, bytes: file.bytes },
+    diff: digest(input.diff),
+    framework: digest(input.framework),
+    context: digest(input.context),
+    // Profile v2 separates runner/selection identity from reusable code evaluation.
+    ...(profileV2 ? {} : { command: digest(input.command), environment: digest(input.environment) }),
+  };
+}
 
 export function projectId(root: string): string { return sha256(resolve(root)); }
 

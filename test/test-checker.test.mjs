@@ -8,6 +8,7 @@ import { assessSafetyProfile, verifySafetyProfile } from '../dist/test-safety-pr
 import { openDatabase } from '../dist/storage/sqlite.js';
 import { getHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
+import { consumeExecutionTicket } from '../dist/storage/execution-ticket.js';
 
 const config = {
   provider: 'cloudflare',
@@ -22,6 +23,174 @@ function modelResponse(provider, dangerous = 0.1, model = 'jev-1.13.0') {
   const output = { model, answers: { test_dangerous: { type: 'noul', noul: dangerous } }, usage: { input_tokens: 1, output_tokens: 1 } };
   return new Response(JSON.stringify(provider === 'cloudflare' ? { success: true, result: { state: 'Completed', result: output } } : output), { status: 200 });
 }
+
+function isolatedInput(cwd) {
+  return { command: 'node --test tests/check.js', cwd, environment: 'testing', isolation: { temporaryFilesystem: true, mockedExternalServices: true }, runtime: { productionAccess: false, persistentStorageAccess: false, networkAccess: false } };
+}
+
+function temporaryTestProject(t) {
+  const cwd = mkdtempSync(join(tmpdir(), 'jev-raw-input-'));
+  mkdirSync(join(cwd, 'tests'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  return cwd;
+}
+
+test('masked-only file changes miss cache without exposing raw values', async (t) => {
+  const cwd = temporaryTestProject(t);
+  const logPath = join(cwd, 'jev.log');
+  const priorLogPath = process.env.JEV_LOG_PATH;
+  process.env.JEV_LOG_PATH = logPath;
+  t.after(() => { if (priorLogPath === undefined) delete process.env.JEV_LOG_PATH; else process.env.JEV_LOG_PATH = priorLogPath; });
+  const file = join(cwd, 'tests', 'check.js');
+  const secrets = ['raw-fixture-alpha-7283', 'raw-fixture-beta-9641'];
+  const input = { ...isolatedInput(cwd), testFiles: ['tests/check.js'] };
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => { bodies.push(init.body); return modelResponse('typesafe'); };
+  writeFileSync(file, `const secret = "${secrets[0]}";\n`);
+  const first = await evaluateTest(pinnedConfig, input);
+  assert.equal(first.decision, 'allow');
+  const unchanged = await evaluateTest(pinnedConfig, input);
+  assert.equal(unchanged.codeAssessment.status, 'cache-hit');
+  assert.equal(bodies.length, 1);
+  writeFileSync(file, `const secret = "${secrets[1]}";\n`);
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.decision, 'allow');
+  assert.equal(changed.codeAssessment.status, 'evaluated');
+  assert.notEqual(changed.codeAssessment.fingerprint, first.codeAssessment.fingerprint);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0], bodies[1], 'outbound masked code remains identical');
+  const db = openDatabase();
+  const persisted = ['fingerprint_cache', 'human_reviews', 'audit_log', 'execution_tickets'].map((table) => JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all())).join('\n');
+  const outputs = JSON.stringify([first, unchanged, changed]);
+  for (const secret of secrets) {
+    assert.equal(bodies.join('\n').includes(secret), false);
+    assert.equal(persisted.includes(secret), false);
+    assert.equal(outputs.includes(secret), false);
+    assert.equal(readFileSync(logPath, 'utf8').includes(secret), false);
+  }
+});
+
+for (const field of ['testCode', 'diff', 'context', 'command']) {
+  test(`masked-only inline ${field} changes invalidate cache and Human Approval`, async (t) => {
+    const cwd = temporaryTestProject(t);
+    const base = isolatedInput(cwd);
+    const value = (suffix) => field === 'command' ? `node --test --token inline-fixture-${suffix}` : `const secret = "inline-fixture-${suffix}";`;
+    const firstInput = { ...base, [field]: value('a') };
+    const secondInput = { ...base, [field]: value('b') };
+    let calls = 0;
+    let dangerous = 0.1;
+    const bodies = [];
+    globalThis.fetch = async (_url, init) => { calls += 1; bodies.push(init.body); return modelResponse('typesafe', dangerous); };
+    const first = await evaluateTest(pinnedConfig, firstInput);
+    assert.equal(first.decision, 'allow');
+    assert.equal((await evaluateTest(pinnedConfig, firstInput)).codeAssessment.status, 'cache-hit');
+    const changed = await evaluateTest(pinnedConfig, secondInput);
+    assert.equal(changed.codeAssessment.status, 'evaluated');
+    assert.notEqual(changed.codeAssessment.fingerprint, first.codeAssessment.fingerprint);
+    assert.equal(calls, 2);
+    assert.equal(bodies[0], bodies[1]);
+    // A separate target avoids an automatic allow entry masking the approval test.
+    const reviewA = { ...firstInput, framework: 'vitest' };
+    const reviewB = { ...secondInput, framework: 'vitest' };
+    dangerous = 0.5;
+    const pending = await evaluateTest(pinnedConfig, reviewA);
+    assert.equal(pending.decision, 'review');
+    transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+    assert.equal((await evaluateTest(pinnedConfig, reviewA)).decision, 'allow');
+    const changedReview = await evaluateTest(pinnedConfig, reviewB);
+    assert.equal(changedReview.decision, 'review');
+    assert.equal(changedReview.allowed, false);
+    assert.notEqual(changedReview.reviewId, pending.reviewId);
+    assert.equal(calls, 5);
+  });
+}
+
+test('file identity uses original bytes even when UTF-8 decoding produces identical code', async (t) => {
+  const cwd = temporaryTestProject(t);
+  const file = join(cwd, 'tests', 'check.js');
+  const input = { ...isolatedInput(cwd), testFiles: ['tests/check.js'] };
+  let calls = 0;
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => { calls += 1; bodies.push(init.body); return modelResponse('typesafe'); };
+  writeFileSync(file, Buffer.from([0x2f, 0x2f, 0xff]));
+  const first = await evaluateTest(pinnedConfig, input);
+  writeFileSync(file, Buffer.from([0x2f, 0x2f, 0xfe]));
+  const second = await evaluateTest(pinnedConfig, input);
+  assert.equal(first.decision, 'allow');
+  assert.equal(second.codeAssessment.status, 'evaluated');
+  assert.notEqual(first.codeAssessment.fingerprint, second.codeAssessment.fingerprint);
+  assert.equal(bodies[0], bodies[1]);
+  assert.equal(calls, 2);
+});
+
+test('only the file with a masked-only change is re-evaluated in a multi-file check', async (t) => {
+  const cwd = temporaryTestProject(t);
+  const files = ['tests/check.js', 'tests/other.js'];
+  for (const file of files) writeFileSync(join(cwd, file), 'const secret = "multi-fixture-a";\n');
+  const input = { ...isolatedInput(cwd), testFiles: files };
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return modelResponse('typesafe'); };
+  await evaluateTest(pinnedConfig, input);
+  assert.equal(calls, 2);
+  writeFileSync(join(cwd, files[0]), 'const secret = "multi-fixture-b";\n');
+  assert.equal((await evaluateTest(pinnedConfig, input)).decision, 'allow');
+  assert.equal(calls, 3);
+});
+
+test('a masked-only file change cannot reuse Human Approval', async (t) => {
+  const cwd = temporaryTestProject(t);
+  const file = join(cwd, 'tests', 'check.js');
+  const input = { ...isolatedInput(cwd), testFiles: ['tests/check.js'] };
+  globalThis.fetch = async () => modelResponse('typesafe', 0.5);
+  writeFileSync(file, 'const secret = "approval-fixture-a";\n');
+  const pending = await evaluateTest(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(pinnedConfig, input)).decision, 'allow');
+  writeFileSync(file, 'const secret = "approval-fixture-b";\n');
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.decision, 'review');
+  assert.equal(changed.allowed, false);
+  assert.notEqual(changed.reviewId, pending.reviewId);
+  assert.notEqual(changed.codeAssessment.fingerprint, pending.codeAssessment.fingerprint);
+});
+
+test('Profile v2 detects masked file changes while preserving environment approval and selector cache reuse', async (t) => {
+  const cwd = profileV2Project();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const file = join(cwd, 'tests', 'Feature', 'RawTest.php');
+  const input = profileV2Input(cwd, 'tests/Feature/RawTest.php');
+  writeFileSync(file, '<?php $secret = "v2-fixture-a";\n');
+  let dangerous = 0.1;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return modelResponse('typesafe', dangerous); };
+  const pending = await evaluateTest(pinnedConfig, input);
+  const now = new Date();
+  transitionEnvironmentApproval(openDatabase(), pending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+  const first = await evaluateTest(pinnedConfig, input);
+  assert.equal(first.decision, 'allow');
+  const filtered = await evaluateTest(pinnedConfig, profileV2Input(cwd, 'tests/Feature/RawTest.php', 'RawTest::testIt'));
+  assert.equal(filtered.codeAssessment.status, 'cache-hit');
+  assert.equal(calls, 1);
+  writeFileSync(file, '<?php $secret = "v2-fixture-b";\n');
+  dangerous = 0.5;
+  const codePending = await evaluateTest(pinnedConfig, input);
+  assert.equal(codePending.decision, 'review');
+  assert.equal(codePending.environmentAssessment.approvalId, first.environmentAssessment.approvalId);
+  transitionHumanReview(openDatabase(), codePending.reviewId, 'approve', now.toISOString());
+  const approved = await evaluateTest(pinnedConfig, input);
+  assert.equal(approved.decision, 'allow');
+  assert.notEqual(approved.codeAssessment.fingerprint, first.codeAssessment.fingerprint);
+  const currentKey = { approvalId: approved.environmentAssessment.approvalId, projectId: getHumanReview(openDatabase(), codePending.reviewId).projectId, environmentFingerprint: approved.environmentAssessment.environmentFingerprint, codeFingerprint: approved.codeAssessment.fingerprint, executionFingerprint: approved.executionAssessment.executionFingerprint };
+  assert.equal(consumeExecutionTicket(openDatabase(), first.executionAssessment.ticket, currentKey, now.toISOString()), false);
+  writeFileSync(file, '<?php $secret = "v2-fixture-c";\n');
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.decision, 'review');
+  assert.notEqual(changed.reviewId, codePending.reviewId);
+  assert.equal(changed.environmentAssessment.approvalId, first.environmentAssessment.approvalId);
+  assert.equal(changed.environmentReviewId, undefined);
+  assert.equal(changed.executionAssessment.ticket, undefined);
+  assert.equal(calls, 4);
+});
 
 const lowRiskResponse = () => new Response(JSON.stringify({
   success: true,

@@ -10,6 +10,7 @@ import { insertAudit } from '../dist/storage/audit-log.js';
 import { sanitizeAuditText } from '../dist/audit-sanitizer.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, revokeEnvironmentApproval, transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
 import { consumeExecutionTicket, issueExecutionTicket } from '../dist/storage/execution-ticket.js';
+import { buildFingerprint, EVALUATOR_VERSION, testInputIdentity } from '../dist/safety-fingerprint.js';
 
 const directories = [];
 afterEach(() => { resetDatabaseForTests(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -20,6 +21,24 @@ function key() { return { projectId: 'sha256:project', targetType: 'test-file', 
 function reviewKey() {
   return { projectId: 'sha256:project', targetType: 'test-file', targetKey: 'tests/Test1.php', fingerprint: 'sha256:code', commandHash: 'sha256:command', testFilesHash: 'sha256:files', cwdHash: 'sha256:cwd', policyHash: 'sha256:policy', contextHash: 'sha256:context', runtimeHash: 'sha256:runtime' };
 }
+
+test('the raw-input evaluator cannot reuse earlier cache or model-bound approval records', () => {
+  const db = openDatabase(databasePath());
+  const oldVersion = 'jev-mcp-server@1.1.0:approval-model-v1';
+  assert.notEqual(EVALUATOR_VERSION, oldVersion);
+  const common = key();
+  const oldFingerprint = buildFingerprint({ ...common, evaluatorVersion: oldVersion, testSpecific: { command: 'npm test', testCode: 'const secret = [REDACTED]' } });
+  const currentFingerprint = buildFingerprint({ ...common, evaluatorVersion: EVALUATOR_VERSION, testSpecific: testInputIdentity({ command: 'npm test', testCode: 'const secret = "fixture-b";' }) });
+  const now = '2026-09-30T00:00:00.000Z';
+  upsertCache(db, { ...common, fingerprint: oldFingerprint, evaluatorVersion: oldVersion }, 'allow', true, now, 'jev-1.13.0');
+  assert.equal(lookupAllow(db, { ...common, fingerprint: currentFingerprint, evaluatorVersion: EVALUATOR_VERSION }), undefined);
+  const approvedKey = bindHumanReviewModel({ ...reviewKey(), fingerprint: oldFingerprint }, 'jev-1.13.0');
+  const pending = createOrGetHumanReview(db, approvedKey, now, '2026-09-30T01:00:00.000Z');
+  transitionHumanReview(db, pending.reviewId, 'approve', now);
+  assert.equal(lookupApprovedHumanReview(db, bindHumanReviewModel({ ...reviewKey(), fingerprint: currentFingerprint }, 'jev-1.13.0'), now), undefined);
+  assert.equal(getHumanReview(db, pending.reviewId).status, 'approved', 'history remains available');
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '6');
+});
 
 test('approval fingerprints bind actual model and every supplied safety context', () => {
   const base = reviewKey();
