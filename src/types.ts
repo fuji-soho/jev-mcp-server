@@ -27,6 +27,7 @@ export type RiskCategory =
   | 'dependencies';
 
 export interface StaticFinding {
+  file?: string;
   ruleId: string;
   category: RiskCategory;
   severity: 'low' | 'medium' | 'high' | 'critical';
@@ -37,6 +38,7 @@ export interface StaticFinding {
 export type PolicySource = 'builtin' | 'user' | 'project';
 
 export interface PolicyFinding {
+  file?: string;
   source: PolicySource;
   rule: string;
   category: RiskCategory;

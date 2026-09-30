@@ -164,7 +164,7 @@ npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verifi
 
 #### Safety Profile v2とEnvironment Approval
 
-Profile v2では、人が初回確認する実行環境と、変更ごとに自動審査するテストコードを分離します。`environmentFiles`またはrunner本体が変わると環境再承認が必要ですが、テスト、assertion、許可された対象ファイル、filterの変更では環境承認を失効させません。`codeReviewRoots`の変更はコード審査キャッシュだけを失効させます。
+Profile v2では、人が初回確認する実行環境と、変更ごとに自動審査するテストコードを分離します。`environmentFiles`またはrunner本体が変わると環境再承認が必要ですが、テスト、assertion、許可された対象ファイル、filterの変更では環境承認を失効させません。`codeReviewRoots`配下のファイル追加・削除・元バイト列の変更は、対応するコード審査キャッシュとHuman Approvalを失効させますが、それ以外が一致するEnvironment Approvalは維持します。
 
 ```json
 {
@@ -192,6 +192,14 @@ Profile v2では、人が初回確認する実行環境と、変更ごとに自�
 ```
 
 Profile v2では`testFiles`と同じファイルを示す構造化`execution`を`jev_check_test`へ渡します。`command`にはrunnerの相対パスだけを指定し、対象やfilterをshell文字列へ連結しません。
+
+各チェックで、Serverは`codeReviewRoots`配下の全ファイルの現在のUTF-8本文を読み、重複するrootを重複排除します。同一のメモリ上のスナップショットから元バイト列のdigestを作り、Built-in／User／Project Policy・frameworkの静的検査を行い、マスクした`relatedCode`（`file`、`content`）をJevへ送ります。1リクエスト内の複数`testFiles`はこのスナップショットを共有します。関連コードのfindingにはproject相対パスの`file`が付く場合があります。平文の本文はSQLite・ログ・MCP結果へ保存せず、Server外へ送る本文はマスク済みのみです。マスクはbest effortなので、利用前に設定範囲の機密情報を確認してください。
+
+審査上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親要素を含むsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`で停止します。無断の切り詰めや拡張子による除外はしません。承認可能な`reviewId`、cache／Human Approvalによる迂回、Execution Ticketはなく、範囲・読み取り可否・リクエスト容量を修正して再チェックしてください。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを失効させません。
+
+審査範囲は指定テストと明示した`codeReviewRoots`のみで、import・package・動的依存を自動展開しません。`codeReviewRoots: []`は有効ですが、追加コード審査を指定していないという意味であり、依存全体の安全性を示しません。上限内で適切な範囲を選定してください（例の大きな`app`や`composer.lock`は上限を超える場合があります）。停止の回避だけを目的に必要なファイルを除外してはいけません。runner側のresource・fingerprint確認も引き続き必要です。
+
+移行：`related-code-v1`へのevaluator更新により、SQLiteがschema 6のままでも以前のコードcacheとHuman Reviewは再利用できません。更新したServerを再build／再起動し、再チェックして、必要なら新しいHuman Approvalと新しいExecution Ticketを取得してください。監査・review履歴と、一致するEnvironment Approvalは維持します。既存Profile v2の設定は新しい審査上限を満たす必要がありますが、入力引数とprofile形式は変わりません。
 
 初回は`environmentReviewId`と`decision=review`が返ります。人がrunnerとresource scopeを確認した後、`jev_environment_approve`へそのIDだけを渡します。承認は既定で30日有効で、`jev_environment_revoke`により即時取消できます。
 

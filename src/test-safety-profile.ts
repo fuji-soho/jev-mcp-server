@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, lstatSync, realpathSync } from 
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { TestCheckInput, SafetyProfileAssessment, TestExecutionSelection } from './types.js';
-import { canonicalJson, digestPaths, projectId, relativeTarget, sha256 } from './safety-fingerprint.js';
+import { canonicalJson, digestPaths, projectId, readRelatedCode, relativeTarget, sha256, type RelatedCodeSnapshot } from './safety-fingerprint.js';
 
 const MAX_PROFILE_BYTES = 64 * 1024;
 const MAX_FILE_BYTES = 512 * 1024;
@@ -54,6 +54,7 @@ export interface SafetyProfileResult {
   jevContext: Record<string, unknown>;
   profileV2?: SafetyProfileV2;
   environmentScopeJson?: string;
+  relatedCode?: RelatedCodeSnapshot;
 }
 
 export interface ExecutionSelectionResult {
@@ -142,13 +143,14 @@ export function assessSafetyProfile(input: TestCheckInput, environment: NodeJS.P
   if (profile.version === 2) {
     try {
       const environmentManifest = digestPaths(root, [...profile.environmentFiles, ...profile.runner.files]);
-      const dependencyManifest = profile.codeReviewRoots.length === 0 ? { fingerprint: sha256('[]'), files: [] } : digestPaths(root, profile.codeReviewRoots);
+      const relatedCode = readRelatedCode(root, profile.codeReviewRoots);
+      const dependency = relatedCode.status === 'complete' ? { dependencyFingerprint: relatedCode.fingerprint } : {};
       const pid = projectId(root);
       const environmentScope = { projectId: pid, projectRoot: root, profileDigest, framework: profile.framework ?? null, environment: profile.environment, runner: profile.runner, resources: profile.resources, environmentFilesFingerprint: environmentManifest.fingerprint };
       const environmentScopeJson = canonicalJson(environmentScope);
       const environmentFingerprint = sha256(environmentScopeJson);
-      const assessment: SafetyProfileAssessment = { version: 2, status: 'unverified', profilePath, profileName: profile.name, fingerprintMatched: false, runtimeMatched: false, profileDigest, safetyFingerprint: environmentManifest.fingerprint, environmentFingerprint, dependencyFingerprint: dependencyManifest.fingerprint, runnerId: profile.runner.id, reason: 'Safety Profile v2 requires a matching Environment Approval.' };
-      return { assessment, profileV2: profile, environmentScopeJson, jevContext: { status: 'unverified', version: 2, profileName: profile.name, profileDigest, environmentFingerprint, dependencyFingerprint: dependencyManifest.fingerprint, runnerId: profile.runner.id, resources: profile.resources, projectId: pid } };
+      const assessment: SafetyProfileAssessment = { version: 2, status: 'unverified', profilePath, profileName: profile.name, fingerprintMatched: false, runtimeMatched: false, profileDigest, safetyFingerprint: environmentManifest.fingerprint, environmentFingerprint, ...dependency, runnerId: profile.runner.id, reason: 'Safety Profile v2 requires a matching Environment Approval.' };
+      return { assessment, profileV2: profile, environmentScopeJson, relatedCode, jevContext: { status: 'unverified', version: 2, profileName: profile.name, profileDigest, environmentFingerprint, ...dependency, runnerId: profile.runner.id, resources: profile.resources, projectId: pid } };
     } catch (error) { return invalidAssessment(error instanceof Error ? error.message : 'Safety Profile v2 files could not be fingerprinted.', profilePath); }
   }
   const paths = [...new Set([...profile.safetyFiles, ...(profile.runner?.files ?? [])])].sort();

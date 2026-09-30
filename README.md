@@ -176,7 +176,7 @@ The server only evaluates supplied evidence; it does not inspect a live process,
 
 #### Safety Profile v2 and Environment Approval
 
-Profile v2 separates the human-approved execution environment from test code reviewed on each change. Changes to `environmentFiles` or the runner require new environment approval. Tests, assertions, permitted file selectors, and filters do not. Changes under `codeReviewRoots` invalidate only code-review cache entries.
+Profile v2 separates the human-approved execution environment from test code reviewed on each change. Changes to `environmentFiles` or the runner require new environment approval. Tests, assertions, permitted file selectors, and filters do not. File additions, deletions, or original-byte changes under `codeReviewRoots` invalidate the matching code-review cache and Human Approval, but preserve an otherwise matching Environment Approval.
 
 ```json
 {
@@ -204,6 +204,14 @@ Profile v2 separates the human-approved execution environment from test code rev
 ```
 
 With Profile v2, pass a structured `execution` selecting the same files as `testFiles`. `command` names only the project-relative approved runner; targets and filters are not appended to a shell command.
+
+For each check, the server reads the full current UTF-8 contents of every file under `codeReviewRoots`, deduplicating overlapping roots. The same in-memory snapshot supplies original-byte digests, Built-in/User/Project Policy and framework checks, and masked `relatedCode` (`file`, `content`) sent to Jev. Multiple `testFiles` in one request share that snapshot. Related findings optionally include the project-relative `file`. Raw source contents are not stored in SQLite, logs, or MCP results; only masked contents leave the server. Masking is best-effort: inspect the configured scope for sensitive material before use.
+
+Review limits are 64 related files, 32 KiB per file, 64 KiB total original bytes, 4096 traversed entries (including directories), and 256 KiB for the complete serialized Jev request. Missing/unreadable paths, symlinks (including parent components), non-regular files, binary/non-UTF-8 contents, or exceeded limits stop with `RELATED_CODE_REVIEW_INCOMPLETE`, `decision=review`, and `allowed=false`. Nothing is silently truncated or skipped by extension. There is no approvable `reviewId`, cache/Human Approval bypass, or Execution Ticket; fix the scope/readability or request size and recheck. An already detected static `deny` remains `deny`. Related-review failure alone does not invalidate a matching Environment Approval.
+
+The review scope is the supplied tests plus explicitly configured `codeReviewRoots`; imports, packages, and dynamic dependencies are not automatically expanded. `codeReviewRoots: []` is valid but specifies no additional source review, not complete dependency safety. Select an appropriate scope within these limits (large `app` directories or `composer.lock` files in the example may exceed them); never remove relevant files solely to bypass a blocked review. Runner-side resource and fingerprint enforcement remains necessary.
+
+Migration: the `related-code-v1` evaluator update prevents reuse of earlier code caches and Human Reviews even though SQLite stays at schema 6. Restart/rebuild the updated server, recheck, obtain new Human Approval if requested, and use a fresh Execution Ticket. Audit/review history and matching Environment Approvals are retained. Existing Profile v2 configurations must meet the new review limits; input arguments and profile format are unchanged.
 
 The first check returns `environmentReviewId` and `decision=review`. After a human checks the runner and resource scope, pass only that ID to `jev_environment_approve`. Approval lasts 30 days by default and can be immediately revoked with `jev_environment_revoke`.
 

@@ -68,6 +68,7 @@ const outputSchema = {
     message: z.string(),
   })),
   policyFindings: z.array(z.object({
+    file: z.string().optional(),
     source: z.enum(['builtin', 'user', 'project']),
     rule: z.string(),
     category: z.string(),
@@ -126,6 +127,7 @@ const testOutputSchema = {
   ...outputSchema,
   staticFindings: z.array(z.string()),
   findings: z.array(z.object({
+    file: z.string().optional(),
     ruleId: z.string(),
     source: z.string(),
     category: z.string(),

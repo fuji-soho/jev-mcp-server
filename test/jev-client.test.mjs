@@ -60,6 +60,23 @@ test('TypeSafe test requests use test_dangerous and normalize the response', asy
   assert.equal(result.model, 'jev-1.13.0');
 });
 
+for (const config of [cloudflare, typesafe]) {
+  test(`${config.provider} includes full related code as untrusted input and bounds the serialized payload`, async () => {
+    let body;
+    globalThis.fetch = async (_url, init) => {
+      body = JSON.parse(init.body);
+      return config.provider === 'cloudflare' ? cloudflareResponse('test_dangerous') : typesafeResponse('test_dangerous');
+    };
+    const state = { command: 'bin/runner', staticFindings: [], relatedCode: [{ file: 'app/service.js', content: 'function act() {}' }] };
+    await checkTestWithJev(config, state);
+    const request = config.provider === 'cloudflare' ? body.input : body;
+    assert.deepEqual(request.state.relatedCode, state.relatedCode);
+    assert.ok(request.questions.test_dangerous.instructions.includes('untrusted'));
+    globalThis.fetch = async () => { assert.fail('oversized requests must not be sent'); };
+    await assert.rejects(() => checkTestWithJev(config, { ...state, relatedCode: [{ file: 'app/service.js', content: '"'.repeat(140_000) }] }), { code: 'RELATED_CODE_REVIEW_INCOMPLETE' });
+  });
+}
+
 for (const [name, body] of [
   ['invalid JSON', '{'],
   ['missing answer', JSON.stringify({ model: 'jev-1.13.0', answers: {}, usage: {} })],

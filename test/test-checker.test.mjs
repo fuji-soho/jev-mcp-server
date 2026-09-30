@@ -874,6 +874,190 @@ function profileV2Input(cwd, file = 'tests/Feature/SafeTest.php', filter) {
   };
 }
 
+async function relatedCodeFixture(t, dangerous = 0.1) {
+  const cwd = profileV2Project();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  writeFileSync(join(cwd, 'tests/Feature/SafeTest.php'), '<?php act();\n');
+  const input = profileV2Input(cwd);
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => { bodies.push(init.body); return modelResponse('typesafe', dangerous); };
+  const pending = await evaluateTest(pinnedConfig, input);
+  const now = new Date();
+  transitionEnvironmentApproval(openDatabase(), pending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+  return { cwd, input, bodies, approvalId: pending.environmentReviewId };
+}
+
+test('related-only DROP DATABASE is statically denied before environment approval or Jev', async (t) => {
+  const { cwd, input, bodies } = await relatedCodeFixture(t);
+  writeFileSync(join(cwd, 'app/Service.php'), "<?php function act() { DB::statement('DROP DATABASE customer_records'); }\n");
+  const result = await evaluateTest(pinnedConfig, input);
+  assert.equal(result.decision, 'deny');
+  assert.equal(result.allowed, false);
+  assert.equal(result.needsHumanReview, false);
+  assert.ok(result.findings.some((finding) => finding.ruleId === 'legacy.drop-database' && finding.file === 'app/Service.php'));
+  assert.ok(result.policyFindings.some((finding) => finding.file === 'app/Service.php' && finding.decision === 'deny'));
+  assert.equal(result.reviewId, undefined);
+  assert.equal(result.executionAssessment.ticket, undefined);
+  assert.equal(bodies.length, 0);
+  assert.equal((await evaluateTest(pinnedConfig, { ...input, command: '' })).decision, 'deny');
+  assert.equal((await evaluateTest(pinnedConfig, { ...input, execution: { ...input.execution, runnerId: 'unapproved' } })).decision, 'deny');
+  // A later missing root cannot soften an already observed static deny.
+  rmSync(join(cwd, 'tests/Support'), { recursive: true });
+  assert.equal((await evaluateTest(pinnedConfig, input)).decision, 'deny');
+  const fresh = profileV2Project();
+  t.after(() => rmSync(fresh, { recursive: true, force: true }));
+  writeFileSync(join(fresh, 'tests/Feature/SafeTest.php'), '<?php act();\n');
+  writeFileSync(join(fresh, 'app/Service.php'), '<?php DROP DATABASE customer_records;\n');
+  const unapproved = await evaluateTest(pinnedConfig, profileV2Input(fresh));
+  assert.equal(unapproved.decision, 'deny');
+  assert.equal(unapproved.environmentReviewId, undefined);
+});
+
+test('User and Project policies scan related source and report the relative file', async (t) => {
+  const { cwd, input, bodies } = await relatedCodeFixture(t);
+  const configHome = join(cwd, 'user-config');
+  mkdirSync(join(configHome, 'jev-mcp'), { recursive: true });
+  const previous = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = configHome;
+  t.after(() => { if (previous === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previous; });
+  const rule = (name, value) => ({ version: 1, rules: [{ name, match: { type: 'contains', value }, category: 'scope', decision: 'deny', reason: 'Related operation prohibited.' }] });
+  writeFileSync(join(configHome, 'jev-mcp/policy.json'), JSON.stringify(rule('related-user', 'restrictedUserOperation')));
+  writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify(rule('related-project', 'restrictedProjectOperation')));
+  writeFileSync(join(cwd, 'app/Service.php'), '<?php restrictedUserOperation(); restrictedProjectOperation();\n');
+  const result = await evaluateTest(pinnedConfig, input);
+  assert.equal(result.decision, 'deny');
+  for (const source of ['user', 'project']) {
+    assert.ok(result.policyFindings.some((finding) => finding.source === source && finding.file === 'app/Service.php'));
+    assert.ok(result.findings.some((finding) => finding.source === source && finding.file === 'app/Service.php'));
+  }
+  assert.equal(bodies.length, 0);
+});
+
+test('related JSON and PHP quoted credentials are masked before transmission and not persisted', async (t) => {
+  const { cwd, input, bodies } = await relatedCodeFixture(t);
+  const jsonSecret = 'json-fixture-secret-5182';
+  const phpSecret = 'php fixture secret 6283';
+  writeFileSync(join(cwd, 'composer.lock'), JSON.stringify({ password: jsonSecret }));
+  writeFileSync(join(cwd, 'app/Service.php'), `<?php return ['DB_PASSWORD' => '${phpSecret}'];\n`);
+  const result = await evaluateTest(pinnedConfig, input);
+  assert.equal(result.allowed, true);
+  const persisted = ['fingerprint_cache', 'human_reviews', 'audit_log'].map((table) => JSON.stringify(openDatabase().prepare(`SELECT * FROM ${table}`).all())).join('\n');
+  for (const secret of [jsonSecret, phpSecret]) {
+    assert.equal(bodies[0].includes(secret), false);
+    assert.equal(JSON.stringify(result).includes(secret), false);
+    assert.equal(persisted.includes(secret), false);
+  }
+});
+
+test('related code is fully sent, redacted, and re-evaluated on raw-only changes without environment reapproval', async (t) => {
+  const { cwd, input, bodies, approvalId } = await relatedCodeFixture(t);
+  const secrets = ['related-secret-alpha-7812', 'related-secret-beta-9241'];
+  const file = join(cwd, 'app/Service.php');
+  const code = (secret) => `<?php function act() { return 'safe-marker'; }\nconst secret = "${secret}";\n`;
+  writeFileSync(file, code(secrets[0]));
+  const first = await evaluateTest(pinnedConfig, input);
+  assert.equal(first.allowed, true);
+  assert.equal((await evaluateTest(pinnedConfig, input)).codeAssessment.status, 'cache-hit');
+  const related = JSON.parse(bodies[0]).state.relatedCode;
+  assert.deepEqual(related.map((item) => item.file), ['app/Service.php', 'composer.lock', 'tests/Support/Helper.php']);
+  assert.ok(related[0].content.includes("return 'safe-marker'"));
+  assert.ok(related[0].content.includes('[REDACTED]'));
+  writeFileSync(file, code(secrets[1]));
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.allowed, true);
+  assert.equal(changed.codeAssessment.status, 'evaluated');
+  assert.notEqual(changed.codeAssessment.dependencyFingerprint, first.codeAssessment.dependencyFingerprint);
+  assert.equal(changed.environmentAssessment.approvalId, approvalId);
+  assert.equal(changed.environmentAssessment.reapprovalRequired, false);
+  assert.deepEqual(JSON.parse(bodies[0]).state.relatedCode, JSON.parse(bodies[1]).state.relatedCode);
+  assert.equal(bodies.length, 2);
+  const persisted = ['fingerprint_cache', 'human_reviews', 'audit_log', 'execution_tickets'].map((table) => JSON.stringify(openDatabase().prepare(`SELECT * FROM ${table}`).all())).join('\n');
+  for (const secret of secrets) {
+    assert.equal(bodies.join('\n').includes(secret), false);
+    assert.equal(JSON.stringify([first, changed]).includes(secret), false);
+    assert.equal(persisted.includes(secret), false);
+  }
+  writeFileSync(join(cwd, 'app/Extra.php'), '<?php function extra() {}\n');
+  const added = await evaluateTest(pinnedConfig, input);
+  assert.notEqual(added.codeAssessment.dependencyFingerprint, changed.codeAssessment.dependencyFingerprint);
+  assert.ok(JSON.parse(bodies[2]).state.relatedCode.some((item) => item.file === 'app/Extra.php'));
+  rmSync(join(cwd, 'app/Extra.php'));
+  assert.equal((await evaluateTest(pinnedConfig, input)).codeAssessment.status, 'cache-hit');
+});
+
+test('related-only changes invalidate Human Approval and related static deny cannot be approved', async (t) => {
+  const { cwd, input, approvalId } = await relatedCodeFixture(t, 0.5);
+  const pending = await evaluateTest(pinnedConfig, input);
+  const now = new Date();
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', now.toISOString());
+  assert.equal((await evaluateTest(pinnedConfig, input)).allowed, true);
+  writeFileSync(join(cwd, 'app/Service.php'), '<?php class Service { public function changed() {} }\n');
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.allowed, false);
+  assert.notEqual(changed.reviewId, pending.reviewId);
+  assert.equal(changed.environmentAssessment.approvalId, approvalId);
+  writeFileSync(join(cwd, 'app/Service.php'), '<?php DROP DATABASE customer_records;\n');
+  const denied = await evaluateTest(pinnedConfig, input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.reviewId, undefined);
+});
+
+for (const humanApproval of [false, true]) {
+  test(`incomplete related review cannot reuse ${humanApproval ? 'Human Approval' : 'allow cache'} or issue tickets`, async (t) => {
+    const { cwd, input, bodies, approvalId } = await relatedCodeFixture(t, humanApproval ? 0.5 : 0.1);
+    const initial = await evaluateTest(pinnedConfig, input);
+    if (humanApproval) transitionHumanReview(openDatabase(), initial.reviewId, 'approve', new Date().toISOString());
+    assert.equal((await evaluateTest(pinnedConfig, input)).allowed, true);
+    const calls = bodies.length;
+    writeFileSync(join(cwd, 'app/Service.php'), Buffer.from([0xff]));
+    const invalid = await evaluateTest(pinnedConfig, input);
+    assert.equal(invalid.errorCode, 'RELATED_CODE_REVIEW_INCOMPLETE');
+    assert.equal(invalid.allowed, false);
+    assert.equal(invalid.codeAssessment.status, 'not-evaluated');
+    assert.equal(invalid.environmentAssessment.status, 'approved');
+    assert.equal(invalid.environmentAssessment.approvalId, approvalId);
+    assert.equal(invalid.environmentAssessment.reapprovalRequired, false);
+    assert.equal(invalid.reviewId, undefined);
+    assert.equal(invalid.executionAssessment.ticket, undefined);
+    assert.equal(bodies.length, calls);
+    rmSync(join(cwd, 'app'), { recursive: true });
+    assert.equal((await evaluateTest(pinnedConfig, input)).errorCode, 'RELATED_CODE_REVIEW_INCOMPLETE');
+  });
+}
+
+test('oversized complete Jev payload stops before API, cache reuse, Human Review or ticket issuance', async (t) => {
+  const { cwd, input, bodies, approvalId } = await relatedCodeFixture(t);
+  assert.equal((await evaluateTest(pinnedConfig, input)).allowed, true);
+  writeFileSync(join(cwd, 'tests/Feature/SafeTest.php'), '"'.repeat(63_000));
+  const result = await evaluateTest(pinnedConfig, { ...input, diff: '"'.repeat(63_000), context: '"'.repeat(31_000) });
+  assert.equal(result.errorCode, 'RELATED_CODE_REVIEW_INCOMPLETE');
+  assert.ok(result.reason.includes('256 KiB'));
+  assert.equal(result.allowed, false);
+  assert.equal(result.reviewId, undefined);
+  assert.equal(result.executionAssessment.ticket, undefined);
+  assert.equal(result.environmentAssessment.approvalId, approvalId);
+  assert.equal(bodies.length, 1);
+});
+
+test('multiple test files share a single related snapshot even when sources change during Jev evaluation', async (t) => {
+  const { cwd, input, bodies } = await relatedCodeFixture(t);
+  writeFileSync(join(cwd, 'tests/Feature/OtherTest.php'), '<?php other();\n');
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(init.body);
+    writeFileSync(join(cwd, 'app/Service.php'), '<?php function changedDuringReview() {}\n');
+    return modelResponse('typesafe');
+  };
+  const files = [...input.testFiles, 'tests/Feature/OtherTest.php'];
+  const result = await evaluateTest(pinnedConfig, { ...input, testFiles: files, execution: { ...input.execution, files } });
+  assert.equal(result.allowed, true);
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(JSON.parse(bodies[0]).state.relatedCode, JSON.parse(bodies[1]).state.relatedCode);
+  assert.equal(JSON.parse(bodies[0]).state.safetyProfile.dependencyFingerprint, JSON.parse(bodies[1]).state.safetyProfile.dependencyFingerprint);
+  await evaluateTest(pinnedConfig, input);
+  assert.equal(bodies.length, 3);
+  assert.ok(JSON.parse(bodies[2]).state.relatedCode[0].content.includes('changedDuringReview'));
+});
+
 test('Safety Profile v2 separates one-time environment approval from changed test review', async () => {
   const config = pinnedConfig;
   let calls = 0;

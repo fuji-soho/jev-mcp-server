@@ -190,7 +190,13 @@ Laravelでは `framework` に `laravel` を指定してください。既存の 
 
 Safety Profile v2を使用するプロジェクトでは、承認済みrunnerだけを`command`へ指定し、テスト対象は構造化された`execution`で渡してください。`jev_check_test`が`environmentReviewId`を返した場合は、runnerとresource scopeを人に提示し、明示的な承認後に限って`jev_environment_approve`を呼び出します。Environment Approvalはテストコード、Policy finding、Jev findingを承認しません。provider/model変更時はコードを再評価しますが、その変更だけを理由に、一致するEnvironment Approvalを失効させません。
 
-allow結果にExecution Ticketが含まれる場合は、承認済み安全runnerだけを使用します。runnerは実行直前に環境・コード・実行指定のfingerprint、実DB接続、設定キャッシュ、fallback接続、filesystem、networkを再確認してTicketを消費しなければなりません。Ticketをraw commandのshell実行許可として扱ってはいけません。
+Profile v2では、関連するhelper・setup・applicationコードが`codeReviewRoots`の範囲に含まれることを確認してください。Serverはmanifestやdiffだけでなく現在の全文を検査し、1リクエスト内の全テストで重複排除した同一スナップショットを使います。平文にBuilt-in／User／Project Policyとframeworkの静的検査を適用し、マスクした`relatedCode`（`file`、`content`）をJevへ送ります。関連findingにはproject相対パスの`file`が付く場合があります。元バイト列の変更・追加・削除は対応するコードcacheとHuman Approvalを失効させるため、マスク済み本文が同じという理由で同一性を推測してはいけません。平文の本文はSQLite・ログ・MCP結果へ残しません。マスクはbest effortなので、範囲内の機密情報も別途確認してください。
+
+上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親または末端のsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`となります。承認可能な`reviewId`とExecution Ticketはないので停止してください。`jev_review_approve`、過去の承認／cacheの再利用、本文の切り詰め、拡張子による除外、必要なrootの削除で迂回してはいけません。理由を説明し、読み取り可否・範囲・リクエスト容量を修正して再チェックします。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを取り消しません。
+
+範囲は指定テストと明示した`codeReviewRoots`だけで、Serverはimport・package・動的依存を自動解決しません。空のroot一覧は追加審査の指定がないという意味であり、依存全体の安全性の証明ではありません。大きなディレクトリやlockfileは上限を超える場合があります。`related-code-v1`へのevaluator更新はSQLite schema 6を変更せずに以前のコードcache／Human Reviewを失効させます。更新済みServerで再評価し、必要なら新しい明示的なHuman Approvalと新しいExecution Ticketを取得してください。履歴と、一致するEnvironment Approvalは保持します。古いevaluatorやreview／Ticketへ戻して審査を回避してはいけません。
+
+allow結果にExecution Ticketが含まれる場合は、承認済み安全runnerだけを使用します。runnerは実行直前に環境・コード・実行指定のfingerprint、実DB接続、設定キャッシュ、fallback・追加接続、filesystem、network、credentialを再確認してTicketを消費しなければなりません。コード審査は実際のruntime resourceやfallbackアクセスの不存在を証明しません。Ticketをraw commandのshell実行許可として扱ってはいけません。
 
 ### Project Policy
 

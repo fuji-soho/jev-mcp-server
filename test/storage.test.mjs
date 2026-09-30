@@ -22,9 +22,9 @@ function reviewKey() {
   return { projectId: 'sha256:project', targetType: 'test-file', targetKey: 'tests/Test1.php', fingerprint: 'sha256:code', commandHash: 'sha256:command', testFilesHash: 'sha256:files', cwdHash: 'sha256:cwd', policyHash: 'sha256:policy', contextHash: 'sha256:context', runtimeHash: 'sha256:runtime' };
 }
 
-test('the raw-input evaluator cannot reuse earlier cache or model-bound approval records', () => {
+for (const oldVersion of ['jev-mcp-server@1.1.0:approval-model-v1', 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1']) {
+test(`the current evaluator cannot reuse ${oldVersion} cache or model-bound approval records`, () => {
   const db = openDatabase(databasePath());
-  const oldVersion = 'jev-mcp-server@1.1.0:approval-model-v1';
   assert.notEqual(EVALUATOR_VERSION, oldVersion);
   const common = key();
   const oldFingerprint = buildFingerprint({ ...common, evaluatorVersion: oldVersion, testSpecific: { command: 'npm test', testCode: 'const secret = [REDACTED]' } });
@@ -39,6 +39,7 @@ test('the raw-input evaluator cannot reuse earlier cache or model-bound approval
   assert.equal(getHumanReview(db, pending.reviewId).status, 'approved', 'history remains available');
   assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '6');
 });
+}
 
 test('approval fingerprints bind actual model and every supplied safety context', () => {
   const base = reviewKey();

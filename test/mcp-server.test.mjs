@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
-test('jev_check_test returns a structured missing-file tool error instead of -32602', async () => {
+test('jev_check_test returns structured file errors and related-code findings through MCP', async () => {
   const temporary = mkdtempSync('/tmp/jev-mcp-missing-file-');
   const project = join(temporary, 'project');
   mkdirSync(join(project, 'tests'), { recursive: true });
@@ -32,6 +32,29 @@ test('jev_check_test returns a structured missing-file tool error instead of -32
       code: 'TEST_FILE_NOT_FOUND',
       message: 'The requested test file does not exist under cwd in the MCP server filesystem.',
     }]);
+    for (const dir of ['.jev', 'bin', 'app']) mkdirSync(join(project, dir));
+    writeFileSync(join(project, 'bin/runner'), '#!/bin/sh\nexit 1\n');
+    writeFileSync(join(project, 'tests/Safe.test.js'), 'act();\n');
+    writeFileSync(join(project, 'app/service.js'), 'DROP DATABASE customer_records;\n');
+    writeFileSync(join(project, '.jev/test-safety.json'), JSON.stringify({
+      version: 2, name: 'mcp-related-review', framework: 'vitest', environment: 'testing',
+      runner: { id: 'runner-v1', executable: 'bin/runner', files: ['bin/runner'], fixedArgs: [], shell: false, selectors: { filePatterns: ['tests/**'], allowFilter: true } },
+      environmentFiles: [], codeReviewRoots: ['app'],
+      resources: { database: { policy: 'deny', rejectFallback: true, rejectAdditionalConnections: true }, filesystem: { writableRoots: [] }, network: { policy: 'deny' }, credentials: { policy: 'deny' } },
+    }));
+    const argumentsV2 = { command: 'bin/runner', cwd: project, environment: 'testing', framework: 'vitest', testFiles: ['tests/Safe.test.js'], execution: { runnerId: 'runner-v1', files: ['tests/Safe.test.js'] } };
+    const denied = await client.callTool({ name: 'jev_check_test', arguments: argumentsV2 });
+    assert.equal(denied.structuredContent.decision, 'deny');
+    assert.ok(denied.structuredContent.findings.some((finding) => finding.file === 'app/service.js'));
+    assert.ok(denied.structuredContent.policyFindings.some((finding) => finding.file === 'app/service.js'));
+    assert.equal(JSON.stringify(denied).includes('customer_records'), false);
+    writeFileSync(join(project, 'app/service.js'), Buffer.from([0xff]));
+    const incomplete = await client.callTool({ name: 'jev_check_test', arguments: argumentsV2 });
+    assert.equal(incomplete.structuredContent.errorCode, 'RELATED_CODE_REVIEW_INCOMPLETE');
+    assert.equal(incomplete.structuredContent.allowed, false);
+    assert.equal(incomplete.structuredContent.reviewId, undefined);
+    assert.equal(incomplete.structuredContent.environmentReviewId, undefined);
+    assert.equal(incomplete.structuredContent.executionAssessment.ticket, undefined);
   } finally {
     await client.close();
     rmSync(temporary, { recursive: true, force: true });

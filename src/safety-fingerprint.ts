@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { TestCheckInput, TestFileError } from './types.js';
 
 export const FINGERPRINT_SCHEMA_VERSION = 2;
-export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1';
+export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1:related-code-v1';
 
 function normalize(value: unknown): unknown {
   if (typeof value === 'string') return value.replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n').normalize('NFC');
@@ -121,6 +121,80 @@ const MAX_MANIFEST_FILES = 20_000;
 const MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024;
 
 export interface FileManifestEntry { key: string; digest: string; bytes: number; }
+
+export const RELATED_CODE_LIMITS = { files: 64, fileBytes: 32 * 1024, totalBytes: 64 * 1024, entries: 4096 } as const;
+export interface RelatedCodeFile extends FileManifestEntry { content: string; }
+export type RelatedCodeSnapshot =
+  | { status: 'complete'; fingerprint: string; files: RelatedCodeFile[] }
+  | { status: 'incomplete'; reason: string; files: RelatedCodeFile[] };
+
+/** Read once: the original bytes identify the exact text inspected locally and sent (redacted) to Jev. */
+export function readRelatedCode(root: string, configuredPaths: string[]): RelatedCodeSnapshot {
+  const files: RelatedCodeFile[] = [];
+  let totalBytes = 0;
+  let entries = 0;
+  const visited = new Set<string>();
+  try {
+    const resolvedRoot = realpathSync(resolve(root));
+    const visit = (path: string): void => {
+      const key = relativeTarget(resolvedRoot, path);
+      if (!key || isAbsolute(path)) throw new Error('Related code path must be relative and inside the project root.');
+      if (visited.has(key)) return;
+      visited.add(key);
+      if (++entries > RELATED_CODE_LIMITS.entries) throw new Error('Related code exceeds the 4096-entry traversal limit.');
+      // Also reject symlinks in parent components of explicitly configured paths.
+      let component = resolvedRoot;
+      for (const part of key.split('/')) {
+        component = resolve(component, part);
+        if (lstatSync(component).isSymbolicLink()) throw new Error('Related code contains a symbolic link.');
+      }
+      const absolute = resolve(resolvedRoot, key);
+      const stat = lstatSync(absolute);
+      if (relativeTarget(resolvedRoot, realpathSync(absolute)) === undefined) throw new Error('Related code escapes the project root.');
+      if (stat.isDirectory()) {
+        const children = readdirSync(absolute).sort();
+        if (entries + children.length > RELATED_CODE_LIMITS.entries) throw new Error('Related code exceeds the 4096-entry traversal limit.');
+        for (const child of children) visit(`${key}/${child}`);
+        return;
+      }
+      if (!stat.isFile()) throw new Error('Related code is not a regular file.');
+      if (files.length >= RELATED_CODE_LIMITS.files) throw new Error('Related code exceeds the 64-file limit.');
+      if (stat.size > RELATED_CODE_LIMITS.fileBytes) throw new Error('Related code exceeds the 32 KiB per-file limit.');
+      const fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      let contents: Buffer;
+      try {
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) throw new Error('Related code changed while being opened.');
+        const buffer = Buffer.alloc(RELATED_CODE_LIMITS.fileBytes + 1);
+        let length = 0;
+        while (length < buffer.length) {
+          const count = readSync(fd, buffer, length, buffer.length - length, null);
+          if (count === 0) break;
+          length += count;
+        }
+        if (length > RELATED_CODE_LIMITS.fileBytes) throw new Error('Related code exceeds the 32 KiB per-file limit.');
+        const after = fstatSync(fd);
+        if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || relativeTarget(resolvedRoot, realpathSync(absolute)) === undefined) throw new Error('Related code changed while being read.');
+        contents = buffer.subarray(0, length);
+      } finally { closeSync(fd); }
+      if (totalBytes + contents.byteLength > RELATED_CODE_LIMITS.totalBytes) throw new Error('Related code exceeds the 64 KiB total limit.');
+      if (contents.includes(0)) throw new Error('Related code contains binary content.');
+      let content: string;
+      try { content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(contents); }
+      catch { throw new Error('Related code is not valid UTF-8.'); }
+      if (/[\x01-\x08\x0b\x0e-\x1f\x7f]/u.test(content)) throw new Error('Related code contains binary content.');
+      totalBytes += contents.byteLength;
+      files.push({ key, digest: sha256(contents), bytes: contents.byteLength, content });
+    };
+    for (const path of [...new Set(configuredPaths)].sort()) visit(path.replaceAll('\\', '/'));
+    files.sort((a, b) => a.key.localeCompare(b.key));
+    return { status: 'complete', files, fingerprint: sha256(canonicalJson({ version: 'related-code-v1', limits: RELATED_CODE_LIMITS, files: files.map(({ key, digest, bytes }) => ({ key, digest, bytes })) })) };
+  } catch (error) {
+    // Never return OS errors containing absolute paths or file contents.
+    const reason = error instanceof Error && error.message.startsWith('Related code') ? error.message : 'Related code could not be read completely.';
+    return { status: 'incomplete', files, reason };
+  }
+}
 
 /** Build a deterministic, symlink-free manifest for explicitly configured files or directories. */
 export function digestPaths(root: string, configuredPaths: string[]): { fingerprint: string; files: FileManifestEntry[] } {
