@@ -31,6 +31,8 @@ CLOUDFLARE_API_TOKEN=your-api-token
 
 再現可能な安全判定のため、TypeSafe modelはversion付きIDへ固定することを推奨します。`jev-latest`や`jev-preview`などの可変aliasも利用できますが、設定変更なしで実モデルが変わり得るため、そのallow判定はSafety Fingerprint Cacheから再利用しません。応答の`jevProvider`、`requestedModel`、`actualModel`で、選択したprovider、設定したmodel、APIが返した実modelを区別できます。
 
+Cloudflareの`typesafe/jev`も可変modelとして扱い、Jev評価が必要なチェックでは毎回APIを呼び出します。自動判定のallowを再利用できるのは、固定したTypeSafeの`jev-X.Y.Z`で、APIが返した実modelと要求modelが一致していた場合だけです。Human Approvalによるallowは再利用可能なallow cacheへ保存しません。
+
 直接接続のendpointと現在利用できるmodel IDは、TypeSafe AI公式の[API reference](https://docs.typesafe.ai/api)と[model list](https://docs.typesafe.ai/models)を参照してください。
 
 `.env` は `.gitignore` の対象になっています。認証情報を含むため、ファイルの公開やコミットはしないでください。
@@ -120,7 +122,11 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 
 `jev_check_test`は、言語やフレームワークを問わず、テスト実行時の永続データ、データベース、ファイルシステム、外部サービス、本番環境、credential、ネットワーク、破壊的cleanup、隔離状態を評価します。テスト、コマンド、DB接続は絶対に実行せず、入力されたcommandは評価のための未信頼データとしてのみ扱います。
 
-最終判定が`review`の場合、Serverは短時間だけ有効なHuman Reviewを保存し、`reviewId`を返します。人間が明示的に承認した後は、`jev_review_approve`へその`reviewId`だけを渡してください。Serverが保存済みのproject、command、対象ファイル、Policy、runtime context、Safety Fingerprintを読み出して照合します。呼び出し側からfingerprintやcommandを指定して承認対象を変更することはできません。同じFingerprintの安全条件が維持されている場合だけ後続チェックで利用でき、変更があれば再評価されます。`deny`は常に優先され、Human Approvalで覆すことはできません。`jev_review_reject`でpending reviewを恒久的に拒否できます。
+評価が正常に完了してHuman Approvalが必要となり、version付きの実modelを識別できた場合、Serverは短時間だけ有効なHuman Reviewを保存し、`decision=review`と`reviewId`を返します。人間が明示的に承認した後は、`jev_review_approve`へその`reviewId`だけを渡してください。Serverが保存済みのproject、command、対象ファイル、Policy、runtime context、Safety Fingerprintを読み出して照合します。呼び出し側からfingerprintやcommandを指定して承認対象を変更することはできません。同じFingerprintの安全条件が維持されている場合だけ後続チェックで利用でき、変更があれば再評価されます。`deny`は常に優先され、Human Approvalで覆すことはできません。`jev_review_reject`でpending reviewを恒久的に拒否できます。
+
+Human Reviewの期限は作成時から1時間で、承認操作によって延長されません。承認が必要な後続チェックでは、Jevを再評価してから承認の状態・期限・対象の完全一致を確認します。承認用fingerprintにはコード評価用fingerprint、command・対象ファイル・cwdのhash、安全Context、APIが返した実modelを含めます。これは`codeAssessment.fingerprint`と異なり、`jev_review_approve`が返す`fingerprint`は承認対象を示します。同じaliasでも実modelが変わり、引き続き承認が必要な判定なら新しいreviewが必要です。期限切れのpending／approved reviewは、新しいpending reviewへ置き換えます。API errorや後続の`deny`を過去の承認で迂回することはできません。
+
+承認が必要なのに応答modelがversion付きの`jev-X.Y.Z`でない場合は、`JEV_MODEL_ID_UNVERIFIED`付きの`review`を返し、承認可能な`reviewId`は発行しません。provider／modelの応答を修正して再チェックし、このエラーを承認で通過させようとしないでください。
 
 最小入力は次の形式です。
 
@@ -139,6 +145,8 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 Profileに記載したファイルはSHA-256でfingerprint化します。verified stateはリポジトリ外のユーザー設定ディレクトリ（または`JEV_TEST_SAFETY_STATE_PATH`）へ保存し、Gitへコミットしません。`jev_check_test`は読み取り専用のまま、明示的なverificationでstateを作成します。
 
 Jev providerと要求modelは、コード評価用Safety Fingerprintの一部です。どちらかを変更すると、以前のJev allow cache、Human Reviewの一致、コードに紐付くExecution Ticketは再利用されず、コードが再評価されます。Environment Approvalはコード評価と分離されているため、provider/model変更だけでは、一致するEnvironment Approvalを失効させません。provider情報を持たない旧cacheも再利用しません。API key自体はfingerprintやcache keyへ含めないため、provider/modelを変えずにkeyだけをローテーションしても、それだけでは安全判定を失効させません。
+
+SQLite schema 5以前から更新する場合は、旧Serverのプロセスを停止し、cache DB（`cache/jev.sqlite`、または`JEV_CACHE_DB_PATH`）をバックアップしてから更新後のServerを起動してください。未反映のWALデータも含め、SQLiteとして整合性のあるバックアップを取得してください。起動時にトランザクション内でschema 6へ自動移行します。既存allow cacheは承認由来かどうかを確実に区別できないため、履歴を保持したまますべて再利用不可にします。旧Human Reviewも履歴として残りますが、実modelを含む新しい承認用fingerprintとは一致せず、承認が必要なチェックでは新しいreviewが必要です。監査履歴と、一致するEnvironment Approvalは保持します。コード評価には新しいevaluator versionを使用します。更新後は一度再評価され、必要に応じて新しいHuman Reviewが発生します。移行失敗時は変更をロールバックし、DBを自動削除しません。旧Serverはschema 6を開けないため、ダウングレードには更新前のバックアップを復元する必要があります。
 
 ```sh
 npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verification-input.json

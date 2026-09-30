@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import { loadConfig, resolveConfigPath } from '../dist/config.js';
 
@@ -19,7 +20,7 @@ async function temporaryEnvFile(contents) {
 }
 
 test('resolves the default configuration path next to the project root', () => {
-  assert.equal(resolveConfigPath([], {}), resolve('/root/jev-mcp-server/.env'));
+  assert.equal(resolveConfigPath([], {}), fileURLToPath(new URL('../.env', import.meta.url)));
 });
 
 test('uses JEV_ENV_PATH when no CLI path is provided', () => {

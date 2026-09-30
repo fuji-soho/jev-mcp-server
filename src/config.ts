@@ -27,7 +27,11 @@ export function evaluationIdentity(config: Config): string {
 }
 
 export function isEvaluationCacheReusable(config: Config): boolean {
-  return config.provider === 'cloudflare' || /^jev-\d+\.\d+\.\d+$/u.test(config.requestedModel);
+  return config.provider === 'typesafe' && isVersionedModel(config.requestedModel);
+}
+
+export function isVersionedModel(model: string): boolean {
+  return /^jev-\d+\.\d+\.\d+$/u.test(model);
 }
 
 function commandLineEnvPath(args: readonly string[]): string | undefined {

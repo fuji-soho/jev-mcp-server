@@ -172,7 +172,13 @@
 
 Human ApprovalでStatic Check、Jev、Built-in Policy、User Policy、Project Policyの `deny` を覆してはいけません。`jev_review_approve` が成功しただけでテストを実行せず、最終的な `jev_check_test` の判定を必ず確認してください。
 
-`jev_check_test` は、変更されていないSafety Fingerprint Cache、または同一Safety Fingerprintに対する有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。`jev-latest`などの可変model aliasは毎回評価し、allow cacheを再利用しません。API keyはfingerprintの入力に含めません。
+Human Reviewの期限は作成時から1時間で、承認によって延長されません。Human Approvalによるallowは再利用可能なallow cacheへ保存しません。承認が必要なチェックではJevを再評価してから、承認の状態・期限・安全Contextの完全一致・APIが返した実modelを照合します。reviewのContextとともに`jevProvider`、`requestedModel`、`actualModel`を人に提示してください。Serverの承認用fingerprintにはコードfingerprint、正確なcommand・対象ファイル・cwdのContext、実modelを含むため、`codeAssessment.fingerprint`と同一視してはいけません。同じ要求aliasでも実modelが変わり、引き続き承認が必要なら新しいHuman Reviewが必要です。期限切れのpending／approved reviewには、新しく発行されたreview IDと新しい明示的承認が必要です。
+
+自動判定のallow cacheを再利用できるのは、実modelと要求modelが一致していた固定TypeSafe modelの`jev-X.Y.Z`だけです。TypeSafeの可変aliasとCloudflareの`typesafe/jev`は、Jev評価が必要な場合に毎回APIを呼び出します。`JEV_MODEL_ID_UNVERIFIED`の場合は停止してください。承認可能な`reviewId`は存在しません。provider／modelの応答を修正して再チェックしてください。API失敗や後続の`deny`を過去の承認で迂回してはいけません。
+
+SQLite schema 6への更新後、旧cacheは再利用不可となり、旧Human Reviewは履歴としてのみ残ります。必要に応じて新しいHuman Reviewの発行と明示的承認を受け、古いreview IDを再利用しようとしないでください。監査履歴と、一致するEnvironment Approvalは保持され、provider／model変更だけではEnvironment Approvalの再承認は不要です。
+
+`jev_check_test` は、変更されていない再利用条件を満たす自動判定のSafety Fingerprint Cache、または実modelに紐付いた有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。API keyはfingerprintの入力に含めません。
 
 Laravelでは `framework` に `laravel` を指定してください。既存の `runtimeDatabase`、`configCache`、`runtimeGuard`、`persistentDatabaseAccess` も引き続き利用できます。`RefreshDatabase`、`DatabaseMigrations`、`DatabaseTruncation`、`migrate:fresh`、`db:wipe`、永続DBのターゲット、テスト設定とruntime設定の不一致は安全性のfindingとして扱ってください。
 

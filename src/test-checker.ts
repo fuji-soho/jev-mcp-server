@@ -1,4 +1,4 @@
-import { evaluationIdentity, isEvaluationCacheReusable, type Config } from './config.js';
+import { evaluationIdentity, isEvaluationCacheReusable, isVersionedModel, type Config } from './config.js';
 import { checkTestWithJev, JevError } from './cloudflare-jev.js';
 import { findPolicyMatches, loadEffectiveTestPolicies, strictestDecision } from './policy.js';
 import { assessSafetyProfile, ENVIRONMENT_VERIFIER_VERSION, validateExecutionSelection, type ExecutionSelectionResult } from './test-safety-profile.js';
@@ -9,7 +9,7 @@ import { resolve } from 'node:path';
 import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
-import { createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
+import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
 import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256 } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, type EnvironmentApprovalKey } from './storage/environment-approval.js';
@@ -155,7 +155,7 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
     : { testCode: safe.testCode, diff: safe.diff, framework: safe.framework, context: safe.context };
   const fingerprint = buildFingerprint({ projectId: pid, targetType: 'test-file', targetKey, testSpecific, sharedContext: { safety: safety.jevContext, policyHash: policies.hash, profile: safety.assessment, files: sharedFiles, dependencyFingerprint }, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION });
   const cacheKey: CacheKey = { projectId: pid, targetType: 'test-file', targetKey, fingerprint, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION };
-  const humanReviewKey: HumanReviewKey = {
+  const humanReviewContext: Omit<HumanReviewKey, 'actualModel'> = {
     projectId: pid, targetType: 'test-file', targetKey, fingerprint,
     commandHash: sha256(safe.command), testFilesHash: sha256(canonicalJson([targetKey])), cwdHash: sha256(root),
     policyHash: policies.hash, contextHash, runtimeHash,
@@ -212,9 +212,9 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const requestId = randomUUID();
   const audit = (result: TestCheckResult, cacheStatus: 'disabled'|'miss'|'hit'|'error', jevDecision?: Decision, save = false): void => {
     if (!db) return;
-    try { db.exec('BEGIN'); insertAudit(db, { requestId, projectId: pid, toolName: 'jev_check_test', targetType: 'test-file', targetKey, fingerprint, cacheStatus, staticDecision, jevDecision, finalDecision: result.decision, allowed: result.allowed, needsHumanReview: result.needsHumanReview, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, jevProvider: config.provider, requestedModel: config.requestedModel, actualModel: result.actualModel, evaluatorVersion: EVALUATOR_VERSION, reason: result.reason }); if (save) upsertCache(db, cacheKey, result.decision, result.decision === 'allow' && cacheReusable && (config.provider === 'cloudflare' || result.actualModel === config.requestedModel), new Date().toISOString(), result.actualModel); db.exec('COMMIT'); } catch { try { db.exec('ROLLBACK'); } catch { /* best effort */ } logEvent('audit_persistence_error', { tool: 'jev_check_test' }); }
+    try { db.exec('BEGIN'); insertAudit(db, { requestId, projectId: pid, toolName: 'jev_check_test', targetType: 'test-file', targetKey, fingerprint, cacheStatus, staticDecision, jevDecision, finalDecision: result.decision, allowed: result.allowed, needsHumanReview: result.needsHumanReview, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, jevProvider: config.provider, requestedModel: config.requestedModel, actualModel: result.actualModel, evaluatorVersion: EVALUATOR_VERSION, reason: result.reason }); if (save && result.decision === 'allow' && cacheReusable && result.actualModel === config.requestedModel) upsertCache(db, cacheKey, result.decision, true, new Date().toISOString(), result.actualModel); db.exec('COMMIT'); } catch { try { db.exec('ROLLBACK'); } catch { /* best effort */ } logEvent('audit_persistence_error', { tool: 'jev_check_test' }); }
   };
-  const issueReview = (result: TestCheckResult): TestCheckResult => {
+  const issueReview = (result: TestCheckResult, humanReviewKey: HumanReviewKey): TestCheckResult => {
     if (!db) return result;
     try {
       const now = new Date();
@@ -259,16 +259,22 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
         ? 'The Safety Profile is not verified for the current files or runtime context.'
         : 'Test isolation or external side-effect safety could not be sufficiently confirmed.';
       const pendingResult = { ...common, allowed: false, needsHumanReview: true, decision, reason };
+      if (!isVersionedModel(response.model)) {
+        const result = { ...pendingResult, errorCode: 'JEV_MODEL_ID_UNVERIFIED', reason: 'The API did not identify a versioned actual model. Human Approval cannot be safely matched; use a provider that reports a jev-X.Y.Z model ID.' };
+        audit(result, 'miss', jevDecision);
+        return result;
+      }
+      const humanReviewKey = bindHumanReviewModel(humanReviewContext, response.model);
       if (db) {
         const approved = lookupApprovedHumanReview(db, humanReviewKey, new Date().toISOString());
         if (approved) {
           const result = attachTicket({ ...common, allowed: true, needsHumanReview: false, decision: 'allow' as const, reason: 'A valid Human Approval matches the current Safety Fingerprint and all safety context.' });
           markHumanReviewUsed(db, approved.reviewId, new Date().toISOString());
-          audit(result, 'miss', jevDecision, true);
+          audit(result, 'miss', jevDecision, false);
           return result;
         }
       }
-      const result = issueReview(pendingResult);
+      const result = issueReview(pendingResult, humanReviewKey);
       audit(result, 'miss', jevDecision, false);
       return result;
     }

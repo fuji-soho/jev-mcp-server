@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_DB_PATH = join(PROJECT_ROOT, 'cache', 'jev.sqlite');
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 let shared: DatabaseSync | undefined;
 let sharedPath: string | undefined;
@@ -163,6 +163,15 @@ function migrate(db: DatabaseSync): void {
       ALTER TABLE audit_log ADD COLUMN requested_model TEXT;
       ALTER TABLE audit_log ADD COLUMN actual_model TEXT;
       UPDATE schema_meta SET value = '5' WHERE key = 'schema_version';
+    `);
+  }
+  if (version <= 5) {
+    // Legacy allow entries may have come from a time-limited Human Approval.
+    // Their origin cannot be recovered reliably, so retain but disable all of them.
+    db.exec(`
+      ALTER TABLE human_reviews ADD COLUMN actual_model TEXT;
+      UPDATE fingerprint_cache SET reusable = 0;
+      UPDATE schema_meta SET value = '6' WHERE key = 'schema_version';
     `);
   }
 }

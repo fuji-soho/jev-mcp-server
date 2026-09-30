@@ -5,7 +5,7 @@ import { test, afterEach } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase, resetDatabaseForTests } from '../dist/storage/sqlite.js';
 import { lookupAllow, upsertCache } from '../dist/storage/fingerprint-cache.js';
-import { createOrGetHumanReview, getHumanReview, lookupApprovedHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
+import { bindHumanReviewModel, createOrGetHumanReview, getHumanReview, lookupApprovedHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { insertAudit } from '../dist/storage/audit-log.js';
 import { sanitizeAuditText } from '../dist/audit-sanitizer.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, revokeEnvironmentApproval, transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
@@ -17,10 +17,87 @@ afterEach(() => { resetDatabaseForTests(); for (const directory of directories.s
 function databasePath() { const directory = mkdtempSync('/tmp/jev-storage-'); directories.push(directory); mkdirSync(join(directory, 'nested')); return join(directory, 'nested', 'jev.sqlite'); }
 function key() { return { projectId: 'sha256:project', targetType: 'test-file', targetKey: 'tests/Test1.php', fingerprint: 'sha256:fingerprint', policyHash: 'sha256:policy', contextHash: 'sha256:context', safetyProfileHash: 'sha256:profile', runtimeHash: 'sha256:runtime', modelVersion: 'typesafe/jev', evaluatorVersion: 'jev-mcp-server@1.0.0' }; }
 
+function reviewKey() {
+  return { projectId: 'sha256:project', targetType: 'test-file', targetKey: 'tests/Test1.php', fingerprint: 'sha256:code', commandHash: 'sha256:command', testFilesHash: 'sha256:files', cwdHash: 'sha256:cwd', policyHash: 'sha256:policy', contextHash: 'sha256:context', runtimeHash: 'sha256:runtime' };
+}
+
+test('approval fingerprints bind actual model and every supplied safety context', () => {
+  const base = reviewKey();
+  const bound = bindHumanReviewModel(base, 'jev-1.13.0');
+  assert.notEqual(bound.fingerprint, base.fingerprint);
+  assert.deepEqual(bindHumanReviewModel(base, 'jev-1.13.0'), bound);
+  assert.notEqual(bindHumanReviewModel(base, 'jev-1.14.0').fingerprint, bound.fingerprint);
+  for (const field of Object.keys(base)) {
+    assert.notEqual(bindHumanReviewModel({ ...base, [field]: `${base[field]}-changed` }, 'jev-1.13.0').fingerprint, bound.fingerprint, field);
+  }
+});
+
+for (const status of ['pending', 'approved']) {
+  test(`expired ${status} review is replaced at its deadline`, () => {
+    const db = openDatabase(databasePath());
+    const bound = bindHumanReviewModel(reviewKey(), 'jev-1.13.0');
+    const deadline = '2026-09-30T01:00:00.000Z';
+    const first = createOrGetHumanReview(db, bound, '2026-09-30T00:00:00.000Z', deadline);
+    if (status === 'approved') transitionHumanReview(db, first.reviewId, 'approve', '2026-09-30T00:10:00.000Z');
+    assert.equal(createOrGetHumanReview(db, bound, '2026-09-30T00:59:59.999Z', deadline).reviewId, first.reviewId);
+    assert.equal(lookupApprovedHumanReview(db, bound, deadline), undefined);
+    const replacement = createOrGetHumanReview(db, bound, deadline, '2026-09-30T02:00:00.000Z');
+    assert.notEqual(replacement.reviewId, first.reviewId);
+    assert.equal(replacement.status, 'pending');
+    assert.equal(getHumanReview(db, first.reviewId).status, 'expired');
+  });
+}
+
+function legacyDatabase() {
+  const path = databasePath();
+  const db = openDatabase(path);
+  const now = '2026-09-30T00:00:00.000Z';
+  upsertCache(db, key(), 'allow', true, now, 'jev-1.13.0');
+  const review = createOrGetHumanReview(db, { ...reviewKey(), actualModel: 'jev-1.13.0' }, now, '2026-09-30T01:00:00.000Z');
+  transitionHumanReview(db, review.reviewId, 'approve', now);
+  const environmentKey = { projectId: 'sha256:project', profileDigest: 'sha256:profile', environmentFingerprint: 'sha256:environment', scopeJson: '{}', verifierVersion: 'jev-environment-profile-v2@1' };
+  const environment = createOrGetEnvironmentReview(db, environmentKey, now, '2026-09-30T01:00:00.000Z');
+  transitionEnvironmentApproval(db, environment.approvalId, 'approve', now, '2026-10-30T00:00:00.000Z');
+  insertAudit(db, { requestId: 'legacy', toolName: 'jev_check_test', cacheStatus: 'miss', finalDecision: 'allow', allowed: true, needsHumanReview: false });
+  // Schema 5 has the same tables and indexes, without human_reviews.actual_model.
+  db.exec("ALTER TABLE human_reviews DROP COLUMN actual_model; UPDATE schema_meta SET value='5' WHERE key='schema_version';");
+  resetDatabaseForTests();
+  return { path, review, environmentKey, environment, now };
+}
+
+test('schema 5 migration disables old allow without deleting approval or audit history', () => {
+  const { path, review, environmentKey, environment, now } = legacyDatabase();
+  const db = openDatabase(path);
+  assert.equal(lookupAllow(db, key()), undefined);
+  assert.equal(db.prepare('SELECT reusable FROM fingerprint_cache').get().reusable, 0);
+  assert.equal(getHumanReview(db, review.reviewId).status, 'approved');
+  assert.equal(getHumanReview(db, review.reviewId).actualModel, undefined);
+  assert.equal(lookupApprovedHumanReview(db, bindHumanReviewModel(reviewKey(), 'jev-1.13.0'), now), undefined);
+  assert.equal(lookupEnvironmentApproval(db, environmentKey, now).approvalId, environment.approvalId);
+  assert.equal(db.prepare('SELECT request_id FROM audit_log').get().request_id, 'legacy');
+  upsertCache(db, key(), 'allow', true, now, 'jev-1.13.0');
+  resetDatabaseForTests();
+  assert.ok(lookupAllow(openDatabase(path), key()), 'migration must not invalidate new entries on every startup');
+});
+
+test('a failed migration rolls back schema and cache changes', () => {
+  const { path } = legacyDatabase();
+  const raw = new DatabaseSync(path);
+  raw.exec("CREATE TRIGGER migration_failure BEFORE UPDATE ON fingerprint_cache BEGIN SELECT RAISE(ABORT, 'mock migration failure'); END;");
+  raw.close();
+  assert.throws(() => openDatabase(path), /mock migration failure/u);
+  const restored = new DatabaseSync(path);
+  try {
+    assert.equal(restored.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '5');
+    assert.equal(restored.prepare('SELECT reusable FROM fingerprint_cache').get().reusable, 1);
+    assert.equal(restored.prepare('PRAGMA table_info(human_reviews)').all().some((column) => column.name === 'actual_model'), false);
+  } finally { restored.close(); }
+});
+
 test('creates the cache directory, schema, and secure file permissions', () => {
   const path = databasePath(); const db = openDatabase(path);
   assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'environment_approvals', 'execution_tickets', 'fingerprint_cache', 'human_reviews', 'schema_meta']);
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '5');
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '6');
 });
 
 test('environment approvals are exact, expiring, and revocable', () => {
@@ -96,6 +173,7 @@ test('stores, approves, rejects, and matches Human Reviews by every safety key',
     projectId: 'sha256:project', targetType: 'test-file', targetKey: 'tests/Test1.php', fingerprint: 'sha256:fingerprint',
     commandHash: 'sha256:command', testFilesHash: 'sha256:files', cwdHash: 'sha256:cwd', policyHash: 'sha256:policy',
     contextHash: 'sha256:context', safetyProfileHash: 'sha256:profile', runtimeHash: 'sha256:runtime',
+    actualModel: 'jev-1.13.0',
   };
   const created = createOrGetHumanReview(db, key, '2026-09-27T00:00:00.000Z', '2026-09-27T01:00:00.000Z');
   assert.match(created.reviewId, /^rev_/u);

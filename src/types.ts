@@ -232,6 +232,7 @@ export interface HumanReviewRecord {
   decision: 'review';
   status: HumanReviewStatus;
   approvalKind?: HumanApprovalKind;
+  actualModel?: string;
   createdAt: string;
   approvedAt?: string;
   rejectedAt?: string;

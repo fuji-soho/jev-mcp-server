@@ -31,6 +31,8 @@ CLOUDFLARE_API_TOKEN=your-api-token
 
 Pin a versioned TypeSafe model for reproducible safety decisions. Moving aliases such as `jev-latest` and `jev-preview` can resolve to a different model without a configuration change; they are accepted, but their allow decisions are not reused from the Safety Fingerprint Cache. The response fields `jevProvider`, `requestedModel`, and `actualModel` distinguish the selected provider, configured model, and version reported by the API.
 
+Cloudflare's `typesafe/jev` is also treated as a moving model: every check requiring Jev calls the API. Only pinned TypeSafe `jev-X.Y.Z` models can reuse an automatic allow decision, and only when the API-reported actual model matched the requested model. Human Approval never populates the reusable allow cache.
+
 See the TypeSafe AI [API reference](https://docs.typesafe.ai/api) and [model list](https://docs.typesafe.ai/models) for the direct endpoint and currently available model IDs.
 
 `.env` is included in `.gitignore`. Because it contains credentials, do not publish or commit it.
@@ -120,7 +122,11 @@ You can add your own rules. On Linux/macOS, User policy is located at `$XDG_CONF
 
 `jev_check_test` evaluates test execution safety across languages and frameworks, including persistent-resource access, database and filesystem mutation, external service side effects, production access, credentials, network access, destructive cleanup, and isolation. It never runs the test, command, or database connection; the supplied command is untrusted input sent only for evaluation.
 
-When the final decision is `review`, the server creates a short-lived Human Review record and returns a `reviewId`. After an explicit human approval, call `jev_review_approve` with only that `reviewId`. The server loads the stored project, command, files, policy, runtime context, and Safety Fingerprint; caller-supplied fingerprints or commands are not accepted. A matching approval may allow the unchanged fingerprint on later checks, but any changed safety input is re-evaluated. `deny` always wins and cannot be overridden by Human Approval. `jev_review_reject` permanently rejects a pending review.
+When a successful evaluation requires Human Approval and identifies a versioned actual model, the server creates a short-lived Human Review record and returns `decision=review` with a `reviewId`. After an explicit human approval, call `jev_review_approve` with only that `reviewId`. The server loads the stored project, command, files, policy, runtime context, and Safety Fingerprint; caller-supplied fingerprints or commands are not accepted. A matching approval may allow the unchanged fingerprint on later checks, but any changed safety input is re-evaluated. `deny` always wins and cannot be overridden by Human Approval. `jev_review_reject` permanently rejects a pending review.
+
+Human Reviews expire one hour after creation; approving one does not extend its deadline. On subsequent checks that require approval, Jev is evaluated again before checking the approval's status, deadline, and exact target. The approval fingerprint includes the code-evaluation fingerprint, command/files/cwd hashes, safety context, and API-reported actual model. It is distinct from `codeAssessment.fingerprint`; the `fingerprint` returned by `jev_review_approve` identifies the approval target. Even with an unchanged alias, a different actual model requires a new review when the result still needs approval. Expired pending or approved reviews are replaced with new pending reviews. API errors and a later `deny` cannot be bypassed with an earlier approval.
+
+If approval is needed but the response model is not a versioned `jev-X.Y.Z` ID, the result is `review` with `JEV_MODEL_ID_UNVERIFIED` and no approvable `reviewId`. Correct the provider/model reporting and recheck; do not attempt to approve this error.
 
 The minimal input is:
 
@@ -157,6 +163,8 @@ npm run verify-test-safety -- --cwd /path/to/project --input /path/to/jev-verifi
 After human verification, an unchanged profile, matching fingerprint, matching runtime context, and low-risk Jev result can return `allow` without repeating the same review. Profile changes, missing files, runner/framework changes, isolation changes, invalid profiles, policy findings, or new risks return `review` or `deny`. Do not put credentials or `.env` values in a profile or verified state.
 
 The Jev provider and requested model are part of the code-evaluation Safety Fingerprint. Changing either invalidates old Jev allow-cache entries, Human Review matches, and code-bound Execution Tickets, so code is re-evaluated. Provider/model changes alone do not invalidate a matching Environment Approval because environment approval is kept separate from code evaluation. Legacy cache entries without provider identity are not reused. API keys are never included in fingerprints or cache keys; rotating a key without changing provider/model does not itself invalidate a safety decision.
+
+When upgrading from SQLite schema 5 or earlier, stop old server processes and back up the cache database (`cache/jev.sqlite`, or `JEV_CACHE_DB_PATH`) before starting the updated server. Back up SQLite consistently, including outstanding WAL data. Startup automatically migrates to schema 6 in a transaction: all existing allow-cache entries are retained but made non-reusable because approval-derived entries cannot reliably be distinguished. Old Human Reviews remain as history but do not match the new model-bound approval fingerprint; checks requiring approval need a new review. Audit history and matching Environment Approvals are preserved. Code evaluation uses a new evaluator version. Expect one-time re-evaluation, and potentially new Human Reviews. Migration failure rolls back the changes; the database is never deleted automatically. Older servers cannot open schema 6; downgrading requires restoring the pre-upgrade backup.
 
 The server only evaluates supplied evidence; it does not inspect a live process, connect to a database, or prove that runtime claims are truthful.
 

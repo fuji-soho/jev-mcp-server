@@ -6,7 +6,7 @@ import { test, afterEach } from 'node:test';
 import { evaluateTest } from '../dist/test-checker.js';
 import { assessSafetyProfile, verifySafetyProfile } from '../dist/test-safety-profile.js';
 import { openDatabase } from '../dist/storage/sqlite.js';
-import { transitionHumanReview } from '../dist/storage/human-review.js';
+import { getHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { transitionEnvironmentApproval } from '../dist/storage/environment-approval.js';
 
 const config = {
@@ -16,12 +16,19 @@ const config = {
   requestedModel: 'typesafe/jev',
 };
 
+const pinnedConfig = { provider: 'typesafe', apiKey: 'test-token', requestedModel: 'jev-1.13.0' };
+
+function modelResponse(provider, dangerous = 0.1, model = 'jev-1.13.0') {
+  const output = { model, answers: { test_dangerous: { type: 'noul', noul: dangerous } }, usage: { input_tokens: 1, output_tokens: 1 } };
+  return new Response(JSON.stringify(provider === 'cloudflare' ? { success: true, result: { state: 'Completed', result: output } } : output), { status: 200 });
+}
+
 const lowRiskResponse = () => new Response(JSON.stringify({
   success: true,
   result: {
     state: 'Completed',
     result: {
-      model: 'typesafe/jev',
+      model: 'jev-1.13.0',
       answers: {
         test_dangerous: { type: 'noul', noul: 0.1 },
       },
@@ -78,6 +85,113 @@ function profileProject() {
   }));
   return cwd;
 }
+
+test('approval-derived allow never enters the cache and expires at the exact deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 8, 30) });
+  const cwd = profileProject();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+  const input = profileInput(cwd);
+  verifySafetyProfile(input);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return modelResponse('typesafe', 0.5); };
+  const pending = await evaluateTest(pinnedConfig, input);
+  assert.equal(pending.decision, 'review');
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  const review = getHumanReview(openDatabase(), pending.reviewId);
+  assert.equal(review.actualModel, 'jev-1.13.0');
+  const expiry = Date.parse(review.expiresAt);
+  t.mock.timers.setTime(expiry - 1);
+  const approved = await evaluateTest(pinnedConfig, input);
+  assert.equal(approved.decision, 'allow');
+  assert.equal(approved.codeAssessment.status, 'evaluated');
+  assert.equal(openDatabase().prepare('SELECT count(*) AS count FROM fingerprint_cache WHERE project_id=?').get(review.projectId).count, 0);
+  assert.equal(openDatabase().prepare("SELECT final_decision FROM audit_log WHERE project_id=? ORDER BY id DESC LIMIT 1").get(review.projectId).final_decision, 'allow');
+  t.mock.timers.setTime(expiry);
+  const expired = await evaluateTest(pinnedConfig, input);
+  assert.equal(expired.decision, 'review');
+  assert.equal(expired.allowed, false);
+  assert.notEqual(expired.reviewId, pending.reviewId);
+  assert.equal(getHumanReview(openDatabase(), pending.reviewId).status, 'expired');
+  t.mock.timers.setTime(expiry + 1);
+  assert.equal((await evaluateTest(pinnedConfig, input)).decision, 'review');
+  assert.equal(calls, 4);
+});
+
+test('an unchanged approved input still evaluates later Jev deny and API failure', async (t) => {
+  const cwd = profileProject();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+  const input = profileInput(cwd);
+  verifySafetyProfile(input);
+  globalThis.fetch = async () => modelResponse('typesafe', 0.5);
+  const pending = await evaluateTest(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(pinnedConfig, input)).decision, 'allow');
+  globalThis.fetch = async () => modelResponse('typesafe', 0.9);
+  const denied = await evaluateTest(pinnedConfig, input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.allowed, false);
+  globalThis.fetch = async () => { throw new Error('mock network failure'); };
+  const failed = await evaluateTest(pinnedConfig, input);
+  assert.equal(failed.decision, 'review');
+  assert.equal(failed.allowed, false);
+  assert.equal(failed.errorCode, 'JEV_NETWORK_ERROR');
+  assert.equal(failed.reviewId, undefined);
+});
+
+for (const selected of [config, { ...pinnedConfig, requestedModel: 'jev-latest' }, { ...pinnedConfig, requestedModel: 'jev-preview' }]) {
+  test(`${selected.provider}:${selected.requestedModel} binds approval to actual model and never reuses allow cache`, async (t) => {
+    const cwd = profileProject();
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+    const input = profileInput(cwd);
+    verifySafetyProfile(input);
+    let calls = 0;
+    let actualModel = 'jev-1.13.0';
+    let dangerous = 0.5;
+    globalThis.fetch = async () => { calls += 1; return modelResponse(selected.provider, dangerous, actualModel); };
+    const pending = await evaluateTest(selected, input);
+    transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+    assert.equal((await evaluateTest(selected, input)).decision, 'allow');
+    actualModel = 'jev-1.14.0';
+    const changed = await evaluateTest(selected, input);
+    assert.equal(changed.decision, 'review');
+    assert.notEqual(changed.reviewId, pending.reviewId);
+    assert.equal(getHumanReview(openDatabase(), changed.reviewId).actualModel, actualModel);
+    assert.equal(calls, 3);
+    dangerous = 0.1;
+    assert.equal((await evaluateTest(selected, input)).decision, 'allow');
+    assert.equal((await evaluateTest(selected, input)).codeAssessment.status, 'evaluated');
+    assert.equal(calls, 5);
+    dangerous = 0.9;
+    assert.equal((await evaluateTest(selected, input)).decision, 'deny');
+  });
+}
+
+test('an opaque actual model cannot issue an approvable review, but deny still wins', async () => {
+  globalThis.fetch = async () => modelResponse('cloudflare', 0.5, 'typesafe/jev');
+  const result = await evaluateTest(config, { command: 'npm test -- opaque-model-case' });
+  assert.equal(result.decision, 'review');
+  assert.equal(result.allowed, false);
+  assert.equal(result.errorCode, 'JEV_MODEL_ID_UNVERIFIED');
+  assert.equal(result.reviewId, undefined);
+  globalThis.fetch = async () => modelResponse('cloudflare', 0.9, 'typesafe/jev');
+  assert.equal((await evaluateTest(config, { command: 'npm test -- opaque-model-case' })).decision, 'deny');
+});
+
+test('a mismatched fixed-model response cannot populate reusable cache', async (t) => {
+  const cwd = profileProject();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  process.env.JEV_TEST_SAFETY_STATE_PATH = join(cwd, 'state.json');
+  const input = profileInput(cwd);
+  verifySafetyProfile(input);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return modelResponse('typesafe', 0.1, 'jev-1.14.0'); };
+  assert.equal((await evaluateTest(pinnedConfig, input)).decision, 'allow');
+  assert.equal((await evaluateTest(pinnedConfig, input)).codeAssessment.status, 'evaluated');
+  assert.equal(calls, 2);
+});
 
 function profileInput(cwd) {
   return {
@@ -464,8 +578,9 @@ test('framework omission with no isolation evidence requires review', async () =
 });
 
 test('evaluates and caches multiple test files independently', async () => {
+  const config = pinnedConfig;
   let calls = 0;
-  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  globalThis.fetch = async () => { calls += 1; return modelResponse(config.provider); };
   const cwd = mkdtempSync('/tmp/jev-files-');
   mkdirSync(join(cwd, 'tests'));
   for (const file of ['Test1.php', 'Test2.php', 'Test3.php']) writeFileSync(join(cwd, 'tests', file), `<?php // ${file}\n`);
@@ -539,8 +654,9 @@ test('distinguishes outside-cwd, symlink, and non-regular test files', async () 
 });
 
 test('shared safety context changes invalidate dependent test files', async () => {
+  const config = pinnedConfig;
   let calls = 0;
-  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  globalThis.fetch = async () => { calls += 1; return modelResponse(config.provider); };
   const cwd = mkdtempSync('/tmp/jev-shared-');
   mkdirSync(join(cwd, 'tests'));
   for (const file of ['Test1.php', 'Test2.php', 'Test3.php']) writeFileSync(join(cwd, 'tests', file), `<?php // ${file}\n`);
@@ -590,8 +706,9 @@ function profileV2Input(cwd, file = 'tests/Feature/SafeTest.php', filter) {
 }
 
 test('Safety Profile v2 separates one-time environment approval from changed test review', async () => {
+  const config = pinnedConfig;
   let calls = 0;
-  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  globalThis.fetch = async () => { calls += 1; return modelResponse(config.provider); };
   const cwd = profileV2Project();
   const testPath = join(cwd, 'tests', 'Feature', 'SafeTest.php');
   writeFileSync(testPath, '<?php use Illuminate\\Foundation\\Testing\\RefreshDatabase; class SafeTest { use RefreshDatabase; }\n');
@@ -633,8 +750,9 @@ test('Safety Profile v2 separates one-time environment approval from changed tes
 });
 
 test('Safety Profile v2 invalidates code cache and environment approval on the correct boundaries', async () => {
+  const config = pinnedConfig;
   let calls = 0;
-  globalThis.fetch = async () => { calls += 1; return lowRiskResponse(); };
+  globalThis.fetch = async () => { calls += 1; return modelResponse(config.provider); };
   const cwd = profileV2Project();
   const testPath = join(cwd, 'tests', 'Feature', 'BoundaryTest.php');
   writeFileSync(testPath, '<?php class BoundaryTest {}\n');
@@ -706,4 +824,36 @@ test('Safety Profile v2 does not turn policy review or Jev failure into allow', 
   assert.equal(jevFailure.allowed, false);
   assert.equal(jevFailure.errorCode, 'JEV_NETWORK_ERROR');
   rmSync(cwd, { recursive: true, force: true });
+});
+
+test('an alias actual-model change replaces code approval but preserves Environment Approval', async (t) => {
+  const cwd = profileV2Project();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  writeFileSync(join(cwd, 'tests', 'Feature', 'ModelTest.php'), '<?php class ModelTest {}\n');
+  const input = profileV2Input(cwd, 'tests/Feature/ModelTest.php');
+  const selected = { ...pinnedConfig, requestedModel: 'jev-latest' };
+  let model = 'jev-1.13.0';
+  globalThis.fetch = async () => modelResponse('typesafe', 0.5, model);
+  const environmentPending = await evaluateTest(selected, input);
+  const now = new Date();
+  transitionEnvironmentApproval(openDatabase(), environmentPending.environmentReviewId, 'approve', now.toISOString(), new Date(now.getTime() + 86_400_000).toISOString());
+  const codePending = await evaluateTest(selected, input);
+  transitionHumanReview(openDatabase(), codePending.reviewId, 'approve', now.toISOString());
+  const approved = await evaluateTest(selected, input);
+  assert.equal(approved.decision, 'allow');
+  assert.ok(approved.executionAssessment.ticket);
+  model = 'jev-1.14.0';
+  const changed = await evaluateTest(selected, input);
+  assert.equal(changed.decision, 'review');
+  assert.notEqual(changed.reviewId, codePending.reviewId);
+  assert.equal(changed.environmentAssessment.status, 'approved');
+  assert.equal(changed.environmentAssessment.approvalId, approved.environmentAssessment.approvalId);
+  assert.equal(changed.environmentReviewId, undefined);
+  assert.equal(changed.executionAssessment.ticket, undefined);
+  globalThis.fetch = async () => { throw new Error('mock provider failure'); };
+  const otherProvider = await evaluateTest(config, input);
+  // A provider failure cannot invalidate the independently approved environment.
+  assert.equal(otherProvider.environmentAssessment.status, 'approved');
+  assert.equal(otherProvider.environmentAssessment.approvalId, approved.environmentAssessment.approvalId);
+  assert.equal(otherProvider.errorCode, 'JEV_NETWORK_ERROR');
 });
