@@ -232,11 +232,36 @@ Migration: the `related-code-v1` evaluator update prevents reuse of earlier code
 
 The first check returns `environmentReviewId` and `decision=review`. After a human checks the runner and resource scope, pass only that ID to `jev_environment_approve`. Approval lasts 30 days by default and can be immediately revoked with `jev_environment_revoke`.
 
-An approved environment plus static and Jev allow returns a single-use, five-minute Execution Ticket. The safe runner must recheck current environment/code/execution fingerprints, the effective database connection, config cache, fallback/additional connections, filesystem, and network immediately before consuming it. MCP allow and caller-supplied evidence do not replace runtime enforcement.
+An approved environment plus static and Jev allow returns a single-use, five-minute Execution Ticket. The safe runner must establish an immutable workspace, enforce the database, config-cache, filesystem, network, and credential restrictions, and recheck current environment/code/execution fingerprints immediately before consuming it. MCP allow and caller-supplied evidence do not replace runtime enforcement.
+
+### Ticket-aware test runner SDK
+
+Ticket-aware runners import `runApprovedTest` from `jev-mcp-server/runner`. The MCP server remains read-only; this SDK is called inside the project-relative runner named by Safety Profile v2. There is intentionally no standalone "verify ticket" command: validation, atomic ticket consumption, and test startup must stay in one runner process.
+
+The runner passes the opaque Ticket, the exact structured `jev_check_test` input, and only the Jev provider/model identity. Jev API credentials are not needed. The SDK reloads the current Profile, Policy, tests, related code, runner files, and environment files; recalculates project/environment/code/execution fingerprints; checks the current Environment Approval; and consumes the Ticket atomically. Callers cannot supply fingerprints, approval IDs, or a clock.
+
+Before recalculation, the approved runner's adapter must establish an immutable execution workspace and enforce the Profile's database, config-cache, filesystem, network, and credential restrictions. Its `execute` method receives a normalized non-shell plan containing the approved runner, fixed arguments, files, and filter. The adapter is part of the fingerprinted, human-approved runner implementation; do not construct it from untrusted test input or use its callbacks as an assertion-only substitute for OS/runtime controls.
+
+```js
+import { runApprovedTest } from 'jev-mcp-server/runner';
+
+await runApprovedTest({
+  ticket,
+  config: { provider: 'typesafe', requestedModel: 'jev-1.13.0' },
+  input: exactCheckInput,
+  adapter: approvedRunnerAdapter,
+});
+```
+
+Pass the Ticket through protected stdin, a dedicated inherited file descriptor, or an environment value that the runner removes before starting the test. Do not place it in command-line arguments, logs, source files, or test child environments.
+
+Any identity/resource mismatch or incomplete validation revokes the Ticket and requires a new `jev_check_test`. The Ticket is consumed before `execute`; startup failure, test failure, or abnormal termination does not restore it. Concurrent consumers can start at most one execution. A Ticket-compatible path does not also call `jev_check_command`. Tests without a Profile v2 Ticket and approved adapter are not eligible for automatic execution.
+
+Migration: existing Profile v2 projects must update their approved runner to use this SDK and implement real runtime controls, then obtain a new Environment Approval because the runner file fingerprint changes. Until that runner and approval are available, stop automatic test execution. Existing pre-SDK Tickets must not be passed to a raw test command or a standalone verification step.
 
 ## Safety and privacy
 
-- Does not execute commands or tests, or connect to databases.
+- The MCP server process does not execute commands or tests, or connect to project databases. The optional runner SDK starts tests only through the approved adapter described above.
 - Does not trust command input or follow instructions contained in it.
 - Masks common tokens, passwords, secrets, and API keys before sending input to Jev.
 - Does not output Cloudflare tokens or TypeSafe API keys to logs, MCP responses, fingerprints, or caches.

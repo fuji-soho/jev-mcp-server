@@ -141,8 +141,10 @@ test('execution tickets are exact and single-use', () => {
   const key = { approvalId: pending.approvalId, projectId: 'sha256:project', environmentFingerprint: 'sha256:environment', codeFingerprint: 'sha256:code', executionFingerprint: 'sha256:execution' };
   const ticket = issueExecutionTicket(db, key, '2026-09-28T00:00:00.000Z', '2026-09-28T00:05:00.000Z');
   assert.equal(consumeExecutionTicket(db, ticket.token, { ...key, executionFingerprint: 'sha256:changed' }, '2026-09-28T00:01:00.000Z'), false);
-  assert.equal(consumeExecutionTicket(db, ticket.token, key, '2026-09-28T00:01:00.000Z'), true);
-  assert.equal(consumeExecutionTicket(db, ticket.token, key, '2026-09-28T00:02:00.000Z'), false);
+  assert.equal(consumeExecutionTicket(db, ticket.token, key, '2026-09-28T00:01:00.000Z'), false, 'an identity mismatch permanently revokes the ticket');
+  const valid = issueExecutionTicket(db, key, '2026-09-28T00:00:00.000Z', '2026-09-28T00:05:00.000Z');
+  assert.equal(consumeExecutionTicket(db, valid.token, key, '2026-09-28T00:01:00.000Z'), true);
+  assert.equal(consumeExecutionTicket(db, valid.token, key, '2026-09-28T00:02:00.000Z'), false);
 });
 
 test('revoking an environment approval invalidates outstanding execution tickets', () => {

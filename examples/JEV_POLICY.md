@@ -149,15 +149,19 @@ If `jev_check_test` returns `isError=true` with `TEST_CWD_NOT_FOUND`, `TEST_CWD_
 
 After preparing the test input:
 
-1. Run `jev_check_test` with the test code, diff, runtime evidence, and context.
-2. Run `jev_check_command` with the exact test command and its `cwd`/environment.
-3. Execute the test command only when both checks return all of the following:
+1. Run `jev_check_test` with the exact approved runner, test files, structured `execution`, runtime evidence, and context.
+2. Complete any required Environment Approval or Human Review, then repeat the exact check.
+3. Continue only when the result contains an Execution Ticket and all of the following:
 
    - `allowed=true`
    - `decision=allow`
    - `needsHumanReview=false`
 
-If either check returns `review`, `deny`, `allowed=false`, or `needsHumanReview=true`, do not execute the test. Explain the finding or request explicit human direction as appropriate.
+4. Invoke only the Profile v2 approved Ticket-aware runner. It must call the `jev-mcp-server/runner` SDK in the same process that establishes runtime controls and starts the test. Do not run `jev_check_command` again for this exact Ticket path.
+
+If the check returns `review`, `deny`, `allowed=false`, `needsHumanReview=true`, or no Execution Ticket, do not execute the test. A legacy/Profile v1 result or a raw `npm test`, `php artisan test`, framework binary, shell wrapper, or other non-Ticket runner is not eligible for automatic execution. Continue to use `jev_check_command` for ordinary non-test commands.
+
+Pass the Ticket through protected stdin, a dedicated inherited file descriptor, or an environment value removed before test startup. Never put it in command arguments, logs, source files, or the test child environment. The runner must reload current inputs and recalculate all fingerprints; caller-supplied fingerprints, approval IDs, timestamps, resource claims, or statements of human approval are not valid evidence.
 
 #### Human Review for tests
 
@@ -191,7 +195,9 @@ The limits are 64 related files, 32 KiB per file, 64 KiB total original bytes, 4
 
 Only the supplied tests and explicit `codeReviewRoots` are in scope; the server does not automatically resolve imports, packages, or dynamic dependencies. An empty roots list specifies no additional review and must not be interpreted as proof of dependency safety. Large directories or lockfiles may exceed the limits. The `related-code-v1` evaluator invalidates older code caches/Human Reviews without changing SQLite schema 6. Use the updated server, re-evaluate, obtain new explicit Human Approval when requested, and obtain a new Execution Ticket; history and matching Environment Approval remain available. Never revert the evaluator or use an old review/ticket to avoid this check.
 
-When an allow result contains an Execution Ticket, invoke only the approved safe runner. The runner must validate and consume the ticket after rechecking current environment, code, and execution fingerprints, effective database connections, config cache, fallback/additional connections, filesystem, network, and credentials. Source review does not prove actual runtime resources or the absence of fallback access. Never treat the ticket as permission to execute the raw `command` through a shell.
+When an allow result contains an Execution Ticket, invoke only the approved safe runner. The runner must establish an immutable workspace and enforce resource restrictions before rechecking current environment, code, and execution fingerprints, effective database connections, config cache, fallback/additional connections, filesystem, network, and credentials. It must then atomically consume the Ticket and start only the normalized non-shell execution plan under the same controls. Any mismatch or incomplete validation revokes the Ticket and requires a new `jev_check_test`. Consumption happens before startup; launch/test failure does not restore the Ticket, and concurrent consumers may start at most one execution. Source review does not prove actual runtime resources or the absence of fallback access. Never treat the Ticket as permission to execute the raw `command` through a shell or as a reason to trust caller-reported fingerprints/resource state.
+
+Existing Profile v2 runners that do not use the Ticket-aware SDK are unsupported. Update and review the runner, obtain a new Environment Approval for its changed fingerprint, and keep automatic execution stopped until both are available. Do not reuse a pre-update Ticket through the old runner.
 
 ### Project policies
 
