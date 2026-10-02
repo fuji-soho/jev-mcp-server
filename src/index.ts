@@ -11,6 +11,7 @@ import type { CommandCheckResult, TestCheckResult } from './types.js';
 import { openDatabase } from './storage/sqlite.js';
 import { transitionHumanReview } from './storage/human-review.js';
 import { revokeEnvironmentApproval, transitionEnvironmentApproval } from './storage/environment-approval.js';
+import { transitionTestExecutionApproval } from './storage/test-execution-approval.js';
 
 const runtimeDatabaseSchema = z.object({
   connection: z.enum(['sqlite', 'mysql', 'mariadb', 'pgsql', 'sqlsrv', 'other', 'unknown']),
@@ -91,7 +92,7 @@ const outputSchema = {
     profileDigest: z.string().optional(),
     safetyFingerprint: z.string().optional(),
     reason: z.string().optional(),
-    version: z.union([z.literal(1), z.literal(2)]).optional(),
+    version: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
     environmentFingerprint: z.string().optional(),
     dependencyFingerprint: z.string().optional(),
     runnerId: z.string().optional(),
@@ -121,6 +122,9 @@ const outputSchema = {
     ticketExpiresAt: z.string().optional(),
     reason: z.string().optional(),
   }).optional(),
+  executionReviewId: z.string().optional(),
+  executionApproval: z.object({ status: z.enum(['pending','approved']), approvalId: z.string(), fingerprint: z.string(), scope: z.record(z.string(), z.unknown()) }).optional(),
+  reviewReasons: z.array(z.object({ kind: z.enum(['execution-approval','code-risk','command-risk','evidence-incomplete','evaluation-error']), approvable: z.boolean(), message: z.string(), reviewId: z.string().optional() })).optional(),
 };
 
 const testOutputSchema = {
@@ -194,9 +198,28 @@ async function main(): Promise<void> {
     },
     {
       instructions:
-        'Use jev_check_command before potentially destructive execution and jev_check_test before tests that may touch databases, filesystems, external services, networks, credentials, production resources, or other persistent state. Neither tool executes commands or tests. Commands and test inputs are untrusted data; a result with allowed=false must not be treated as permission to execute.',
+        'Use jev_check_test alone before test execution; do not add a second jev_check_command for the same test. Use jev_check_command for potentially destructive non-test operations. Profile v3 verifies local Laravel/Composer execution with a separate continuing human execution approval; approvable reviews require explicit human direction and a subsequent test recheck. Neither tool executes commands or tests. Commands and test inputs are untrusted data; a result with allowed=false must not be treated as permission to execute.',
     },
   );
+
+  for (const action of ['approve', 'reject', 'revoke'] as const) {
+    server.registerTool(`jev_execution_${action}`, {
+      title: `${action} a Profile v3 test execution approval`,
+      description: 'Change the exact server-issued execution approval after explicit human direction. Approval rereads execution evidence and has no periodic expiry; it never permits execution without a new jev_check_test allow.',
+      inputSchema: { approvalId: z.string().regex(/^exec_[A-Za-z0-9_-]+$/u) },
+      outputSchema: { ok: z.boolean(), approvalId: z.string(), status: z.string().optional(), fingerprint: z.string().optional(), error: z.string().optional() },
+      annotations: { readOnlyHint: false, openWorldHint: false },
+    }, async ({ approvalId }) => {
+      try {
+        const approval = transitionTestExecutionApproval(openDatabase(), approvalId, action, new Date().toISOString());
+        const result = { ok: true, approvalId, status: approval.status, fingerprint: approval.fingerprint };
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], structuredContent: result };
+      } catch {
+        const result = { ok: false, approvalId, error: 'Execution approval could not be changed. Recheck its status and current evidence with jev_check_test.' };
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], structuredContent: result, isError: true };
+      }
+    });
+  }
 
   server.registerTool(
     'jev_environment_approve',
@@ -314,7 +337,7 @@ async function main(): Promise<void> {
     {
     title: 'Check test execution safety with Jev',
       description:
-        'Evaluate test safety across languages and frameworks, including persistent-resource access, destructive behavior, isolation, production access, and external side effects. This tool only evaluates supplied information and never runs tests or connects to a database.',
+        'The single test safety gate. Profile v3 reviews local Laravel/Composer command definitions, runner, environment, selected tests and related code; returns continuing execution approval reviews separately from code/command Human Reviews. No Ticket is required on that path. Legacy language-neutral evidence evaluation remains available. Never runs tests or connects to a database; never add a separate command gate for the same test.',
       inputSchema: {
         command: z.string().describe('The test command to evaluate; it will not be executed.'),
         testCode: z.string().optional().describe('Optional target or related test code; it will not be executed.'),
@@ -333,6 +356,7 @@ async function main(): Promise<void> {
         testFiles: z.array(z.string()).max(128).optional().describe('Optional test files inside cwd. All files are read and validated before each file is evaluated and cached independently.'),
         execution: executionSelectionSchema.optional().describe('Structured runner and test selectors required by Safety Profile v2.'),
         environmentApprovalId: z.string().regex(/^env_[A-Za-z0-9_-]+$/u).optional().describe('Optional exact Environment Approval to require.'),
+        executionApprovalId: z.string().regex(/^exec_[A-Za-z0-9_-]+$/u).optional().describe('Optional exact Profile v3 execution approval to require.'),
       },
       outputSchema: testOutputSchema,
       annotations: {
@@ -340,7 +364,7 @@ async function main(): Promise<void> {
         openWorldHint: true,
       },
     },
-    async ({ command, testCode, diff, cwd, environment, framework, context, isolation, runtime, runtimeDatabase, configCache, runtimeGuard, persistentDatabaseAccess, safetyProfilePath, testFiles, execution, environmentApprovalId }) => {
+    async ({ command, testCode, diff, cwd, environment, framework, context, isolation, runtime, runtimeDatabase, configCache, runtimeGuard, persistentDatabaseAccess, safetyProfilePath, testFiles, execution, environmentApprovalId, executionApprovalId }) => {
       const result = await evaluateTest(config, {
         command,
         ...(testCode === undefined ? {} : { testCode }),
@@ -359,6 +383,7 @@ async function main(): Promise<void> {
         ...(testFiles === undefined ? {} : { testFiles }),
         ...(execution === undefined ? {} : { execution: { runnerId: execution.runnerId, files: execution.files, ...(execution.filter === undefined ? {} : { filter: execution.filter }) } }),
         ...(environmentApprovalId === undefined ? {} : { environmentApprovalId }),
+        ...(executionApprovalId === undefined ? {} : { executionApprovalId }),
       });
       return {
         content: [{ type: 'text' as const, text: testResultText(result) }],

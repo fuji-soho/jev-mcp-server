@@ -45,12 +45,12 @@ function commandState(input: CommandCheckInput): CommandCheckInput {
     ...(input.context === undefined ? {} : { context: redactSecrets(input.context) }) };
 }
 
-function buildStaticFindings(input: CommandCheckInput): { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string; policyHash: string } {
+export function buildCommandStaticFindings(input: CommandCheckInput, executionReviewed = false): { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string; policyHash: string } {
   const policies = loadEffectivePolicies(input.cwd);
   const text = [input.command, input.cwd, input.environment, input.target, input.context]
     .filter((item): item is string => item !== undefined).join('\n');
   const policyMatches = findPolicyMatches(policies, text);
-  const findings = [...policyMatches.findings, ...commandScopeFindings(input.command)];
+  const findings = [...policyMatches.findings, ...(executionReviewed ? [] : commandScopeFindings(input.command))];
   if (input.environment === 'production' && /\b(?:delete|destroy|drop|truncate|reset|clean|stop|disable|restart|reload|deploy|apply)\b/iu.test(input.command)) {
     findings.push({ ruleId: 'context.production-change', category: 'production-impact', severity: 'high', decision: 'review', message: 'A state-changing command targets a production environment.' });
   }
@@ -86,7 +86,7 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
   const modelVersion = evaluationIdentity(config);
   const validationError = validateInput(input);
   let staticResult: { findings: StaticFinding[]; policyFindings: PolicyFinding[]; policyVersion: string; policyHash: string };
-  try { staticResult = buildStaticFindings(input); } catch { return reviewResult('The safety policy could not be loaded. Human review is required.', 'POLICY_ERROR'); }
+  try { staticResult = buildCommandStaticFindings(input); } catch { return reviewResult('The safety policy could not be loaded. Human review is required.', 'POLICY_ERROR'); }
   const state = commandState(input);
   const root = (() => { try { return realpathSync(resolve(input.cwd ?? process.cwd())); } catch { return resolve(input.cwd ?? process.cwd()); } })();
   const pid = projectId(root);

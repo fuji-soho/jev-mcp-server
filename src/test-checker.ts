@@ -10,11 +10,14 @@ import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
 import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
-import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256, testInputIdentity, type TestFileIdentity } from './safety-fingerprint.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256, testInputIdentity, type TestFileIdentity, type TestFileResolution } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, type EnvironmentApprovalKey } from './storage/environment-approval.js';
 import { issueExecutionTicket } from './storage/execution-ticket.js';
 import { findLaravelTestRisks } from './frameworks/laravel-test-safety.js';
+import { usesExecutionProfile } from './execution-profile.js';
+import { evaluateTestExecution } from './test-execution-checker.js';
+import { buildCommandStaticFindings } from './command-checker.js';
 
 const MAX_COMMAND_LENGTH = 16_000;
 const MAX_TEST_CODE_LENGTH = 64_000;
@@ -34,11 +37,12 @@ function inputErrorResult(reason: string, errorCode: string, fileErrors?: TestFi
   return { ...reviewResult(reason, [], errorCode), needsHumanReview: false, ...(fileErrors === undefined ? {} : { fileErrors }) };
 }
 
-function redact(value: string): string {
+export function redactTestText(value: string): string {
   return value
     .replace(/(["']?(?:DB_PASSWORD|DB_USERNAME|API_TOKEN|CLOUDFLARE_API_TOKEN|APP_KEY|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|CREDENTIALS?|SECRET|PASSWORD|TOKEN)["']?\s*(?:=>|=|:)\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;\n]+)/giu, '$1[REDACTED]')
     .replace(/(--?(?:token|password|secret|api[-_]?key|access[-_]?key|private[-_]?key)(?:=|\s+))([^\s,;&]+)/giu, '$1[REDACTED]');
 }
+const redact = redactTestText;
 
 function inputText(input: TestCheckInput): string {
   return [input.command, input.testCode, input.diff, input.cwd, input.environment, input.framework, input.context, input.execution === undefined ? undefined : canonicalJson(input.execution)]
@@ -86,9 +90,9 @@ function hasExplicitPersistentTarget(input: TestCheckInput): boolean {
     || /\b(?:production|persistent|real)\s+(?:database|db)\b/iu.test(context);
 }
 
-function customFindings(input: TestCheckInput, text = inputText(input)): StaticFinding[] {
+export function customFindings(input: TestCheckInput, text = inputText(input), executionApproved = false): StaticFinding[] {
   const findings: StaticFinding[] = [];
-  const safeRuntime = hasSafeRuntime(input);
+  const safeRuntime = executionApproved || hasSafeRuntime(input);
   const explicitPersistentTarget = hasExplicitPersistentTarget(input);
   findings.push(...findLaravelTestRisks(input, text, { safeRuntime, explicitPersistentTarget }));
   if (/\bDROP\s+DATABASE\b/iu.test(text)) findings.push({ ruleId: 'legacy.drop-database', category: 'database', severity: 'critical', decision: 'deny', message: 'DROP DATABASE' });
@@ -132,12 +136,12 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   let policies;
   try { policies = loadEffectiveTestPolicies(input.cwd, input.framework); } catch { return reviewResult('The test safety policy could not be loaded. Human review is required.', [], 'POLICY_ERROR'); }
   const policyMatches = findPolicyMatches(policies, inputText(input));
-  const custom = customFindings(input);
+  const custom = customFindings(input, inputText(input), safety.executionApproved);
   let staticFindings = [...policyMatches.findings, ...custom];
   const policyFindings = policyMatches.policyFindings;
   for (const file of safety.relatedCode?.files ?? []) {
     const matches = findPolicyMatches(policies, file.content);
-    staticFindings.push(...[...matches.findings, ...customFindings(input, file.content)].map((finding) => ({ ...finding, file: file.key })));
+    staticFindings.push(...[...matches.findings, ...customFindings(input, file.content, safety.executionApproved)].map((finding) => ({ ...finding, file: file.key })));
     policyFindings.push(...matches.policyFindings.map((finding) => ({ ...finding, file: file.key })));
   }
   let testFindings = toTestFindings(staticFindings, policyFindings);
@@ -155,7 +159,7 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const dependencyFingerprint = safety.assessment.dependencyFingerprint ?? sha256(canonicalJson(sharedFiles));
   const contextHash = sha256(canonicalJson({ shared: { safety: safety.jevContext, policyVersion: policies.version, policyHash: policies.hash, files: sharedFiles, dependencyFingerprint }, runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard }));
   const runtimeHash = sha256(canonicalJson({ runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard, persistentDatabaseAccess: input.persistentDatabaseAccess }));
-  const testSpecific = testInputIdentity(input, fileIdentity, safety.profileV2 !== undefined);
+  const testSpecific = testInputIdentity(input, fileIdentity, safety.profileV2 !== undefined || safety.executionApproved === true);
   const fingerprint = buildFingerprint({ projectId: pid, targetType: 'test-file', targetKey, testSpecific, sharedContext: { safety: safety.jevContext, policyHash: policies.hash, profile: safety.assessment, files: sharedFiles, dependencyFingerprint }, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION });
   const cacheKey: CacheKey = { projectId: pid, targetType: 'test-file', targetKey, fingerprint, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION };
   const humanReviewContext: Omit<HumanReviewKey, 'actualModel'> = {
@@ -306,17 +310,38 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
 }
 
 export async function evaluateTest(config: Config, input: TestCheckInput): Promise<TestCheckResult> {
-  if (!input.testFiles || input.testFiles.length === 0) return evaluateTestSingle(config, input);
+  let priorExecution = false;
+  try {
+    const root = realpathSync(resolve(input.cwd ?? process.cwd()));
+    priorExecution = openDatabase().prepare('SELECT 1 FROM test_execution_approvals WHERE project_id=? LIMIT 1').get(projectId(root)) !== undefined;
+  } catch { /* A configured Profile v3 still fails closed if its store is unavailable. */ }
+  if (usesExecutionProfile(input) || input.executionApprovalId !== undefined || priorExecution || /(?:^|[ /])composer(?:\s|$)/u.test(input.command)) return evaluateTestExecution(config, input);
+  // Legacy inputs retain their workflows, but command Policy prohibitions apply inside the test gate too.
+  try {
+    const command = buildCommandStaticFindings(input, true);
+    if (command.findings.some(f => f.decision === 'deny')) return { ...reviewResult('Command policy denied this test execution.', [...command.findings, ...customFindings(input)].map(f => f.message), 'STATIC_DENY'), ok: true, dangerous: 1, riskScore: 1, decision: 'deny', needsHumanReview: false, policyVersion: command.policyVersion, policyFindings: command.policyFindings };
+  } catch { return { ...reviewResult('Command safety policy could not be loaded.', [], 'POLICY_ERROR'), needsHumanReview: false }; }
+  const result = await evaluateTestCode(config, input);
+  const command = buildCommandStaticFindings(input, true);
+  if (result.decision !== 'deny' && command.policyFindings.some(f => f.source === 'builtin' && f.decision === 'review')) return { ...result, decision: 'review', allowed: false, needsHumanReview: false,
+    errorCode: 'COMMAND_POLICY_REVIEW', reason: 'Command policy review is unresolved. Use Profile v3 for a separately scoped execution review.',
+    policyFindings: [...(result.policyFindings ?? []), ...command.policyFindings],
+    reviewReasons: [{ kind: 'command-risk', approvable: false, message: 'Command Policy review requires a supported execution workflow.' }] };
+  return result;
+}
+
+export async function evaluateTestCode(config: Config, input: TestCheckInput, preparedSafety?: SafetyProfileResult, preparedFiles?: TestFileResolution[]): Promise<TestCheckResult> {
+  if (!input.testFiles || input.testFiles.length === 0) return evaluateTestSingle(config, input, 'test', true, undefined, preparedSafety);
   const rootResult = resolveTestRoot(input.cwd ?? process.cwd());
   if (!rootResult.ok) return inputErrorResult(rootResult.message, rootResult.code);
   const root = rootResult.root;
-  const files = input.testFiles.map((file) => readTestFile(root, file));
+  const files = preparedFiles ?? input.testFiles.map((file) => readTestFile(root, file));
   const fileErrors = files.flatMap((file) => file.ok ? [] : [file.error]);
   if (fileErrors.length > 0) {
     return inputErrorResult('One or more requested test files could not be read from the MCP server filesystem.', 'TEST_FILE_VALIDATION_ERROR', fileErrors);
   }
   const results: TestCheckResult[] = [];
-  const safety = assessSafetyProfile({ ...input, cwd: root });
+  const safety = preparedSafety ?? assessSafetyProfile({ ...input, cwd: root });
   for (const file of files) {
     if (!file.ok) continue;
     results.push(await evaluateTestSingle(config, { ...input, cwd: root, testCode: file.content }, file.target, false, { digest: file.digest, bytes: file.bytes }, safety));
@@ -341,6 +366,11 @@ export async function evaluateTest(config: Config, input: TestCheckInput): Promi
     reason: results.length === 1 ? first.reason : `Evaluated ${results.length} test files independently; aggregate decision is ${decision}.`,
     ...(reviewIds.length === 0 ? {} : { reviewIds, ...(reviewIds.length === 1 ? { reviewId: reviewIds[0] } : {}) }),
   };
+  if (results.length > 1 && preparedSafety?.executionApproved) {
+    aggregate.codeAssessment = { status: results.every(r => r.codeAssessment?.status === 'cache-hit') ? 'cache-hit' : results.some(r => r.codeAssessment?.status === 'not-evaluated') ? 'not-evaluated' : 'evaluated',
+      fingerprint: sha256(canonicalJson(results.map(r => r.codeAssessment?.fingerprint ?? '').sort())),
+      ...(first.codeAssessment?.dependencyFingerprint === undefined ? {} : { dependencyFingerprint: first.codeAssessment.dependencyFingerprint }) };
+  }
   if (aggregate.allowed && first.environmentAssessment?.status === 'approved' && first.environmentAssessment.approvalId !== undefined && first.environmentAssessment.environmentFingerprint !== undefined && first.executionAssessment?.executionFingerprint !== undefined) {
     try {
       const db = openDatabase();

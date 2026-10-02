@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_DB_PATH = join(PROJECT_ROOT, 'cache', 'jev.sqlite');
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 let shared: DatabaseSync | undefined;
 let sharedPath: string | undefined;
@@ -172,6 +172,20 @@ function migrate(db: DatabaseSync): void {
       ALTER TABLE human_reviews ADD COLUMN actual_model TEXT;
       UPDATE fingerprint_cache SET reusable = 0;
       UPDATE schema_meta SET value = '6' WHERE key = 'schema_version';
+    `);
+  }
+  if (version <= 6) {
+    db.exec(`
+      CREATE TABLE test_execution_approvals (
+        approval_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, profile_path TEXT NOT NULL,
+        fingerprint TEXT NOT NULL, policy_hash TEXT NOT NULL, verifier_version TEXT NOT NULL,
+        scope_json TEXT NOT NULL, request_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','revoked','expired','superseded')),
+        created_at TEXT NOT NULL, approved_at TEXT, rejected_at TEXT, revoked_at TEXT, expires_at TEXT
+      );
+      CREATE UNIQUE INDEX idx_test_execution_active ON test_execution_approvals(project_id,profile_path)
+        WHERE status IN ('pending','approved');
+      UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';
     `);
   }
 }

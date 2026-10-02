@@ -4,7 +4,7 @@
 
 ### コマンド実行
 
-ファイル、Gitリポジトリ、データベース、依存パッケージ、サービス、コンテナ、インフラ、デプロイ、その他の永続的な状態を変更する可能性があるコマンドを実行する前に、必ず以下を呼び出してください。
+テスト実行は後述のテスト手順で`jev_check_test`だけを使います。それ以外の、ファイル、Gitリポジトリ、データベース、依存パッケージ、サービス、コンテナ、インフラ、デプロイ、その他の永続的な状態を変更する可能性があるコマンドを実行する前に、必ず以下を呼び出してください。
 
 `jev_check_command`
 
@@ -127,20 +127,19 @@
 - MCP Serverが同じコンテナ内で動作していて直接読み取れる場合を除き、コンテナ内だけで有効な絶対パスを `cwd` や `testFiles` に使用しない
 - MCP Serverから見えるディレクトリと実行環境内のディレクトリが、同じproject内容を指していることを確認する
 
-たとえば、Podmanがhost側の `/host/projects/app` をコンテナ内の `/app` にmountしている場合は、次のように指定します。
+Profile v3ではwrapper／コンテナcommandは未対応です。MCP processもテスト用コンテナ内で動き、Podmanがprojectを`/app`へmountしている場合、同じnamespaceで直接実行するcommandを確認します。
 
 ```json
 {
-  "command": "podman exec app-test sh -lc 'cd /app && composer test'",
-  "cwd": "/host/projects/app",
+  "command": "composer test",
+  "cwd": "/app",
   "framework": "laravel",
   "environment": "testing",
-  "testFiles": [
-    "tests/Unit/ExampleTest.php",
-    "tests/Feature/LoginTest.php"
-  ]
+  "testFiles": ["tests/Unit/ExampleTest.php", "tests/Feature/LoginTest.php"]
 }
 ```
+
+このファイル一覧はcommandから解決したsuite／選択集合の全体でなければなりません。別namespaceから実行するwrapper commandを、この内側のcommandへ置き換えて審査してはいけません。
 
 `testFiles` の絶対パスが有効なのは、MCP Serverのfilesystem上で `cwd` の内側に解決される場合だけです。コンテナ内だけで有効なパスを絶対パスにしても、MCP Serverから読み取れるようにはなりません。MCP Serverが指定されたテストファイルを読み取れない場合は、ファイルの説明文で代用せず、審査失敗として扱ってください。
 
@@ -166,15 +165,33 @@
 
 入力を準備した後、以下の順序で確認してください。
 
-1. テストコード、diff、runtime情報、contextを渡して `jev_check_test` を実行する
-2. 実際に実行する完全なテストコマンドを `cwd`・環境情報とともに `jev_check_command` で確認する
-3. 両方の結果が、以下をすべて満たす場合のみテストコマンドを実行する
+1. 正確なcommand、実際の対象ファイル、必要な実行証拠を渡して`jev_check_test`を呼び出す。
+2. Server発行の承認可能なreviewだけを、明示的な人の判断後に解消し、再チェックする。
+3. `allowed=true`、`decision=allow`、`needsHumanReview=false`が揃う場合だけ同じcommandを実行する。
 
-   - `allowed=true`
-   - `decision=allow`
-   - `needsHumanReview=false`
+テスト実行に2回目の`jev_check_command`を追加しません。依存インストール、DB管理、cleanupなど別の操作には使用します。
 
-どちらか一方でも `review`、`deny`、`allowed=false`、`needsHumanReview=true` の場合はテストを実行しないでください。検出された理由を説明し、必要に応じてユーザーへ明示的な判断を求めてください。
+#### Profile v3の実行承認
+
+通常の確認済みLaravel／Composer経路は、`.jev/test-safety.json`のversion 3と既存のPHP安全runnerを使います。READMEの完全なschemaとruntime条件に従い、MCPから参照できる`cwd`、`framework=laravel`、`environment=testing`、正確なローカルcommandを渡します。Composerテストはv3を要求します。未対応を避けるためにwrapper／コンテナcommandを内側の`composer test`へ置き換えてはいけません。初期v3対応ではMCPと実行を同じPOSIXローカルnamespaceで行います。
+
+`executionReviewId`が返った場合は、`executionApproval.scope`のcommand・展開したComposer chain全文・PHP runner・guardファイル・runtime設定・許可resource／引数範囲を人に提示します。人はrunner全文、guard読込、PHPUnit起動、selector転送を確認します。script名、ソース内の参照、申告hash、profile宣言、「SQLiteで隔離済み」という申告だけでは安全性を証明しません。明示的承認後だけ、返された`approvalId`だけで`jev_execution_approve`を呼び、再チェックします。承認操作だけでは実行できません。
+
+approved実行承認に定期失効はなく、pending reviewは1時間で期限切れになります。`jev_execution_reject`はpendingを拒否、`jev_execution_revoke`はapprovedを取消し、いずれも`approvalId`だけを受け取ります。reject／revoke／superseded済みIDは復活しません。`executionApprovalId`はその有効な承認との完全一致が必要な場合だけ使い、IDを生成・差し替えないでください。承認待ちの条件変更には新しいreviewが必要です。v3履歴のあるprojectでprofileを削除・downgradeしてlegacy承認へ戻してはいけません。
+
+許可範囲内のテスト追加・本文変更、filter／file選択変更では実行再承認は不要ですが、現在のコード審査または条件を満たすコードcacheが必要です。通常の関連コード変更は依存するコード審査を失効させ、runner・guard・環境／安全ファイル・実行ファイル／runtime同一性・Composer定義／autoload／依存・profile scope・適用Policyの変更は実行再承認を要求します。provider／model変更はコード審査だけへ影響します。SHA-256は元バイト列とマスク前入力から作り、同じマスク結果を同一性の根拠にしません。変更説明のために秘密情報の値を送信・保存しないでください。
+
+Serverは実行定義、宣言した安全ファイル、XML bootstrap、インストール済みvendor依存、Composer／global metadata、安全設定を読み込み・照合します。有効なPHP設定をすべて宣言し、実際の実行も同じ設定を使うことを確認します。`runtime.configFiles: []`は人が確認した不在の宣言であり、自動検出ではありません。Serverは任意のPHP importや動的subprocess全体を解決しません。必要なhelper／applicationソースが`codeReviewRoots`に含まれることを確認し、停止回避のために範囲を縮小しないでください。
+
+許可済みPHPファイルselectorと、許可された1つの`--filter VALUE`だけを渡します。selector許可の下でconfiguration／bootstrap／PHP optionを変更してはいけません。`testFiles`はcommandの全対象集合と一致させます。全suite commandはXMLから列挙したsuite全体の審査が必要で、一部だけを渡してはいけません。filterだけでも対象ファイル全体を審査します。インライン`testCode`とv2の`execution`／`environmentApprovalId`はv3へ混在できません。対応script参照、plugin無効化、runtimeパス、読込／探索上限はREADMEを確認してください。
+
+`reviewReasons`を確認します。`execution-approval`は実行条件reviewだけ、`command-risk`／`code-risk`はそれぞれ実modelに結び付くHuman Review IDで扱います。`evidence-incomplete`／`evaluation-error`、`approvable=false`、未対応形式、対象／scope不一致、読めない／不足したファイル・設定、symlink、上限超過は修正して再チェックします。それらのエラーを承認したり、過去の承認／cacheで迂回したりしてはいけません。別の有効なreview IDでも未解決の理由は解消しません。静的検査／Policy／Jevのdenyは常に優先します。
+
+承認済みv3の各チェックはコードcache HIT時もcommandを毎回Jevへ評価させ、コマンドallow cacheは引き続き無効です。自動コードcacheは既存の固定model／実model条件を維持します。必要なAPI評価の失敗を実行承認や過去のHuman Reviewで解除できません。最終のテストゲートが3つのallow条件を満たす場合だけ実行します。
+
+通常経路にExecution TicketやTicket SDKは不要です。確認済みの既存runnerが毎回SQLite memoryの強制、実DB接続確認、永続／fallback／追加接続拒否、config cacheの処理を行います。command、対象、コード、安全条件の変更は再チェックします。ゲートはOS sandbox、lock、チェックから実行までの競合防止を自動提供しません。
+
+schema 7への更新後は、更新したServerと配布Policyを使い、初回のv3実行承認を取得してください。既存の30日期限Environment Approvalを無期限承認へ変換しません。任意の従来v1／v2経路とv2 Ticketはその文書化した条件だけで維持し、現行チェックを回避するためのprofile／Server downgradeや旧記録の再利用は禁止します。
 
 #### テストのHuman Review
 
@@ -190,11 +207,11 @@ Human Reviewの期限は作成時から1時間で、承認によって延長さ�
 
 SQLite schema 6への更新後、旧cacheは再利用不可となり、旧Human Reviewは履歴としてのみ残ります。必要に応じて新しいHuman Reviewの発行と明示的承認を受け、古いreview IDを再利用しようとしないでください。監査履歴と、一致するEnvironment Approvalは保持され、provider／model変更だけではEnvironment Approvalの再承認は不要です。
 
-`jev_check_test` は、変更されていない再利用条件を満たす自動判定のSafety Fingerprint Cache、または実modelに紐付いた有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。Cache HITの場合、そのリクエストでJevが呼び出されなかった可能性があります。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。Jev接続用のAPI keyはfingerprintの入力に含めません。
+`jev_check_test` は、変更されていない再利用条件を満たす自動判定のSafety Fingerprint Cache、または実modelに紐付いた有効なHuman Approvalによって `decision=allow` を返すことがあります。この場合も、`allowed` と `needsHumanReview` の確認は省略できません。CacheとHuman Reviewの判定履歴は、ServerのSQLiteへ監査用に保存されます。コードCache HITの場合、そのコードはJevへ再送されなかった可能性がありますが、Profile v3のcommandは引き続きJevで評価します。command、テストファイル、共通の安全Context、Policy、Safety Profile、作業ディレクトリ/project、runtime/isolation情報、evaluator version、Jev provider、要求modelが変化した場合は再利用できず、コードが再評価されます。provider情報を持たない旧cacheは再利用できません。Jev接続用のAPI keyはfingerprintの入力に含めません。
 
 API送信用のマスク結果を入力の同一性とみなしてはいけません。テストファイルは元バイト列のdigestで識別し、インラインの`testCode`、`diff`、`context`、該当するテストcommandはマスク前にハッシュ化します。マスク対象の値だけの変更でも`jev_check_test`を再実行し、APIへ送るマスク済みのテキストが同じという理由でcacheやHuman Approvalを再利用できると判断してはいけません。新しい結果がHuman Reviewを要求する場合は、新しく発行されたreview IDと明示的承認を受けてください。変更を説明するために平文の秘密情報を送信・記録してはいけません。Jev接続用認証情報は引き続き対象外ですが、評価対象のコードやテスト引数内の認証情報はdigestへ影響します。テストコードだけの変更では一致するProfile v2のEnvironment Approvalを維持し、許可されたfilterだけの変更ではコード評価を再利用できます。
 
-`raw-test-input-v1`へのevaluator更新後は、SQLiteがschema 6のままでも旧cacheとHuman Reviewは新しい同一性に一致しません。再チェックし、必要なら新しいHuman Reviewを受け、現在のコードfingerprintに対する新しいExecution Ticketを取得してください。監査履歴と、一致するEnvironment Approvalは保持されます。更新したServerを使用し、古いevaluatorや古いreview／Ticketへ戻して再評価を迂回してはいけません。
+`raw-test-input-v1`へのevaluator更新後は、その更新自体はDB schemaを変更しなくても旧cacheとHuman Reviewは新しい同一性に一致しません。再チェックし、必要なら新しいHuman Reviewを受け、任意のProfile v2 Ticket経路を使う場合だけ現在のコードfingerprintに対する新しいExecution Ticketを取得してください。監査履歴と、一致するEnvironment Approvalは保持されます。更新したServerを使用し、古いevaluatorや古いreview／Ticketへ戻して再評価を迂回してはいけません。
 
 Laravelでは `framework` に `laravel` を指定してください。既存の `runtimeDatabase`、`configCache`、`runtimeGuard`、`persistentDatabaseAccess` も引き続き利用できます。`RefreshDatabase`、`DatabaseMigrations`、`DatabaseTruncation`、`migrate:fresh`、`db:wipe`、永続DBのターゲット、テスト設定とruntime設定の不一致は安全性のfindingとして扱ってください。
 
@@ -206,9 +223,9 @@ Profile v2では、関連するhelper・setup・applicationコードが`codeRevi
 
 上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親または末端のsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`となります。承認可能な`reviewId`とExecution Ticketはないので停止してください。`jev_review_approve`、過去の承認／cacheの再利用、本文の切り詰め、拡張子による除外、必要なrootの削除で迂回してはいけません。理由を説明し、読み取り可否・範囲・リクエスト容量を修正して再チェックします。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを取り消しません。
 
-範囲は指定テストと明示した`codeReviewRoots`だけで、Serverはimport・package・動的依存を自動解決しません。空のroot一覧は追加審査の指定がないという意味であり、依存全体の安全性の証明ではありません。大きなディレクトリやlockfileは上限を超える場合があります。`related-code-v1`へのevaluator更新はSQLite schema 6を変更せずに以前のコードcache／Human Reviewを失効させます。更新済みServerで再評価し、必要なら新しい明示的なHuman Approvalと新しいExecution Ticketを取得してください。履歴と、一致するEnvironment Approvalは保持します。古いevaluatorやreview／Ticketへ戻して審査を回避してはいけません。
+範囲は指定テストと明示した`codeReviewRoots`だけで、Serverはimport・package・動的依存を自動解決しません。空のroot一覧は追加審査の指定がないという意味であり、依存全体の安全性の証明ではありません。大きなディレクトリやlockfileは上限を超える場合があります。`related-code-v1`へのevaluator更新はその更新自体ではDB schemaを変更せずに以前のコードcache／Human Reviewを失効させます。更新済みServerで再評価し、必要なら新しい明示的なHuman Approvalを取得し、任意のProfile v2 Ticket経路を使う場合だけ新しいExecution Ticketを取得してください。履歴と、一致するEnvironment Approvalは保持します。古いevaluatorやreview／Ticketへ戻して審査を回避してはいけません。
 
-allow結果にExecution Ticketが含まれる場合は、承認済み安全runnerだけを使用します。runnerは実行直前に環境・コード・実行指定のfingerprint、実DB接続、設定キャッシュ、fallback・追加接続、filesystem、network、credentialを再確認してTicketを消費しなければなりません。コード審査は実際のruntime resourceやfallbackアクセスの不存在を証明しません。Ticketをraw commandのshell実行許可として扱ってはいけません。
+任意の従来Profile v2 Ticket経路を明示的に選び、allow結果にExecution Ticketが含まれる場合だけ、その承認済み安全runnerを使用します。runnerは実行直前に環境・コード・実行指定のfingerprint、実DB接続、設定キャッシュ、fallback・追加接続、filesystem、network、credentialを再確認してTicketを消費しなければなりません。コード審査は実際のruntime resourceやfallbackアクセスの不存在を証明しません。Ticketをraw commandのshell実行許可として扱ってはいけません。
 
 ### Project Policy
 

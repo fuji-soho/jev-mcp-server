@@ -196,7 +196,7 @@ test('legacy and current reusable command cache rows are ignored and retained as
   assert.equal(failed.errorCode, 'JEV_NETWORK_ERROR');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM fingerprint_cache').get().count, 2);
   assert.ok(db.prepare('SELECT cache_status FROM audit_log').all().every((row) => row.cache_status === 'disabled'));
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '6');
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '7');
 });
 
 test('scripts, dispatchers, wrappers, shell syntax, and unknown forms cannot be allowed by low Jev risk', async () => {

@@ -200,7 +200,9 @@ export function readRelatedCode(root: string, configuredPaths: string[]): Relate
 export function digestPaths(root: string, configuredPaths: string[]): { fingerprint: string; files: FileManifestEntry[] } {
   const resolvedRoot = realpathSync(resolve(root));
   const files: FileManifestEntry[] = [];
+  let entries = 0;
   const visit = (relativePath: string): void => {
+    if (++entries > 40_000) throw new Error('Configured fingerprint paths exceed the traversal limit.');
     const key = relativeTarget(resolvedRoot, relativePath);
     if (key === undefined || key === '') throw new Error('Configured fingerprint path escapes the project root.');
     const absolute = resolve(resolvedRoot, key);

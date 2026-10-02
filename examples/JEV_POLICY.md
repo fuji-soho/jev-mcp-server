@@ -4,7 +4,7 @@ This project uses the `jev-mcp-server` MCP server as a safety gate for potential
 
 ### Command execution
 
-Before executing any command that may modify files, repositories, databases, dependencies, services, containers, infrastructure, deployments, or other persistent state, call:
+For test invocations, follow the Tests procedure below and use `jev_check_test` alone. Before executing other commands that may modify files, repositories, databases, dependencies, services, containers, infrastructure, deployments, or other persistent state, call:
 
 `jev_check_command`
 
@@ -75,7 +75,7 @@ When `staticFindings` contains `command.execution-content-unreviewed`, stop. Scr
 
 Recheck when script bodies, related configuration/dependencies, or other execution inputs change, even if the command string is unchanged. Checks do not lock files or enforce execution-time integrity; preserve the checked inputs through execution.
 
-After the `command-scope-v1:no-command-cache-v1` update, stop old server processes, rebuild/restart the updated server, and recheck. SQLite remains at schema 6; history and existing test-cache/Human Review/Environment Approval/Execution Ticket behavior are preserved by this command-only update. Never use an older server or old command allow to bypass the new review conditions.
+After the `command-scope-v1:no-command-cache-v1` update, stop old server processes, rebuild/restart the updated server, and recheck. That earlier command-only change did not alter SQLite schema; the current release migrates to schema 7 as described below; history and existing test-cache/Human Review/Environment Approval/Execution Ticket behavior are preserved by this command-only update. Never use an older server or old command allow to bypass the new review conditions.
 
 ### Read-only operations
 
@@ -110,20 +110,19 @@ When tests run in a container, VM, or remote environment:
 - do not use container-internal absolute paths for `cwd` or `testFiles` unless the MCP server runs in that same container and can read them directly;
 - verify that the MCP-visible directory and the execution directory refer to the same project contents.
 
-For example, if Podman mounts `/host/projects/app` at `/app` inside a container, use an input shaped like:
+For Profile v3, wrapper/container commands are unsupported. If the MCP process also runs inside the test container, and Podman mounts the project at `/app`, check the direct invocation in that same namespace:
 
 ```json
 {
-  "command": "podman exec app-test sh -lc 'cd /app && composer test'",
-  "cwd": "/host/projects/app",
+  "command": "composer test",
+  "cwd": "/app",
   "framework": "laravel",
   "environment": "testing",
-  "testFiles": [
-    "tests/Unit/ExampleTest.php",
-    "tests/Feature/LoginTest.php"
-  ]
+  "testFiles": ["tests/Unit/ExampleTest.php", "tests/Feature/LoginTest.php"]
 }
 ```
+
+These files must be the complete suite or selection resolved by the command. Do not substitute this inner invocation for a wrapper command actually executed from another namespace.
 
 An absolute `testFiles` entry is valid only when it resolves inside `cwd` in the MCP server's filesystem. Making a container-only path absolute does not make it readable by the MCP server. If the MCP server cannot read a requested test file, treat the check as failed rather than substituting a description of the file.
 
@@ -149,15 +148,33 @@ If `jev_check_test` returns `isError=true` with `TEST_CWD_NOT_FOUND`, `TEST_CWD_
 
 After preparing the test input:
 
-1. Run `jev_check_test` with the test code, diff, runtime evidence, and context.
-2. Run `jev_check_command` with the exact test command and its `cwd`/environment.
-3. Execute the test command only when both checks return all of the following:
+1. Call `jev_check_test` with the exact command, actual target files and required execution evidence.
+2. Resolve only server-issued, approvable reviews after explicit human direction, then recheck.
+3. Execute the same checked invocation only when `allowed=true`, `decision=allow`, and `needsHumanReview=false`.
 
-   - `allowed=true`
-   - `decision=allow`
-   - `needsHumanReview=false`
+Do not add a second `jev_check_command` for test execution. Use it for other operations such as dependency installation, database administration or cleanup.
 
-If either check returns `review`, `deny`, `allowed=false`, or `needsHumanReview=true`, do not execute the test. Explain the finding or request explicit human direction as appropriate.
+#### Profile v3 execution approval
+
+The normal verified Laravel/Composer path uses `.jev/test-safety.json` version 3 and an existing PHP safety runner. Follow the complete schema and runtime requirements in the README. Supply MCP-visible `cwd`, `framework=laravel`, `environment=testing`, and the exact local invocation. Composer tests require v3. Never replace a wrapper/container command with an inner `composer test` to avoid unsupported execution; initial v3 support requires MCP and execution in the same POSIX-local namespace.
+
+On `executionReviewId`, show `executionApproval.scope`: the command and complete expanded Composer chain, PHP runner, guard files, runtime configuration and allowed resource/argument scope. Have a human inspect the full runner, guard loading, PHPUnit invocation and selector forwarding. Neither a script name, source reference, caller hash, profile declaration nor a claim of SQLite isolation is proof of actual safety. After explicit human approval, call `jev_execution_approve` with only the returned `approvalId`. Recheck; an approval action alone never permits execution.
+
+Approved execution records have no periodic deadline; pending reviews expire after one hour. `jev_execution_reject` rejects pending records and `jev_execution_revoke` cancels approved records, each with only `approvalId`. Rejected, revoked or superseded IDs do not reactivate. Use `executionApprovalId` only when requiring that exact active record; never invent or substitute an ID. Changes while approval is pending require a new review. Removing/downgrading a v3 profile cannot restore legacy approval for a project with v3 history.
+
+Test additions/body changes and permitted filter/file selection changes do not require execution reapproval within the approved scope, but require current code review or eligible code-cache reuse. Ordinary related-code changes invalidate dependent code review; runner, guards, environment/safety files, executable/runtime identity, Composer definitions/autoload/dependencies, profile scope or applicable Policy changes require execution reapproval. A provider/model change affects code review, not execution approval. SHA-256 uses original bytes and pre-mask input; identical masked text never proves unchanged evidence. Do not send or record secret values to explain a change.
+
+The server automatically reads/fingerprints execution definitions and declared safety files, XML bootstrap, installed vendor dependencies, Composer/global metadata and safety settings. Declare all active PHP config files and verify the actual execution uses that configuration. `runtime.configFiles: []` is a human-reviewed absence claim, not automatic discovery. The server does not resolve all arbitrary PHP imports or dynamic subprocesses. Confirm that `codeReviewRoots` covers necessary helper/application source; do not shrink it to avoid a blocked review.
+
+Pass only approved PHP file selectors and one permitted `--filter VALUE`. Never change configuration/bootstrap/PHP options under a selector allowance. `testFiles` must equal the command's complete selected set. A full-suite command requires review of the entire enumerated XML suite; never submit a subset. Filter-only execution still reviews every selected file. Inline `testCode` and v2 `execution`/`environmentApprovalId` cannot be mixed with v3. See the README for supported script references, plugin disabling, runtime paths and read/traversal limits.
+
+Inspect `reviewReasons`. `execution-approval` authorizes only execution-condition review, while `command-risk`/`code-risk` require their own model-bound Human Review IDs. `evidence-incomplete`/`evaluation-error`, `approvable=false`, unsupported forms, target/scope mismatch, missing or unreadable files/configuration, symlinks and exceeded limits require correction and rechecking. Never approve those errors or use previous approvals/cache to bypass them. A separate valid review ID does not clear another unresolved reason. Static/Policy/Jev deny always wins.
+
+The command is freshly evaluated by Jev on each approved v3 check, including a code-cache hit; command allow cache remains disabled. Automatic code cache retains the existing fixed-model/actual-model conditions. Required API failure cannot be overridden with execution approval or prior Human Review. Execute only after the final test gate returns all three allow conditions.
+
+The normal path requires no Execution Ticket or Ticket SDK. Use the existing reviewed runner, which must enforce SQLite memory, confirm actual DB connections, reject persistent/fallback/additional connections and handle config cache on every run. Recheck any changed command, target, code or safety conditions. This gate does not supply OS sandboxing, locks or automatic check-to-execution race prevention.
+
+After upgrading to schema 7, use the updated server and distributed policy. Obtain an initial v3 execution approval; existing 30-day Environment Approvals are not converted into indefinite records. Preserve optional legacy v1/v2 workflows and v2 Tickets only under their documented conditions; never downgrade a profile/server or reuse an old record to bypass current checks.
 
 #### Human Review for tests
 
@@ -173,11 +190,11 @@ For `jev_check_test`, only pinned TypeSafe `jev-X.Y.Z` models whose actual model
 
 After upgrading to SQLite schema 6, old cache entries are non-reusable and old Human Reviews are history only. Obtain a newly issued Human Review and explicit approval when required; do not try to reuse an old review ID. Audit history and matching Environment Approvals are preserved, and provider/model changes alone do not require new Environment Approval.
 
-`jev_check_test` may return `decision=allow` from an unchanged eligible automatic Safety Fingerprint Cache entry or from a valid model-bound Human Approval. This is still subject to the same `allowed` and `needsHumanReview` checks. Cache hits and Human Review decisions are stored in the server's SQLite database for audit. A cache hit does not mean that Jev was called for that request. Changes to the command, test file, shared safety files, policies, Safety Profile, working directory/project, runtime/isolation evidence, evaluator version, Jev provider, or requested model invalidate reuse and cause code re-evaluation. Cache entries without provider identity are not reusable. Jev connection API keys are not fingerprint inputs.
+`jev_check_test` may return `decision=allow` from an unchanged eligible automatic Safety Fingerprint Cache entry or from a valid model-bound Human Approval. This is still subject to the same `allowed` and `needsHumanReview` checks. Cache hits and Human Review decisions are stored in the server's SQLite database for audit. A code-cache hit does not mean code was sent to Jev in that request; Profile v3 still evaluates the command with Jev. Changes to the command, test file, shared safety files, policies, Safety Profile, working directory/project, runtime/isolation evidence, evaluator version, Jev provider, or requested model invalidate reuse and cause code re-evaluation. Cache entries without provider identity are not reusable. Jev connection API keys are not fingerprint inputs.
 
 API redaction does not establish input identity. Test files are identified by original-byte digests, and inline `testCode`, `diff`, `context`, and applicable test commands are hashed before redaction. Changes limited to masked values still require a new `jev_check_test`; do not assume unchanged masked API text permits cache or Human Approval reuse. If the new result requires Human Review, obtain a newly issued review ID and explicit approval. Do not send or log plaintext secrets to demonstrate what changed. Jev connection credentials remain excluded, but credentials inside evaluated code or test arguments affect its digest. A test-code-only change preserves a matching Profile v2 Environment Approval; permitted filter-only changes may reuse code evaluation.
 
-After the `raw-test-input-v1` evaluator update, earlier cache and Human Review records do not match the new identity even though SQLite remains at schema 6. Recheck, obtain a new Human Review when required, and obtain a new Execution Ticket for current code fingerprints. Audit history and matching Environment Approvals are preserved. Use the updated server; do not fall back to an older evaluator or an old review/ticket to bypass re-evaluation.
+After the `raw-test-input-v1` evaluator update, earlier cache and Human Review records do not match the new identity without itself changing the DB schema. Recheck, obtain a new Human Review when required, and obtain a new Execution Ticket for current code fingerprints only for the optional Profile v2 Ticket path. Audit history and matching Environment Approvals are preserved. Use the updated server; do not fall back to an older evaluator or an old review/ticket to bypass re-evaluation.
 
 For Laravel, set `framework` to `laravel`. Existing Laravel evidence fields such as `runtimeDatabase`, `configCache`, `runtimeGuard`, and `persistentDatabaseAccess` remain supported. `RefreshDatabase`, `DatabaseMigrations`, `DatabaseTruncation`, `migrate:fresh`, `db:wipe`, persistent database targets, and test/runtime configuration mismatches must be treated as safety findings.
 
@@ -189,9 +206,9 @@ For Profile v2, confirm that `codeReviewRoots` covers the relevant helpers, setu
 
 The limits are 64 related files, 32 KiB per file, 64 KiB total original bytes, 4096 traversed entries including directories, and 256 KiB for the complete serialized Jev request. Missing/unreadable paths, parent or leaf symlinks, non-regular files, binary/non-UTF-8 contents, and exceeded limits return `RELATED_CODE_REVIEW_INCOMPLETE`, `decision=review`, `allowed=false`. Stop: there is no approvable `reviewId` or Execution Ticket. Do not call `jev_review_approve`, reuse an old approval/cache, truncate evidence, skip extensions, or remove relevant roots to evade this condition. Explain the reason, correct readability/scope/request size, and recheck. An already detected static `deny` stays `deny`. Related-review failure alone does not revoke a matching Environment Approval.
 
-Only the supplied tests and explicit `codeReviewRoots` are in scope; the server does not automatically resolve imports, packages, or dynamic dependencies. An empty roots list specifies no additional review and must not be interpreted as proof of dependency safety. Large directories or lockfiles may exceed the limits. The `related-code-v1` evaluator invalidates older code caches/Human Reviews without changing SQLite schema 6. Use the updated server, re-evaluate, obtain new explicit Human Approval when requested, and obtain a new Execution Ticket; history and matching Environment Approval remain available. Never revert the evaluator or use an old review/ticket to avoid this check.
+Only the supplied tests and explicit `codeReviewRoots` are in scope; the server does not automatically resolve imports, packages, or dynamic dependencies. An empty roots list specifies no additional review and must not be interpreted as proof of dependency safety. Large directories or lockfiles may exceed the limits. The `related-code-v1` evaluator invalidates older code caches/Human Reviews without itself changing the DB schema. Use the updated server, re-evaluate, obtain new explicit Human Approval when requested, and obtain a new Execution Ticket only for the optional Profile v2 Ticket path; history and matching Environment Approval remain available. Never revert the evaluator or use an old review/ticket to avoid this check.
 
-When an allow result contains an Execution Ticket, invoke only the approved safe runner. The runner must validate and consume the ticket after rechecking current environment, code, and execution fingerprints, effective database connections, config cache, fallback/additional connections, filesystem, network, and credentials. Source review does not prove actual runtime resources or the absence of fallback access. Never treat the ticket as permission to execute the raw `command` through a shell.
+Only when explicitly using the optional legacy Profile v2 Ticket path and an allow result contains an Execution Ticket, invoke its approved safe runner. The runner must validate and consume the ticket after rechecking current environment, code, and execution fingerprints, effective database connections, config cache, fallback/additional connections, filesystem, network, and credentials. Source review does not prove actual runtime resources or the absence of fallback access. Never treat the ticket as permission to execute the raw `command` through a shell.
 
 ### Project policies
 

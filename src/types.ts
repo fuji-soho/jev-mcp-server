@@ -101,6 +101,8 @@ export interface TestCheckInput {
   execution?: TestExecutionSelection;
   /** Optional exact environment approval to require. */
   environmentApprovalId?: string;
+  /** Optional exact Profile v3 execution approval to require. */
+  executionApprovalId?: string;
 }
 
 export interface TestExecutionSelection {
@@ -191,6 +193,9 @@ export interface TestCheckResult {
   environmentAssessment?: EnvironmentAssessment;
   codeAssessment?: CodeAssessment;
   executionAssessment?: ExecutionAssessment;
+  executionReviewId?: string;
+  executionApproval?: { status: 'pending' | 'approved'; approvalId: string; fingerprint: string; scope: Record<string, unknown> };
+  reviewReasons?: Array<{ kind: 'execution-approval' | 'code-risk' | 'command-risk' | 'evidence-incomplete' | 'evaluation-error'; approvable: boolean; message: string; reviewId?: string }>;
 }
 
 export interface EnvironmentAssessment {
@@ -221,7 +226,7 @@ export interface ExecutionAssessment {
 export interface HumanReviewRecord {
   reviewId: string;
   projectId: string;
-  targetType: 'test-file';
+  targetType: 'test-file' | 'test-execution';
   targetKey: string;
   fingerprint: string;
   commandHash: string;
@@ -251,7 +256,7 @@ export interface SafetyProfileAssessment {
   profileDigest?: string;
   safetyFingerprint?: string;
   reason?: string;
-  version?: 1 | 2;
+  version?: 1 | 2 | 3;
   environmentFingerprint?: string;
   dependencyFingerprint?: string;
   runnerId?: string;

@@ -55,6 +55,8 @@ export interface SafetyProfileResult {
   profileV2?: SafetyProfileV2;
   environmentScopeJson?: string;
   relatedCode?: RelatedCodeSnapshot;
+  /** Internal, server-verified Profile v3 approval evidence. Never supplied by callers. */
+  executionApproved?: boolean;
 }
 
 export interface ExecutionSelectionResult {

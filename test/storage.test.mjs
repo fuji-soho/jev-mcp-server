@@ -37,7 +37,7 @@ test(`the current evaluator cannot reuse ${oldVersion} cache or model-bound appr
   transitionHumanReview(db, pending.reviewId, 'approve', now);
   assert.equal(lookupApprovedHumanReview(db, bindHumanReviewModel({ ...reviewKey(), fingerprint: currentFingerprint }, 'jev-1.13.0'), now), undefined);
   assert.equal(getHumanReview(db, pending.reviewId).status, 'approved', 'history remains available');
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '6');
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '7');
 });
 }
 
@@ -80,7 +80,7 @@ function legacyDatabase() {
   transitionEnvironmentApproval(db, environment.approvalId, 'approve', now, '2026-10-30T00:00:00.000Z');
   insertAudit(db, { requestId: 'legacy', toolName: 'jev_check_test', cacheStatus: 'miss', finalDecision: 'allow', allowed: true, needsHumanReview: false });
   // Schema 5 has the same tables and indexes, without human_reviews.actual_model.
-  db.exec("ALTER TABLE human_reviews DROP COLUMN actual_model; UPDATE schema_meta SET value='5' WHERE key='schema_version';");
+  db.exec("DROP TABLE test_execution_approvals; ALTER TABLE human_reviews DROP COLUMN actual_model; UPDATE schema_meta SET value='5' WHERE key='schema_version';");
   resetDatabaseForTests();
   return { path, review, environmentKey, environment, now };
 }
@@ -116,8 +116,8 @@ test('a failed migration rolls back schema and cache changes', () => {
 
 test('creates the cache directory, schema, and secure file permissions', () => {
   const path = databasePath(); const db = openDatabase(path);
-  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'environment_approvals', 'execution_tickets', 'fingerprint_cache', 'human_reviews', 'schema_meta']);
-  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '6');
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ['audit_log', 'environment_approvals', 'execution_tickets', 'fingerprint_cache', 'human_reviews', 'schema_meta', 'test_execution_approvals']);
+  assert.equal(db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '7');
 });
 
 test('environment approvals are exact, expiring, and revocable', () => {

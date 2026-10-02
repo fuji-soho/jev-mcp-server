@@ -5,7 +5,7 @@ import { canonicalJson, sha256 } from '../safety-fingerprint.js';
 
 export interface HumanReviewKey {
   projectId: string;
-  targetType: 'test-file';
+  targetType: 'test-file' | 'test-execution';
   targetKey: string;
   fingerprint: string;
   commandHash: string;
@@ -28,7 +28,7 @@ export function bindHumanReviewModel(key: Omit<HumanReviewKey, 'actualModel'>, a
 
 function mapRow(row: Record<string, unknown>): HumanReviewRecord {
   return {
-    reviewId: String(row.review_id), projectId: String(row.project_id), targetType: 'test-file', targetKey: String(row.target_key),
+    reviewId: String(row.review_id), projectId: String(row.project_id), targetType: String(row.target_type) as HumanReviewRecord['targetType'], targetKey: String(row.target_key),
     fingerprint: String(row.fingerprint), commandHash: String(row.command_hash), testFilesHash: String(row.test_files_hash), cwdHash: String(row.cwd_hash),
     policyHash: String(row.policy_hash), contextHash: String(row.context_hash), runtimeHash: String(row.runtime_hash),
     ...(row.safety_profile_hash == null ? {} : { safetyProfileHash: String(row.safety_profile_hash) }),
