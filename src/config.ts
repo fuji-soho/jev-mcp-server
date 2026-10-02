@@ -19,11 +19,10 @@ export interface TypeSafeConfig {
 }
 
 export type Config = CloudflareConfig | TypeSafeConfig;
-export interface EvaluationConfigIdentity { provider: Config['provider']; requestedModel: string }
 
 export const DEFAULT_TYPESAFE_MODEL = 'jev-1.13.0';
 
-export function evaluationIdentity(config: EvaluationConfigIdentity): string {
+export function evaluationIdentity(config: Config): string {
   return `${config.provider}:${config.requestedModel}`;
 }
 

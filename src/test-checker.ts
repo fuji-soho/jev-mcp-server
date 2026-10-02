@@ -1,20 +1,26 @@
 import { evaluationIdentity, isEvaluationCacheReusable, isVersionedModel, type Config } from './config.js';
 import { checkTestWithJev, JevError, validateTestRequestSize, type TestSafetyState } from './cloudflare-jev.js';
 import { findPolicyMatches, loadEffectiveTestPolicies, strictestDecision } from './policy.js';
-import { assessSafetyProfile, ENVIRONMENT_VERIFIER_VERSION, type SafetyProfileResult } from './test-safety-profile.js';
+import { assessSafetyProfile, ENVIRONMENT_VERIFIER_VERSION, validateExecutionSelection, type ExecutionSelectionResult, type SafetyProfileResult } from './test-safety-profile.js';
 import type { Decision, EnvironmentAssessment, PolicyFinding, RiskCategory, StaticFinding, TestCheckInput, TestCheckResult, TestFileError, TestFinding } from './types.js';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
 import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
-import { canonicalJson, EVALUATOR_VERSION, projectId, readTestFile, resolveTestRoot, sha256, type TestFileIdentity } from './safety-fingerprint.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256, testInputIdentity, type TestFileIdentity } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, type EnvironmentApprovalKey } from './storage/environment-approval.js';
 import { issueExecutionTicket } from './storage/execution-ticket.js';
 import { findLaravelTestRisks } from './frameworks/laravel-test-safety.js';
-import { buildTestEvaluationIdentity, validateTestInput } from './test-execution-identity.js';
 
+const MAX_COMMAND_LENGTH = 16_000;
+const MAX_TEST_CODE_LENGTH = 64_000;
+const MAX_DIFF_LENGTH = 64_000;
+const MAX_CONTEXT_LENGTH = 32_000;
+const MAX_FIELD_LENGTH = 4_000;
 const SEVERITY_SCORE = { low: 0.25, medium: 0.5, high: 0.8, critical: 1 } as const;
 const HUMAN_REVIEW_TTL_SECONDS = 60 * 60;
 const ENVIRONMENT_REVIEW_TTL_SECONDS = 60 * 60;
@@ -37,6 +43,16 @@ function redact(value: string): string {
 function inputText(input: TestCheckInput): string {
   return [input.command, input.testCode, input.diff, input.cwd, input.environment, input.framework, input.context, input.execution === undefined ? undefined : canonicalJson(input.execution)]
     .filter((value): value is string => value !== undefined).join('\n');
+}
+
+function validateInput(input: TestCheckInput): string | undefined {
+  if (input.command.trim() === '') return 'command must not be empty.';
+  if (input.command.length > MAX_COMMAND_LENGTH) return `command exceeds the ${MAX_COMMAND_LENGTH}-character limit.`;
+  if (input.testCode !== undefined && input.testCode.length > MAX_TEST_CODE_LENGTH) return `testCode exceeds the ${MAX_TEST_CODE_LENGTH}-character limit.`;
+  if (input.diff !== undefined && input.diff.length > MAX_DIFF_LENGTH) return `diff exceeds the ${MAX_DIFF_LENGTH}-character limit.`;
+  if (input.context !== undefined && input.context.length > MAX_CONTEXT_LENGTH) return `context exceeds the ${MAX_CONTEXT_LENGTH}-character limit.`;
+  for (const [name, value] of [['cwd', input.cwd], ['framework', input.framework]] as const) if (value !== undefined && value.length > MAX_FIELD_LENGTH) return `${name} exceeds the ${MAX_FIELD_LENGTH}-character limit.`;
+  return undefined;
 }
 
 function legacySafeRuntime(input: TestCheckInput): boolean {
@@ -102,11 +118,16 @@ function safeInput(input: TestCheckInput): TestCheckInput {
   return { command: redact(input.command), ...(input.testCode === undefined ? {} : { testCode: redact(input.testCode) }), ...(input.diff === undefined ? {} : { diff: redact(input.diff) }), ...(input.cwd === undefined ? {} : { cwd: redact(input.cwd) }), ...(input.environment === undefined ? {} : { environment: input.environment }), ...(input.framework === undefined ? {} : { framework: input.framework }), ...(input.context === undefined ? {} : { context: redact(input.context) }), ...(input.isolation === undefined ? {} : { isolation: input.isolation }), ...(input.runtime === undefined ? {} : { runtime: input.runtime }), ...(input.runtimeDatabase === undefined ? {} : { runtimeDatabase: input.runtimeDatabase }), ...(input.configCache === undefined ? {} : { configCache: input.configCache }), ...(input.runtimeGuard === undefined ? {} : { runtimeGuard: input.runtimeGuard }), ...(input.persistentDatabaseAccess === undefined ? {} : { persistentDatabaseAccess: input.persistentDatabaseAccess }), ...(input.safetyProfilePath === undefined ? {} : { safetyProfilePath: redact(input.safetyProfilePath) }), ...(input.execution === undefined ? {} : { execution: input.execution }) };
 }
 
+function sharedSafetyFiles(root: string): Array<{ key: string; digest: string; bytes: number }> {
+  const candidates = ['tests/TestCase.php', 'test-safe.php', 'phpunit.xml', 'phpunit.xml.dist', 'package.json', 'pyproject.toml', 'pytest.ini', 'vitest.config.ts', 'vitest.config.js', '.jev/test-safety.json'];
+  return candidates.map((file) => fileDigest(root, file)).filter((item): item is { key: string; digest: string; bytes: number } => item !== undefined);
+}
+
 async function evaluateTestSingle(config: Config, input: TestCheckInput, targetKey = 'test', createTicket = true, fileIdentity?: TestFileIdentity, preparedSafety?: SafetyProfileResult): Promise<TestCheckResult> {
   const evaluation = { jevProvider: config.provider, requestedModel: config.requestedModel } as const;
   const modelVersion = evaluationIdentity(config);
   const cacheReusable = isEvaluationCacheReusable(config);
-  const validationError = validateTestInput(input);
+  const validationError = validateInput(input);
   const safety = preparedSafety ?? assessSafetyProfile(input);
   let policies;
   try { policies = loadEffectiveTestPolicies(input.cwd, input.framework); } catch { return reviewResult('The test safety policy could not be loaded. Human review is required.', [], 'POLICY_ERROR'); }
@@ -124,9 +145,18 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   let staticDecision = strictestDecision(staticFindings.map((finding) => finding.decision).concat(policyFindings.map((finding) => finding.decision)));
   let initialDetails = { policyFindings, policyVersion: policies.version, policiesApplied: policies.policies.map((policy) => policy.version), findings: testFindings, safetyProfile: safety.assessment };
   if (validationError !== undefined && staticDecision !== 'deny') return reviewResult(validationError, messages, 'INVALID_INPUT', initialDetails);
-  const identity = buildTestEvaluationIdentity(config, input, targetKey, policies, safety, fileIdentity);
-  const { root, projectId: pid, dependencyFingerprint, contextHash, runtimeHash, fingerprint, executionSelection } = identity;
+  const root = (() => { try { return realpathSync(resolve(input.cwd ?? process.cwd())); } catch { return resolve(input.cwd ?? process.cwd()); } })();
+  const pid = projectId(root);
   const safe = safeInput(input);
+  const executionSelection: ExecutionSelectionResult = safety.profileV2 === undefined
+    ? { valid: true, runnerMatched: true, selectorsAllowed: true }
+    : validateExecutionSelection(root, safety.profileV2, input.execution, input.testFiles, input.command, input.framework, input.environment);
+  const sharedFiles = sharedSafetyFiles(root);
+  const dependencyFingerprint = safety.assessment.dependencyFingerprint ?? sha256(canonicalJson(sharedFiles));
+  const contextHash = sha256(canonicalJson({ shared: { safety: safety.jevContext, policyVersion: policies.version, policyHash: policies.hash, files: sharedFiles, dependencyFingerprint }, runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard }));
+  const runtimeHash = sha256(canonicalJson({ runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard, persistentDatabaseAccess: input.persistentDatabaseAccess }));
+  const testSpecific = testInputIdentity(input, fileIdentity, safety.profileV2 !== undefined);
+  const fingerprint = buildFingerprint({ projectId: pid, targetType: 'test-file', targetKey, testSpecific, sharedContext: { safety: safety.jevContext, policyHash: policies.hash, profile: safety.assessment, files: sharedFiles, dependencyFingerprint }, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION });
   const cacheKey: CacheKey = { projectId: pid, targetType: 'test-file', targetKey, fingerprint, policyHash: policies.hash, contextHash, safetyProfileHash: safety.assessment.profileDigest, runtimeHash, modelVersion, evaluatorVersion: EVALUATOR_VERSION };
   const humanReviewContext: Omit<HumanReviewKey, 'actualModel'> = {
     projectId: pid, targetType: 'test-file', targetKey, fingerprint,

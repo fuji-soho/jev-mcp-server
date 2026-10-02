@@ -166,19 +166,15 @@
 
 入力を準備した後、以下の順序で確認してください。
 
-1. 正確な承認済みrunner、テストファイル、構造化`execution`、runtime情報、contextを渡して`jev_check_test`を実行する
-2. 必要なEnvironment ApprovalまたはHuman Reviewを完了し、完全に同じ内容で再チェックする
-3. 結果にExecution Ticketが含まれ、以下をすべて満たす場合だけ続行する
+1. テストコード、diff、runtime情報、contextを渡して `jev_check_test` を実行する
+2. 実際に実行する完全なテストコマンドを `cwd`・環境情報とともに `jev_check_command` で確認する
+3. 両方の結果が、以下をすべて満たす場合のみテストコマンドを実行する
 
    - `allowed=true`
    - `decision=allow`
    - `needsHumanReview=false`
 
-4. Profile v2で承認されたTicket対応runnerだけを起動する。runnerはruntime制約の確立とテスト起動を行う同じプロセス内で`jev-mcp-server/runner` SDKを呼び出す。この正確なTicket経路では`jev_check_command`を重ねて実行しない
-
-チェックが`review`、`deny`、`allowed=false`、`needsHumanReview=true`、またはExecution Ticketなしの場合はテストを実行しないでください。legacy／Profile v1の結果や、rawの`npm test`、`php artisan test`、framework binary、shell wrapper、その他の非Ticket runnerは自動実行できません。通常のテスト以外のコマンドには、引き続き`jev_check_command`を使用してください。
-
-Ticketは保護されたstdin、専用の継承file descriptor、またはテスト起動前に削除する環境値で渡してください。コマンド引数、ログ、source file、テスト子プロセスの環境へ入れてはいけません。runnerは現在の入力を読み直して全fingerprintを再計算しなければなりません。呼び出し側が申告したfingerprint、approval ID、時刻、resource情報、人の承認文言は証拠として扱えません。
+どちらか一方でも `review`、`deny`、`allowed=false`、`needsHumanReview=true` の場合はテストを実行しないでください。検出された理由を説明し、必要に応じてユーザーへ明示的な判断を求めてください。
 
 #### テストのHuman Review
 
@@ -212,9 +208,7 @@ Profile v2では、関連するhelper・setup・applicationコードが`codeRevi
 
 範囲は指定テストと明示した`codeReviewRoots`だけで、Serverはimport・package・動的依存を自動解決しません。空のroot一覧は追加審査の指定がないという意味であり、依存全体の安全性の証明ではありません。大きなディレクトリやlockfileは上限を超える場合があります。`related-code-v1`へのevaluator更新はSQLite schema 6を変更せずに以前のコードcache／Human Reviewを失効させます。更新済みServerで再評価し、必要なら新しい明示的なHuman Approvalと新しいExecution Ticketを取得してください。履歴と、一致するEnvironment Approvalは保持します。古いevaluatorやreview／Ticketへ戻して審査を回避してはいけません。
 
-allow結果にExecution Ticketが含まれる場合は、承認済み安全runnerだけを使用します。runnerは変更不能なworkspaceを確立してresource制約を強制した後、環境・コード・実行指定のfingerprint、実DB接続、設定cache、fallback・追加接続、filesystem、network、credentialを再確認します。その後、Ticketを原子的に消費し、同じ制約下で正規化済みの非shell実行planだけを起動します。不一致または検証不能ではTicketを失効させ、新しい`jev_check_test`を要求します。Ticketは起動前に消費し、起動／テスト失敗でも復元せず、同時消費で起動できるのは1件だけです。コード審査は実際のruntime resourceやfallbackアクセスの不存在を証明しません。Ticketをraw commandのshell実行許可や、呼び出し側が申告したfingerprint／resource状態を信頼する根拠として扱ってはいけません。
-
-Ticket対応SDKを使用しない既存Profile v2 runnerは非対応です。runnerを更新・審査し、変更後のfingerprintに対する新しいEnvironment Approvalを取得し、両方が揃うまで自動実行を停止してください。更新前のTicketを旧runnerで再利用してはいけません。
+allow結果にExecution Ticketが含まれる場合は、承認済み安全runnerだけを使用します。runnerは実行直前に環境・コード・実行指定のfingerprint、実DB接続、設定キャッシュ、fallback・追加接続、filesystem、network、credentialを再確認してTicketを消費しなければなりません。コード審査は実際のruntime resourceやfallbackアクセスの不存在を証明しません。Ticketをraw commandのshell実行許可として扱ってはいけません。
 
 ### Project Policy
 

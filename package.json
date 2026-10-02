@@ -3,16 +3,6 @@
   "version": "1.1.0",
   "description": "A read-only MCP safety gate for evaluating potentially destructive commands.",
   "main": "dist/index.js",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./runner": {
-      "types": "./dist/runner/index.d.ts",
-      "import": "./dist/runner/index.js"
-    }
-  },
   "bin": {
     "jev-mcp-server": "dist/index.js"
   },

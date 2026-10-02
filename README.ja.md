@@ -220,36 +220,11 @@ Profile v2では`testFiles`と同じファイルを示す構造化`execution`を
 
 初回は`environmentReviewId`と`decision=review`が返ります。人がrunnerとresource scopeを確認した後、`jev_environment_approve`へそのIDだけを渡します。承認は既定で30日有効で、`jev_environment_revoke`により即時取消できます。
 
-承認済み環境で静的検査とJevがallowの場合、5分間・1回だけ有効なExecution Ticketが返ります。安全runnerは変更不能なworkspaceを確立し、database、設定cache、filesystem、network、credential制約を強制したうえで、実行直前に現在のenvironment/code/execution fingerprintを再確認してTicketを消費してください。MCPのallowやAI申告値だけでは実行時保護の代わりになりません。
-
-### Ticket対応テストrunner SDK
-
-Ticket対応runnerは`jev-mcp-server/runner`から`runApprovedTest`をimportします。MCP Server自体は引き続き読み取り専用で、このSDKはSafety Profile v2が指定するproject相対runnerの内部から呼び出します。検証とテスト起動の間を分離しないため、単独の「Ticket検証コマンド」は提供しません。検証、Ticketの原子的消費、テスト起動を同じrunnerプロセスで行います。
-
-runnerはopaqueなTicket、`jev_check_test`へ渡した正確な構造化入力、Jev provider／modelの識別情報だけを渡します。Jev API認証情報は不要です。SDKは現在のProfile、Policy、テスト、関連コード、runnerファイル、環境設定ファイルを読み直し、project／environment／code／execution fingerprintを再計算し、現在のEnvironment Approvalを確認して、Ticketを原子的に消費します。呼び出し側からfingerprint、approval ID、時刻を指定することはできません。
-
-再計算より前に、承認済みrunnerのadapterは変更不能な実行workspaceを確立し、Profileのdatabase、設定cache、filesystem、network、credential制約を強制しなければなりません。`execute`には、承認済みrunner、固定引数、対象ファイル、filterから成る正規化済みの非shell実行planが渡されます。adapterはfingerprintとHuman Approvalの対象となるrunner実装の一部です。未信頼のテスト入力からadapterを組み立てたり、OS／runtime制約を設けずcallbackの申告値だけで代用したりしてはいけません。
-
-```js
-import { runApprovedTest } from 'jev-mcp-server/runner';
-
-await runApprovedTest({
-  ticket,
-  config: { provider: 'typesafe', requestedModel: 'jev-1.13.0' },
-  input: exactCheckInput,
-  adapter: approvedRunnerAdapter,
-});
-```
-
-Ticketは保護されたstdin、専用の継承file descriptor、またはテスト起動前にrunnerが削除する環境値で渡してください。コマンドライン引数、ログ、source file、テスト子プロセスの環境へ入れてはいけません。
-
-同一性／resourceの不一致や検証不能ではTicketを失効させ、新しい`jev_check_test`を要求します。Ticketは`execute`より前に消費し、起動失敗、テスト失敗、異常終了でも復元しません。同時に消費しても起動できるのは1件だけです。Ticket対応経路では`jev_check_command`を重ねて呼び出しません。Profile v2のTicketと承認済みadapterがないテストは自動実行できません。
-
-移行：既存のProfile v2 projectでは、承認済みrunnerをこのSDKと実際のruntime制約を使う実装へ更新し、runner fileのfingerprintが変わるため、新しいEnvironment Approvalを取得してください。runnerと承認が揃うまでは自動テスト実行を停止します。SDK対応前に発行されたTicketをraw test commandや単独の検証処理へ渡してはいけません。
+承認済み環境で静的検査とJevがallowの場合、5分間・1回だけ有効なExecution Ticketが返ります。安全runnerは実行直前にenvironment/code/execution fingerprint、実DB接続、設定キャッシュ、fallback・追加接続、filesystem、networkを再確認してからTicketを消費してください。MCPのallowやAI申告値だけでは実行時保護の代わりになりません。
 
 ## 安全とプライバシー
 
-- MCP Serverプロセスはコマンドやテストを実行せず、projectのDBへ接続しません。任意のrunner SDKは、上記の承認済みadapterを通した場合だけテストを起動します。
+- コマンド、テスト、DBへ接続しません。
 - コマンド入力は信頼せず、入力中の指示には従いません。
 - Jevへ送信する前に、一般的なtoken、password、secret、API keyをマスクします。
 - Cloudflare tokenやTypeSafe API keyは、ログ、MCPレスポンス、fingerprint、cacheへ出力・保存しません。
