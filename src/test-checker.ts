@@ -10,7 +10,7 @@ import { openDatabase } from './storage/sqlite.js';
 import { insertAudit } from './storage/audit-log.js';
 import { lookupAllow, upsertCache, type CacheKey } from './storage/fingerprint-cache.js';
 import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
-import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, readTestFile, resolveTestRoot, sha256, testInputIdentity, type TestFileIdentity, type TestFileResolution } from './safety-fingerprint.js';
+import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, fileDigest, projectId, relativeTarget, readTestFile, resolveTestRoot, sha256, testInputIdentity, type TestFileIdentity, type TestFileResolution } from './safety-fingerprint.js';
 import { logEvent } from './logger.js';
 import { createOrGetEnvironmentReview, lookupEnvironmentApproval, type EnvironmentApprovalKey } from './storage/environment-approval.js';
 import { issueExecutionTicket } from './storage/execution-ticket.js';
@@ -122,9 +122,9 @@ function safeInput(input: TestCheckInput): TestCheckInput {
   return { command: redact(input.command), ...(input.testCode === undefined ? {} : { testCode: redact(input.testCode) }), ...(input.diff === undefined ? {} : { diff: redact(input.diff) }), ...(input.cwd === undefined ? {} : { cwd: redact(input.cwd) }), ...(input.environment === undefined ? {} : { environment: input.environment }), ...(input.framework === undefined ? {} : { framework: input.framework }), ...(input.context === undefined ? {} : { context: redact(input.context) }), ...(input.isolation === undefined ? {} : { isolation: input.isolation }), ...(input.runtime === undefined ? {} : { runtime: input.runtime }), ...(input.runtimeDatabase === undefined ? {} : { runtimeDatabase: input.runtimeDatabase }), ...(input.configCache === undefined ? {} : { configCache: input.configCache }), ...(input.runtimeGuard === undefined ? {} : { runtimeGuard: input.runtimeGuard }), ...(input.persistentDatabaseAccess === undefined ? {} : { persistentDatabaseAccess: input.persistentDatabaseAccess }), ...(input.safetyProfilePath === undefined ? {} : { safetyProfilePath: redact(input.safetyProfilePath) }), ...(input.execution === undefined ? {} : { execution: input.execution }) };
 }
 
-function sharedSafetyFiles(root: string): Array<{ key: string; digest: string; bytes: number }> {
+function sharedSafetyFiles(root: string, includeProfile = true): Array<{ key: string; digest: string; bytes: number }> {
   const candidates = ['tests/TestCase.php', 'test-safe.php', 'phpunit.xml', 'phpunit.xml.dist', 'package.json', 'pyproject.toml', 'pytest.ini', 'vitest.config.ts', 'vitest.config.js', '.jev/test-safety.json'];
-  return candidates.map((file) => fileDigest(root, file)).filter((item): item is { key: string; digest: string; bytes: number } => item !== undefined);
+  return candidates.filter(file => includeProfile || file !== '.jev/test-safety.json').map((file) => fileDigest(root, file)).filter((item): item is { key: string; digest: string; bytes: number } => item !== undefined);
 }
 
 async function evaluateTestSingle(config: Config, input: TestCheckInput, targetKey = 'test', createTicket = true, fileIdentity?: TestFileIdentity, preparedSafety?: SafetyProfileResult): Promise<TestCheckResult> {
@@ -134,7 +134,7 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const validationError = validateInput(input);
   const safety = preparedSafety ?? assessSafetyProfile(input);
   let policies;
-  try { policies = loadEffectiveTestPolicies(input.cwd, input.framework); } catch { return reviewResult('The test safety policy could not be loaded. Human review is required.', [], 'POLICY_ERROR'); }
+  try { policies = loadEffectiveTestPolicies(safety.policyRoot ?? input.cwd, input.framework); } catch { return reviewResult('The test safety policy could not be loaded. Human review is required.', [], 'POLICY_ERROR'); }
   const policyMatches = findPolicyMatches(policies, inputText(input));
   const custom = customFindings(input, inputText(input), safety.executionApproved);
   let staticFindings = [...policyMatches.findings, ...custom];
@@ -155,7 +155,7 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
   const executionSelection: ExecutionSelectionResult = safety.profileV2 === undefined
     ? { valid: true, runnerMatched: true, selectorsAllowed: true }
     : validateExecutionSelection(root, safety.profileV2, input.execution, input.testFiles, input.command, input.framework, input.environment);
-  const sharedFiles = sharedSafetyFiles(root);
+  const sharedFiles = sharedSafetyFiles(root, !safety.dbRegistered);
   const dependencyFingerprint = safety.assessment.dependencyFingerprint ?? sha256(canonicalJson(sharedFiles));
   const contextHash = sha256(canonicalJson({ shared: { safety: safety.jevContext, policyVersion: policies.version, policyHash: policies.hash, files: sharedFiles, dependencyFingerprint }, runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard }));
   const runtimeHash = sha256(canonicalJson({ runtime: input.runtime, isolation: input.isolation, database: input.runtimeDatabase, configCache: input.configCache, guard: input.runtimeGuard, persistentDatabaseAccess: input.persistentDatabaseAccess }));
@@ -310,12 +310,21 @@ async function evaluateTestSingle(config: Config, input: TestCheckInput, targetK
 }
 
 export async function evaluateTest(config: Config, input: TestCheckInput): Promise<TestCheckResult> {
-  let priorExecution = false;
+  let registeredProject = false, legacyExecutionHistory = false;
   try {
     const root = realpathSync(resolve(input.cwd ?? process.cwd()));
-    priorExecution = openDatabase().prepare('SELECT 1 FROM test_execution_approvals WHERE project_id=? LIMIT 1').get(projectId(root)) !== undefined;
-  } catch { /* A configured Profile v3 still fails closed if its store is unavailable. */ }
-  if (usesExecutionProfile(input) || input.executionApprovalId !== undefined || priorExecution || /(?:^|[ /])composer(?:\s|$)/u.test(input.command)) return evaluateTestExecution(config, input);
+    const db = openDatabase();
+    registeredProject = db.prepare('SELECT 1 FROM test_execution_conditions WHERE project_id=? LIMIT 1').get(projectId(root)) !== undefined;
+    legacyExecutionHistory = input.safetyProfilePath !== undefined && db.prepare("SELECT 1 FROM test_execution_approvals WHERE project_id=? AND source_kind='profile' AND profile_path=? LIMIT 1").get(projectId(root), relativeTarget(root,resolve(input.safetyProfilePath)) ?? '') !== undefined;
+  } catch (error) {
+    // A registration store failure cannot silently choose the legacy evidence-only evaluator.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return { ...reviewResult('Execution registration storage could not be read. Correct the database and recheck.', [], 'EXECUTION_STORE_ERROR'), needsHumanReview:false };
+  }
+  // Normal Laravel/Composer/container execution never probes an implicit Profile file.
+  const explicitLegacy = input.safetyProfilePath !== undefined || input.execution !== undefined || input.environmentApprovalId !== undefined;
+  if (input.executionConditions || input.executionConditionsId || (!explicitLegacy && registeredProject) || (!explicitLegacy && (input.executionApprovalId || input.framework === 'laravel'
+    || /(?:^|[ /])(?:composer|podman|docker)(?:\s|$)/u.test(input.command)))) return evaluateTestExecution(config,input);
+  if (input.safetyProfilePath && (legacyExecutionHistory || usesExecutionProfile(input))) return evaluateTestExecution(config,input);
   // Legacy inputs retain their workflows, but command Policy prohibitions apply inside the test gate too.
   try {
     const command = buildCommandStaticFindings(input, true);

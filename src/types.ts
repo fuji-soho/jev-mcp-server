@@ -1,3 +1,4 @@
+import type { ExecutionConditionsInput } from './execution-schema.js';
 export type Decision = 'allow' | 'review' | 'deny';
 
 export type HumanReviewStatus = 'pending' | 'approved' | 'rejected' | 'expired';
@@ -93,7 +94,7 @@ export interface TestCheckInput {
   runtimeGuard?: RuntimeGuardEvidence;
   /** @deprecated Use runtime.persistentStorageAccess. */
   persistentDatabaseAccess?: boolean;
-  /** Automatically loads .jev/test-safety.json below cwd when present. */
+  /** Explicit legacy Safety Profile path; normal DB registration never reads an implicit Profile. */
   safetyProfilePath?: string;
   /** Optional test files inside the MCP-visible cwd. Files are preflighted, then evaluated and cached independently. */
   testFiles?: string[];
@@ -101,8 +102,10 @@ export interface TestCheckInput {
   execution?: TestExecutionSelection;
   /** Optional exact environment approval to require. */
   environmentApprovalId?: string;
-  /** Optional exact Profile v3 execution approval to require. */
+  /** Optional exact active DB/legacy execution approval to require. */
   executionApprovalId?: string;
+  executionConditions?: ExecutionConditionsInput;
+  executionConditionsId?: string;
 }
 
 export interface TestExecutionSelection {
@@ -194,8 +197,12 @@ export interface TestCheckResult {
   codeAssessment?: CodeAssessment;
   executionAssessment?: ExecutionAssessment;
   executionReviewId?: string;
+  executionConditionsId?: string;
+  evidenceErrors?: Array<{ file: string; code: string; message: string }>;
+  missingFields?: Array<{ field: string; reason: string; example?: unknown }>;
+  conditionCandidates?: Array<{ executionConditionsId: string; target: unknown; entry: unknown }>;
   executionApproval?: { status: 'pending' | 'approved'; approvalId: string; fingerprint: string; scope: Record<string, unknown> };
-  reviewReasons?: Array<{ kind: 'execution-approval' | 'code-risk' | 'command-risk' | 'evidence-incomplete' | 'evaluation-error'; approvable: boolean; message: string; reviewId?: string }>;
+  reviewReasons?: Array<{ kind: 'execution-approval' | 'registration-incomplete' | 'conditions-ambiguous' | 'unsupported-form' | 'conditions-mismatch' | 'code-risk' | 'command-risk' | 'evidence-incomplete' | 'evaluation-error'; approvable: boolean; message: string; reviewId?: string }>;
 }
 
 export interface EnvironmentAssessment {
@@ -218,6 +225,8 @@ export interface ExecutionAssessment {
   runnerMatched: boolean;
   selectorsAllowed: boolean;
   executionFingerprint?: string;
+  sourceVerification?: 'local-runtime-inspected' | 'human-approved-container';
+  containerInternalsVerified?: boolean;
   ticket?: string;
   ticketExpiresAt?: string;
   reason?: string;

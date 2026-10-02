@@ -38,7 +38,7 @@ function fixture() {
     runtime: { php: join(cwd,'runtime/php'), composer: join(cwd,'runtime/composer'), composerHome: resolveComposerHome(), configFiles: [] },
     resources: { database: { policy: 'sqlite-memory', rejectFallback: true, rejectAdditionalConnections: true }, filesystem: { writableRoots: [] }, network: { policy: 'deny' }, credentials: { policy: 'deny' } } };
   const save = () => put('.jev/test-safety.json', JSON.stringify(profile)); save();
-  const input = { command: `${profile.runtime.composer} test`, cwd, framework: 'laravel', environment: 'testing' };
+  const input = { command: `${profile.runtime.composer} test`, safetyProfilePath:join(cwd,'.jev/test-safety.json'), cwd, framework: 'laravel', environment: 'testing' };
   return { cwd, put, profile, save, input };
 }
 function mock(commandScore = 0.1, codeScore = 0.1, model = config.requestedModel) {

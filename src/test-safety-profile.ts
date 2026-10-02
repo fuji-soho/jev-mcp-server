@@ -57,6 +57,8 @@ export interface SafetyProfileResult {
   relatedCode?: RelatedCodeSnapshot;
   /** Internal, server-verified Profile v3 approval evidence. Never supplied by callers. */
   executionApproved?: boolean;
+  dbRegistered?: boolean;
+  policyRoot?: string;
 }
 
 export interface ExecutionSelectionResult {

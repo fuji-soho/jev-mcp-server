@@ -1,19 +1,19 @@
 import { randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { canonicalJson, projectId } from '../safety-fingerprint.js';
+import { canonicalJson, projectId, sha256 } from '../safety-fingerprint.js';
 import { snapshotExecution, EXECUTION_VERIFIER_VERSION, type ExecutionSnapshot } from '../execution-profile.js';
 import { findPolicyMatches, loadEffectivePolicies, loadEffectiveTestPolicies } from '../policy.js';
 import { insertAudit } from './audit-log.js';
 import type { TestCheckInput } from '../types.js';
 
 export interface TestExecutionApproval {
-  approvalId: string; projectId: string; profilePath: string; fingerprint: string; policyHash: string;
+  approvalId: string; conditionId?: string; sourceKind: 'profile'|'db'; projectId: string; profilePath: string; fingerprint: string; policyHash: string;
   status: 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired' | 'superseded';
   scope: Record<string, unknown>; request: TestCheckInput; createdAt: string; expiresAt?: string;
 }
 function map(row: Record<string, unknown>): TestExecutionApproval {
-  return { approvalId: String(row.approval_id), projectId: String(row.project_id), profilePath: String(row.profile_path),
-    fingerprint: String(row.fingerprint), policyHash: String(row.policy_hash), status: String(row.status) as TestExecutionApproval['status'],
+  return { approvalId: String(row.approval_id), projectId: String(row.project_id), profilePath: row.profile_path == null ? `conditions:${String(row.condition_id)}` : String(row.profile_path),
+    fingerprint: String(row.fingerprint), sourceKind: String(row.source_kind) as 'profile'|'db', ...(row.condition_id == null ? {} : {conditionId:String(row.condition_id)}), policyHash: String(row.policy_hash), status: String(row.status) as TestExecutionApproval['status'],
     scope: JSON.parse(String(row.scope_json)) as Record<string, unknown>, request: JSON.parse(String(row.request_json)) as TestCheckInput,
     createdAt: String(row.created_at), ...(row.expires_at == null ? {} : { expiresAt: String(row.expires_at) }) };
 }
@@ -23,12 +23,25 @@ export function getTestExecutionApproval(db: DatabaseSync, id: string): TestExec
 }
 
 export function executionApprovalFor(db: DatabaseSync, snapshot: ExecutionSnapshot, now: string, requiredId?: string): TestExecutionApproval {
-  const pid = projectId(snapshot.root);
+  const pid = projectId(snapshot.projectRoot);
   let committed = false;
   db.exec('BEGIN IMMEDIATE');
   try {
     db.prepare("UPDATE test_execution_approvals SET status='expired' WHERE status='pending' AND expires_at<=?").run(now);
-    const active = db.prepare("SELECT * FROM test_execution_approvals WHERE project_id=? AND profile_path=? AND status IN ('pending','approved')").get(pid, snapshot.profilePath);
+    let conditionId = snapshot.conditionId;
+    if (snapshot.conditions) {
+      const descriptor = canonicalJson(snapshot.conditions), hash = sha256(descriptor);
+      const existing = db.prepare('SELECT * FROM test_execution_conditions WHERE project_id=? AND descriptor_hash=?').get(pid,hash);
+      if (existing) conditionId = String(existing.condition_id);
+      else {
+        conditionId = `cond_${randomBytes(24).toString('base64url')}`;
+        db.prepare('INSERT INTO test_execution_conditions(condition_id,project_id,host_root,descriptor_hash,conditions_json,created_at) VALUES(?,?,?,?,?,?)')
+          .run(conditionId,pid,snapshot.projectRoot,hash,descriptor,now);
+      }
+    }
+    const active = conditionId
+      ? db.prepare("SELECT * FROM test_execution_approvals WHERE condition_id=? AND status IN ('pending','approved')").get(conditionId)
+      : db.prepare("SELECT * FROM test_execution_approvals WHERE project_id=? AND profile_path=? AND source_kind='profile' AND status IN ('pending','approved')").get(pid, snapshot.profilePath);
     const current = active ? map(active) : undefined;
     if (requiredId && (current?.approvalId !== requiredId || current.status !== 'approved' || current.fingerprint !== snapshot.fingerprint)) {
       if (current && current.fingerprint !== snapshot.fingerprint) db.prepare("UPDATE test_execution_approvals SET status='superseded' WHERE approval_id=?").run(current.approvalId);
@@ -37,12 +50,21 @@ export function executionApprovalFor(db: DatabaseSync, snapshot: ExecutionSnapsh
     }
     if (current?.fingerprint === snapshot.fingerprint) { db.exec('COMMIT'); return current; }
     if (current) db.prepare("UPDATE test_execution_approvals SET status='superseded' WHERE approval_id=?").run(current.approvalId);
+    const priorRecord = conditionId
+      ? db.prepare('SELECT 1 FROM test_execution_approvals WHERE condition_id=? LIMIT 1').get(conditionId)
+      : db.prepare("SELECT 1 FROM test_execution_approvals WHERE project_id=? AND profile_path=? AND source_kind='profile' LIMIT 1").get(pid,snapshot.profilePath);
+    const priorProject = snapshot.conditions && db.prepare("SELECT 1 FROM test_execution_approvals WHERE project_id=? AND source_kind='db' LIMIT 1").get(pid);
+    const reviewTrigger = current || (!priorRecord && priorProject) ? 'conditions-changed' : priorRecord ? 'approval-inactive' : 'initial';
+    const scope = {...snapshot.scope, reviewTrigger};
     const id = `exec_${randomBytes(24).toString('base64url')}`;
     const expiresAt = new Date(Date.parse(now) + 60 * 60 * 1000).toISOString();
     // Only the safe entry invocation is persisted, never selectors, filters or caller context.
-    const request = { command: snapshot.baseCommand, cwd: snapshot.root, safetyProfilePath: `${snapshot.root}/${snapshot.profilePath}`, framework: snapshot.profile.framework, environment: snapshot.profile.environment };
-    db.prepare('INSERT INTO test_execution_approvals(approval_id,project_id,profile_path,fingerprint,policy_hash,verifier_version,scope_json,request_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-      .run(id, pid, snapshot.profilePath, snapshot.fingerprint, snapshot.policyHash, EXECUTION_VERIFIER_VERSION, canonicalJson(snapshot.scope), canonicalJson(request), 'pending', now, expiresAt);
+    const request: TestCheckInput = { command: snapshot.baseCommand, cwd: snapshot.projectRoot,
+      ...(snapshot.conditions ? {executionConditions:snapshot.conditions} : {safetyProfilePath:`${snapshot.root}/${snapshot.profilePath}`}),
+      framework: snapshot.profile.framework, environment: snapshot.profile.environment };
+    db.prepare('INSERT INTO test_execution_approvals(approval_id,project_id,profile_path,condition_id,source_kind,fingerprint,policy_hash,verifier_version,scope_json,request_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(id, pid, snapshot.conditions ? null : snapshot.profilePath, conditionId ?? null, snapshot.conditions ? 'db' : 'profile', snapshot.fingerprint, snapshot.policyHash,
+        snapshot.conditions ? 'jev-db-execution-v1' : EXECUTION_VERIFIER_VERSION, canonicalJson(scope), canonicalJson(request), 'pending', now, expiresAt);
     db.exec('COMMIT');
     return getTestExecutionApproval(db, id)!;
   } catch (error) { if (!committed) db.exec('ROLLBACK'); throw error; }
@@ -58,12 +80,12 @@ export function transitionTestExecutionApproval(db: DatabaseSync, id: string, ac
       throw new Error('Execution review expired. Recheck to obtain a new review.');
     }
     const current = snapshotExecution(record.request, true);
-    if (current.fingerprint !== record.fingerprint || projectId(current.root) !== record.projectId) {
+    if (current.fingerprint !== record.fingerprint || projectId(current.projectRoot) !== record.projectId) {
       db.prepare("UPDATE test_execution_approvals SET status='superseded' WHERE approval_id=? AND status='pending'").run(id);
       throw new Error('Execution evidence changed after review creation. Recheck before approving.');
     }
     const texts = [record.request.command, ...current.evidence.map(f => f.content), ...current.related.map(f => f.content)];
-    for (const policies of [loadEffectivePolicies(current.root), loadEffectiveTestPolicies(current.root, current.profile.framework)]) {
+    for (const policies of [loadEffectivePolicies(current.projectRoot), loadEffectiveTestPolicies(current.projectRoot, current.profile.framework)]) {
       if (texts.some(text => findPolicyMatches(policies, text).findings.some(f => f.decision === 'deny'))) throw new Error('Current policy denies the execution evidence.');
     }
   }

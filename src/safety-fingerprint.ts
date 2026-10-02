@@ -126,7 +126,7 @@ export const RELATED_CODE_LIMITS = { files: 64, fileBytes: 32 * 1024, totalBytes
 export interface RelatedCodeFile extends FileManifestEntry { content: string; }
 export type RelatedCodeSnapshot =
   | { status: 'complete'; fingerprint: string; files: RelatedCodeFile[] }
-  | { status: 'incomplete'; reason: string; files: RelatedCodeFile[] };
+  | { status: 'incomplete'; reason: string; file?: string; files: RelatedCodeFile[] };
 
 /** Read once: the original bytes identify the exact text inspected locally and sent (redacted) to Jev. */
 export function readRelatedCode(root: string, configuredPaths: string[]): RelatedCodeSnapshot {
@@ -134,11 +134,13 @@ export function readRelatedCode(root: string, configuredPaths: string[]): Relate
   let totalBytes = 0;
   let entries = 0;
   const visited = new Set<string>();
+  let currentFile: string | undefined;
   try {
     const resolvedRoot = realpathSync(resolve(root));
     const visit = (path: string): void => {
       const key = relativeTarget(resolvedRoot, path);
       if (!key || isAbsolute(path)) throw new Error('Related code path must be relative and inside the project root.');
+      currentFile = key;
       if (visited.has(key)) return;
       visited.add(key);
       if (++entries > RELATED_CODE_LIMITS.entries) throw new Error('Related code exceeds the 4096-entry traversal limit.');
@@ -192,7 +194,7 @@ export function readRelatedCode(root: string, configuredPaths: string[]): Relate
   } catch (error) {
     // Never return OS errors containing absolute paths or file contents.
     const reason = error instanceof Error && error.message.startsWith('Related code') ? error.message : 'Related code could not be read completely.';
-    return { status: 'incomplete', files, reason };
+    return { status: 'incomplete', files, reason, ...(currentFile ? {file:currentFile} : {}) };
   }
 }
 

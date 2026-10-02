@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_DB_PATH = join(PROJECT_ROOT, 'cache', 'jev.sqlite');
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 let shared: DatabaseSync | undefined;
 let sharedPath: string | undefined;
@@ -188,6 +188,38 @@ function migrate(db: DatabaseSync): void {
       UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';
     `);
   }
+  if (version <= 7) {
+    db.exec(`
+      CREATE TABLE test_execution_conditions (
+        condition_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, host_root TEXT NOT NULL,
+        descriptor_hash TEXT NOT NULL, conditions_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(project_id, descriptor_hash)
+      );
+      DROP INDEX idx_test_execution_active;
+      ALTER TABLE test_execution_approvals RENAME TO test_execution_approvals_v7;
+      CREATE TABLE test_execution_approvals (
+        approval_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, profile_path TEXT,
+        condition_id TEXT REFERENCES test_execution_conditions(condition_id),
+        source_kind TEXT NOT NULL CHECK(source_kind IN ('profile','db')),
+        fingerprint TEXT NOT NULL, policy_hash TEXT NOT NULL, verifier_version TEXT NOT NULL,
+        scope_json TEXT NOT NULL, request_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','revoked','expired','superseded')),
+        created_at TEXT NOT NULL, approved_at TEXT, rejected_at TEXT, revoked_at TEXT, expires_at TEXT,
+        CHECK((source_kind='profile' AND profile_path IS NOT NULL AND condition_id IS NULL)
+          OR (source_kind='db' AND profile_path IS NULL AND condition_id IS NOT NULL))
+      );
+      INSERT INTO test_execution_approvals
+        SELECT approval_id,project_id,profile_path,NULL,'profile',fingerprint,policy_hash,verifier_version,
+          scope_json,request_json,status,created_at,approved_at,rejected_at,revoked_at,expires_at FROM test_execution_approvals_v7;
+      DROP TABLE test_execution_approvals_v7;
+      CREATE UNIQUE INDEX idx_test_execution_active ON test_execution_approvals(project_id,profile_path)
+        WHERE source_kind='profile' AND status IN ('pending','approved');
+      CREATE UNIQUE INDEX idx_test_execution_condition_active ON test_execution_approvals(condition_id)
+        WHERE source_kind='db' AND status IN ('pending','approved');
+      UPDATE schema_meta SET value='8' WHERE key='schema_version';
+    `);
+  }
+
 }
 
 export function openDatabase(path = process.env.JEV_CACHE_DB_PATH?.trim() || DEFAULT_DB_PATH): DatabaseSync {

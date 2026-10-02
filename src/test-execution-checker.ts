@@ -2,6 +2,7 @@ import type { Config } from './config.js';
 import { evaluationIdentity, isVersionedModel } from './config.js';
 import { checkCommandWithJev, JevError } from './cloudflare-jev.js';
 import { buildCommandStaticFindings } from './command-checker.js';
+import { ExecutionRegistrationError } from './execution-conditions.js';
 import { ExecutionEvidenceError, snapshotExecution } from './execution-profile.js';
 import { customFindings, evaluateTestCode, redactTestText } from './test-checker.js';
 import { canonicalJson, projectId, readRelatedCode, sha256 } from './safety-fingerprint.js';
@@ -12,13 +13,14 @@ import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview
 import { insertAudit } from './storage/audit-log.js';
 import type { StaticFinding, TestCheckInput, TestCheckResult, PolicyFinding } from './types.js';
 
-function blocked(reason: string, errorCode: string, kind: 'evidence-incomplete' | 'evaluation-error' = 'evidence-incomplete'): TestCheckResult {
+function blocked(reason: string, errorCode: string, kind: NonNullable<TestCheckResult['reviewReasons']>[number]['kind'] = 'evidence-incomplete'): TestCheckResult {
   return { ok: false, dangerous: null, allowed: false, needsHumanReview: false, decision: 'review', reason, errorCode,
     categories: [], riskScore: null, staticFindings: [], policyVersion: 'unavailable', model: 'typesafe/jev',
     reviewReasons: [{ kind, approvable: false, message: reason }] };
 }
 
 export async function evaluateTestExecution(config: Config, input: TestCheckInput): Promise<TestCheckResult> {
+  input = {...input, framework:input.framework ?? 'laravel', environment:input.environment ?? 'testing'};
   let commandStatic;
   try { commandStatic = buildCommandStaticFindings(input, true); }
   catch { return blocked('Safety policy could not be loaded. Correct the policy and recheck.', 'POLICY_ERROR', 'evaluation-error'); }
@@ -37,7 +39,7 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       const source = read.files[0]!;
       return { ok: true as const, target: source.key, content: source.content, digest: source.digest, bytes: source.bytes };
     });
-    const commandPolicies = loadEffectivePolicies(snapshot.root), testPolicies = loadEffectiveTestPolicies(snapshot.root, input.framework);
+    const commandPolicies = loadEffectivePolicies(snapshot.projectRoot), testPolicies = loadEffectiveTestPolicies(snapshot.projectRoot, input.framework);
     // Selection has been parsed as bounded literal file/filter values. A regex '*' inside
     // a quoted PHPUnit filter is not a filesystem wildcard or a new execution option.
     const findings = commandStatic.findings.filter(f => f.ruleId !== 'scope.broad-option');
@@ -64,18 +66,18 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       if (error instanceof Error && error.message === 'EXECUTION_APPROVAL_MISMATCH') return blocked('The requested execution approval does not match the active project and execution conditions.', 'EXECUTION_APPROVAL_MISMATCH');
       throw error;
     }
-    const approvalDetails = { status: approval.status as 'pending' | 'approved', approvalId: approval.approvalId, fingerprint: snapshot.fingerprint, scope: snapshot.scope };
-    const common = { executionApproval: approvalDetails, executionAssessment: { runnerMatched: true, selectorsAllowed: true, executionFingerprint: snapshot.executionFingerprint },
+    const approvalDetails = { status: approval.status as 'pending' | 'approved', approvalId: approval.approvalId, fingerprint: snapshot.fingerprint, scope: {...snapshot.scope, reviewTrigger:approval.scope.reviewTrigger} };
+    const common = { ...(approval.conditionId ? { executionConditionsId:approval.conditionId } : {}), executionApproval: approvalDetails, executionAssessment: { runnerMatched: true, selectorsAllowed: true, executionFingerprint: snapshot.executionFingerprint, sourceVerification: snapshot.conditions?.target.mode && snapshot.conditions.target.mode !== 'local' ? 'human-approved-container' as const : 'local-runtime-inspected' as const, containerInternalsVerified:false },
       policyVersion: `${commandPolicies.version};${testPolicies.version}`, policyFindings, jevProvider: config.provider, requestedModel: config.requestedModel };
     const audit = (result: TestCheckResult, actualModel?: string): void => {
-      insertAudit(db, { toolName: 'jev_check_test', targetType: 'test-execution', targetKey: snapshot.profilePath, projectId: projectId(snapshot.root),
+      insertAudit(db, { toolName: 'jev_check_test', targetType: 'test-execution', targetKey: snapshot.profilePath, projectId: projectId(snapshot.projectRoot),
         fingerprint: snapshot.executionFingerprint, policyHash: snapshot.policyHash, cacheStatus: 'disabled', finalDecision: result.decision,
         allowed: result.allowed, needsHumanReview: result.needsHumanReview, modelVersion: evaluationIdentity(config), actualModel,
         jevProvider: config.provider, requestedModel: config.requestedModel, evaluatorVersion: 'jev-test-execution-v1',
         reason: result.reason, summary: canonicalJson({ executionApprovalId: approval.approvalId, status: approval.status }) });
     };
     if (approval.status !== 'approved') {
-      const reason = 'Human confirmation is required for the current command, complete safe runner, guards and resource scope. Approval does not approve test code.';
+      const reason = `${approval.scope.reviewTrigger === 'conditions-changed' ? 'Execution conditions or safety evidence changed. ' : approval.scope.reviewTrigger === 'approval-inactive' ? 'The previous approval is inactive. ' : 'Initial execution registration. '}Human confirmation is required for the current command, complete safe runner, guards and resource scope. Approval does not approve test code.`;
       const result: TestCheckResult = { ...blocked(reason, 'EXECUTION_APPROVAL_REQUIRED'), ...common, ok: true, needsHumanReview: true,
         executionReviewId: approval.approvalId, staticFindings: findings.map(f => f.message),
         reviewReasons: [{ kind: 'execution-approval', approvable: true, message: reason, reviewId: approval.approvalId }] };
@@ -99,12 +101,13 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
     }
     const related = [...new Map([...snapshot.evidence, ...snapshot.related].map(f => [f.key, f])).values()].sort((a, b) => a.key.localeCompare(b.key));
     const dependencyFingerprint = sha256(canonicalJson(related.map(({ key, digest, bytes }) => ({ key, digest, bytes }))));
-    const codeResult = await evaluateTestCode(config, { ...input, cwd: snapshot.root, testFiles: snapshot.files }, {
-      assessment: { version: 3, status: 'verified', fingerprintMatched: true, runtimeMatched: true, profileDigest: snapshot.fingerprint,
+    let codeResult = await evaluateTestCode(config, { ...input, cwd: snapshot.root, testFiles: snapshot.files }, {
+      assessment: { version: 3, status: 'verified', fingerprintMatched: true, runtimeMatched: snapshot.conditions?.target.mode !== 'podman' && snapshot.conditions?.target.mode !== 'docker', profileDigest: snapshot.fingerprint,
         dependencyFingerprint, profileName: snapshot.profile.name, environmentFingerprint: snapshot.fingerprint },
       jevContext: { version: 3, executionConditions: snapshot.fingerprint, resources: snapshot.profile.resources, environmentApproved: true },
-      executionApproved: true, relatedCode: { status: 'complete', fingerprint: dependencyFingerprint, files: related },
+      executionApproved: true, policyRoot: snapshot.projectRoot, dbRegistered: snapshot.conditions !== undefined, relatedCode: { status: 'complete', fingerprint: dependencyFingerprint, files: related },
     }, tests);
+    if (snapshot.conditions) { const {safetyProfile: _legacyProfile, ...normalResult} = codeResult; codeResult = normalResult; }
     if (!codeResult.ok || codeResult.decision === 'deny') {
       const { reviewId: _reviewId, reviewIds: _reviewIds, ...withoutIds } = codeResult;
       const result: TestCheckResult = { ...withoutIds, ...common, allowed: false, needsHumanReview: false,
@@ -123,8 +126,8 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       const codeIdentity = sha256(canonicalJson(tests.flatMap(t => t.ok ? [{ file: t.target, digest: t.digest }] : [])));
       const fingerprint = sha256(canonicalJson({ execution: snapshot.executionFingerprint, dependencies: snapshot.dependencyFingerprint,
         codeIdentity, model: evaluationIdentity(config), context: input.context === undefined ? null : sha256(input.context), diff: input.diff === undefined ? null : sha256(input.diff), reviews: commandReviews }));
-      const key = bindHumanReviewModel({ projectId: projectId(snapshot.root), targetType: 'test-execution', targetKey: snapshot.profilePath, fingerprint,
-        commandHash: sha256(input.command), testFilesHash: codeIdentity, cwdHash: sha256(snapshot.root), policyHash: snapshot.policyHash,
+      const key = bindHumanReviewModel({ projectId: projectId(snapshot.projectRoot), targetType: 'test-execution', targetKey: snapshot.profilePath, fingerprint,
+        commandHash: sha256(input.command), testFilesHash: codeIdentity, cwdHash: sha256(snapshot.projectRoot), policyHash: snapshot.policyHash,
         contextHash: fingerprint, runtimeHash: snapshot.fingerprint }, response.model);
       if (!lookupApprovedHumanReview(db, key, now.toISOString())) commandReviewId = createOrGetHumanReview(db, key, now.toISOString(), new Date(now.getTime() + 3_600_000).toISOString()).reviewId;
     }
@@ -142,6 +145,10 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       reason: commandReviewId && decision !== 'deny' ? 'Command review remains unresolved; execution approval alone is insufficient.' : codeResult.reason };
     audit(result, response.model); return result;
   } catch (error) {
+    if (error instanceof ExecutionRegistrationError) {
+      const kind = error.code.includes('AMBIGUOUS') ? 'conditions-ambiguous' : error.code.includes('MISMATCH') ? 'conditions-mismatch' : error.code === 'UNSUPPORTED_EXECUTION_FORM' ? 'unsupported-form' : 'registration-incomplete';
+      return {...blocked(error.message,error.code,kind), ...(error.missingFields.length ? {missingFields:error.missingFields} : {}), ...(error.candidates.length ? {conditionCandidates:error.candidates} : {})};
+    }
     if (error instanceof ExecutionEvidenceError) {
       const findings = [...commandStatic.findings], policyFindings = [...commandStatic.policyFindings];
       try {
@@ -155,7 +162,7 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
         }
       } catch { /* An incomplete policy never grants permission. */ }
       if (findings.some(f => f.decision === 'deny')) return deny(findings, policyFindings);
-      return blocked(`${error.message}${error.file ? ` File: ${error.file}` : ''}`, error.code);
+      return {...blocked(`${error.message}${error.file ? ` File: ${error.file}` : ''}`, error.code, error.code === 'UNSUPPORTED_EXECUTION_FORM' ? 'unsupported-form' : 'evidence-incomplete'), ...(error.file ? {evidenceErrors:[{file:error.file,code:error.code,message:error.message}]} : {})};
     }
     return blocked('Execution evidence, policy or approval storage is unavailable. Correct the configuration and recheck.', 'EXECUTION_CHECK_ERROR', 'evaluation-error');
   }

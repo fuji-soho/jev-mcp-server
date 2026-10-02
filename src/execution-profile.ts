@@ -1,40 +1,19 @@
 import { lstatSync, readFileSync, realpathSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
-import { z } from 'zod';
 import { SaxesParser } from 'saxes';
 import { canonicalJson, digestPaths, projectId, readRelatedCode, relativeTarget, resolveTestRoot, sha256, type RelatedCodeFile } from './safety-fingerprint.js';
 import { loadEffectivePolicies, loadEffectiveTestPolicies } from './policy.js';
 import type { TestCheckInput } from './types.js';
 
 export const EXECUTION_VERIFIER_VERSION = 'jev-test-execution-v1';
-const pathSchema = z.string().min(1).max(4000).refine(p => /^[a-zA-Z0-9_./-]+$/u.test(p) && !isAbsolute(p) && p !== '.' && !p.split('/').includes('..'));
-const patternSchema = z.string().min(1).max(4000).refine(p => /^[a-zA-Z0-9_./*-]+$/u.test(p) && !isAbsolute(p) && p !== '.' && !p.split('/').includes('..'));
-const executableSchema = z.string().refine(p => isAbsolute(p) && /^[a-zA-Z0-9_./+-]+$/u.test(p));
-const paths = z.array(pathSchema).max(128);
-export const executionProfileSchema = z.object({
-  version: z.literal(3), name: z.string().regex(/^[a-zA-Z0-9_.-]{1,100}$/u),
-  framework: z.literal('laravel'), environment: z.literal('testing'),
-  entry: z.discriminatedUnion('adapter', [
-    z.object({ adapter: z.literal('composer-script'), script: z.string().regex(/^[a-zA-Z][a-zA-Z0-9_-]*$/u) }).strict(),
-    z.object({ adapter: z.literal('php-runner') }).strict(),
-  ]),
-  runner: z.object({ file: pathSchema, safetyFiles: paths, testEntry: pathSchema.default('vendor/bin/phpunit') }).strict(),
-  selectors: z.object({ filePatterns: z.array(patternSchema).min(1).max(128), allowFilter: z.boolean(), allowFullSuite: z.boolean() }).strict(),
-  environmentFiles: paths, codeReviewRoots: paths,
-  runtime: z.object({ php: executableSchema, composer: executableSchema.optional(),
-    composerHome: z.string().refine(isAbsolute).optional(), configFiles: z.array(z.string().refine(isAbsolute)).max(128) }).strict(),
-  resources: z.object({
-    database: z.object({ policy: z.literal('sqlite-memory'), rejectFallback: z.literal(true), rejectAdditionalConnections: z.literal(true) }).strict(),
-    filesystem: z.object({ writableRoots: paths }).strict(),
-    network: z.object({ policy: z.literal('deny') }).strict(), credentials: z.object({ policy: z.literal('deny') }).strict(),
-  }).strict(),
-}).strict();
-export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
+export { executionProfileSchema } from './execution-schema.js';
+import { executionProfileSchema, type ExecutionProfile, type ExecutionConditions } from './execution-schema.js';
+import { parseExecutionInvocation, resolveExecutionConditions, conditionsProfile, wrapExecutionCommand, mappedHostWorkdir } from './execution-conditions.js';
 
-export class ExecutionEvidenceError extends Error {
-  constructor(public readonly code: string, message: string, public readonly file?: string, public readonly evidence: RelatedCodeFile[] = []) { super(message); }
-}
+export { ExecutionEvidenceError } from './execution-error.js';
+import { ExecutionEvidenceError } from './execution-error.js';
+
 function stop(code: string, message: string, file?: string): never { throw new ExecutionEvidenceError(code, message, file); }
 
 /** This detector never follows a profile symlink or interprets a broken v3 profile as absent. */
@@ -51,7 +30,7 @@ export function usesExecutionProfile(input: TestCheckInput): boolean {
 
 function readProjectFiles(root: string, files: string[]): RelatedCodeFile[] {
   const snapshot = readRelatedCode(root, files);
-  if (snapshot.status !== 'complete') throw new ExecutionEvidenceError('EXECUTION_EVIDENCE_INCOMPLETE', snapshot.reason, undefined, snapshot.files);
+  if (snapshot.status !== 'complete') throw new ExecutionEvidenceError('EXECUTION_EVIDENCE_INCOMPLETE', snapshot.reason, snapshot.file, snapshot.files);
   return snapshot.files;
 }
 function jsonFile(root: string, file: string): Record<string, unknown> {
@@ -236,7 +215,8 @@ function suiteFiles(root: string, selectors: Array<{ path: string; suffix: strin
 }
 
 export interface ExecutionSnapshot {
-  root: string; profilePath: string; profile: ExecutionProfile; fingerprint: string; policyHash: string;
+  conditions?: ExecutionConditions; conditionId?: string;
+  root: string; projectRoot: string; profilePath: string; profile: ExecutionProfile; fingerprint: string; policyHash: string;
   scope: Record<string, unknown>; evidence: RelatedCodeFile[]; related: RelatedCodeFile[];
   dependencyFingerprint: string; files: string[]; executionFingerprint: string; baseCommand: string;
 }
@@ -244,23 +224,39 @@ export interface ExecutionSnapshot {
 export function snapshotExecution(input: TestCheckInput, approvalOnly = false): ExecutionSnapshot {
   const resolved = resolveTestRoot(input.cwd ?? process.cwd());
   if (!resolved.ok) stop(resolved.code, resolved.message);
-  const root = resolved.root;
-  const profilePath = input.safetyProfilePath ? relativeTarget(root, resolve(input.safetyProfilePath)) : '.jev/test-safety.json';
-  if (!profilePath) stop('INVALID_EXECUTION_PROFILE', 'The execution profile must be inside cwd.');
-  const rawProfile = readProjectFiles(root, [profilePath])[0]!;
-  let profile: ExecutionProfile;
-  try { profile = executionProfileSchema.parse(JSON.parse(rawProfile.content)); }
-  catch { return stop('INVALID_EXECUTION_PROFILE', 'Profile v3 has an invalid schema. Supply runtime paths, safety files, selectors and resource scope.', profilePath); }
-  if (input.framework !== profile.framework || input.environment !== profile.environment) stop('EXECUTION_CONTEXT_MISMATCH', 'framework=laravel and environment=testing must match Profile v3.');
-  if (input.execution || input.environmentApprovalId) stop('EXECUTION_CONTEXT_MISMATCH', 'Profile v2 execution/Environment Approval fields cannot be mixed with Profile v3.');
-  const tokens = executionTokens(input.command);
+  const hostRoot = resolved.root;
+  let root = hostRoot;
+  let profilePath: string, profile: ExecutionProfile, profileDigest: string;
+  let conditions: ExecutionConditions | undefined, conditionId: string | undefined;
+  if (input.safetyProfilePath) {
+    if (input.executionConditions || input.executionConditionsId) stop('EXECUTION_CONTEXT_MISMATCH', 'Choose DB registration or the explicit legacy Profile path, not both.');
+    const key = relativeTarget(root, resolve(input.safetyProfilePath));
+    if (!key) stop('INVALID_EXECUTION_PROFILE', 'The legacy execution profile must be inside cwd.');
+    profilePath = key;
+    const rawProfile = readProjectFiles(root, [profilePath])[0]!;
+    profileDigest = rawProfile.digest;
+    try { profile = executionProfileSchema.parse(JSON.parse(rawProfile.content)); }
+    catch { return stop('INVALID_EXECUTION_PROFILE', 'The explicitly selected legacy Profile v3 has an invalid schema.', profilePath); }
+  } else {
+    const resolvedConditions = resolveExecutionConditions(input, root);
+    conditions = resolvedConditions.conditions; conditionId = resolvedConditions.conditionId;
+    if (conditions.target.mode !== 'local') root = mappedHostWorkdir(hostRoot,conditions.target.projectRoot,conditions.target.cwd);
+    profile = conditionsProfile(conditions);
+    profileDigest = sha256(canonicalJson(conditions)); profilePath = `conditions:${profileDigest}`;
+  }
+  if ((input.framework !== undefined && input.framework !== profile.framework) || (input.environment !== undefined && input.environment !== profile.environment)) stop('EXECUTION_CONTEXT_MISMATCH', 'Execution requires framework=laravel and environment=testing.');
+  if (input.execution || input.environmentApprovalId) stop('EXECUTION_CONTEXT_MISMATCH', 'Profile v2 execution/Environment Approval fields cannot be mixed with this execution workflow.');
+  const invocation = parseExecutionInvocation(input.command);
+  const container = invocation.mode !== 'local';
+  if (container && !conditions) stop('UNSUPPORTED_EXECUTION_FORM', 'Legacy Profile execution is local only; register container executionConditions without a Profile.');
+  const tokens = [...invocation.tokens];
   let args: string[], baseCommand: string, chain: string[], definitionFiles: string[] = [];
   let composerRuntime: Record<string, unknown> | undefined;
   if (profile.entry.adapter === 'composer-script') {
-    if (!profile.runtime.composer) stop('INVALID_EXECUTION_PROFILE', 'Composer runtime executable is required.');
+    if (!container && !profile.runtime.composer) stop('INVALID_EXECUTION_PROFILE', 'Composer runtime executable is required.');
     const command = tokens.shift();
     if (command !== 'composer' && command !== profile.runtime.composer) stop('UNSUPPORTED_EXECUTION_FORM', 'The configured local Composer executable must be invoked directly.');
-    if (command === 'composer') assertNamedExecutable('composer', profile.runtime.composer);
+    if (!container && command === 'composer') assertNamedExecutable('composer', profile.runtime.composer!);
     const noPlugins = tokens[0] === '--no-plugins'; if (noPlugins) tokens.shift();
     const runScript = tokens[0] === 'run-script'; if (runScript) tokens.shift();
     if (tokens.shift() !== profile.entry.script) stop('EXECUTION_SELECTOR_OUTSIDE_SCOPE', 'The requested Composer script is outside the configured entry scope.');
@@ -268,18 +264,21 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
     args = tokens;
     baseCommand = `${command}${noPlugins ? ' --no-plugins' : ''}${runScript ? ' run-script' : ''} ${profile.entry.script}`;
     const resolvedChain = composerChain(root, profile); chain = resolvedChain.calls; definitionFiles = resolvedChain.files;
-    if (resolvedChain.invocation[0] === 'php') assertNamedExecutable('php', profile.runtime.php);
-    assertComposerPhp(profile.runtime.composer, profile.runtime.php);
-    const home = resolveComposerHome();
-    if (profile.runtime.composerHome && resolve(profile.runtime.composerHome) !== home) stop('EXECUTION_CONTEXT_MISMATCH', 'Declared Composer home differs from the current runtime. Set COMPOSER_HOME consistently in MCP and execution or correct runtime.composerHome.');
-    if (process.env.COMPOSER && resolve(process.env.COMPOSER) !== join(root, 'composer.json')) stop('EXECUTION_CONTEXT_MISMATCH', 'COMPOSER redirects the project definition. Remove the override and recheck.');
-    composerRuntime = { executable: executableDigest(profile.runtime.composer), home: resolve(home), noPlugins, metadata: assertNoPlugins(root, home, noPlugins) };
+    if (!container) {
+      if (resolvedChain.invocation[0] === 'php') assertNamedExecutable('php', profile.runtime.php);
+      assertComposerPhp(profile.runtime.composer!, profile.runtime.php);
+      const home = resolveComposerHome();
+      if (profile.runtime.composerHome && resolve(profile.runtime.composerHome) !== home) stop('EXECUTION_CONTEXT_MISMATCH', 'Declared Composer home differs from the current runtime. Set COMPOSER_HOME consistently in MCP and execution.');
+      if (process.env.COMPOSER && resolve(process.env.COMPOSER) !== join(root, 'composer.json')) stop('EXECUTION_CONTEXT_MISMATCH', 'COMPOSER redirects the project definition. Remove the override and recheck.');
+      composerRuntime = { executable: executableDigest(profile.runtime.composer!), home: resolve(home), noPlugins, metadata: assertNoPlugins(root, home, noPlugins) };
+    } else composerRuntime = { noPlugins, verification: 'human-approved-container' };
   } else {
     if ((tokens[0] !== 'php' && tokens[0] !== profile.runtime.php) || tokens[1] !== profile.runner.file) stop('UNSUPPORTED_EXECUTION_FORM', 'Invoke the configured PHP safe runner directly.');
-    if (tokens[0] === 'php') assertNamedExecutable('php', profile.runtime.php);
+    if (!container && tokens[0] === 'php') assertNamedExecutable('php', profile.runtime.php);
     args = tokens.slice(2); if (args[0] === '--') args.shift();
     baseCommand = `${tokens[0]} ${profile.runner.file}`; chain = [baseCommand];
   }
+  baseCommand = wrapExecutionCommand(invocation, baseCommand);
   const selected: string[] = []; let filter: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
@@ -293,18 +292,20 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
   }
   if (new Set(selected).size !== selected.length) stop('EXECUTION_SELECTOR_OUTSIDE_SCOPE', 'Duplicate selectors are not permitted.');
   const configuration = profile.environmentFiles.find(p => /(?:^|\/)phpunit\.xml(?:\.dist)?$/u.test(p));
-  if (!configuration) stop('INVALID_EXECUTION_PROFILE', 'environmentFiles must include the PHPUnit configuration.');
+  if (!configuration) stop(conditions ? 'EXECUTION_CONFIGURATION_MISSING' : 'INVALID_EXECUTION_PROFILE', 'environmentFiles must include the existing PHPUnit configuration. Correct that structured field and recheck.');
   const xml = readProjectFiles(root, [configuration])[0]!.content;
   const xmlConfig = phpunitConfiguration(xml), bootstrap = xmlConfig.bootstrap;
-  const autoFiles = ['composer.lock', 'vendor/composer/installed.json', 'vendor/composer/autoload_files.php', 'vendor/composer/autoload_real.php', 'vendor/composer/autoload_static.php', '.env', '.env.testing', 'bootstrap/cache/config.php', 'tests/TestCase.php'];
+  const autoFiles = ['composer.lock', 'vendor/composer/installed.json', 'vendor/composer/autoload_files.php', 'vendor/composer/autoload_real.php', 'vendor/composer/autoload_static.php', '.env', '.env.testing', 'bootstrap/cache/config.php', 'tests/TestCase.php'].filter(file => !(container && file.startsWith('vendor/')) && !(conditions && file === 'tests/TestCase.php'));
   const autoManifest = autoFiles.map(file => ({ file, digest: optionalDigest(join(root, file)) }));
-  for (const file of ['composer.lock', 'vendor/composer/installed.json']) {
+  for (const file of container ? [] : ['composer.lock', 'vendor/composer/installed.json']) {
     if (autoManifest.find(f => f.file === file)?.digest === 'absent') stop('EXECUTION_EVIDENCE_INCOMPLETE', 'Installed dependency metadata is required.', file);
   }
-  let vendorFingerprint: string;
-  try { vendorFingerprint = digestPaths(root, ['vendor']).fingerprint; }
-  catch { return stop('EXECUTION_DEPENDENCY_INCOMPLETE', 'Installed vendor dependencies must be readable, symlink-free and within 20000 files, 40000 entries and 8 MiB per file. Reinstall or correct the dependency scope.'); }
-  const evidencePaths = [...definitionFiles, profile.runner.file, ...profile.runner.safetyFiles, ...profile.environmentFiles, ...(bootstrap ? [bootstrap] : []), profile.runner.testEntry];
+  let vendorFingerprint = 'human-approved-container';
+  if (!container) {
+    try { vendorFingerprint = digestPaths(root, ['vendor']).fingerprint; }
+    catch { return stop('EXECUTION_DEPENDENCY_INCOMPLETE', 'Installed vendor dependencies must be readable, symlink-free and within 20000 files, 40000 entries and 8 MiB per file. Reinstall or correct the dependency scope.'); }
+  }
+  const evidencePaths = [...definitionFiles, profile.runner.file, ...profile.runner.safetyFiles, ...profile.environmentFiles, ...(bootstrap && !(container && bootstrap.startsWith('vendor/')) ? [bootstrap] : []), ...(!container ? [profile.runner.testEntry] : [])];
   const evidence = readProjectFiles(root, [...new Set(evidencePaths)]);
   const runner = evidence.find(f => f.key === profile.runner.file)!;
   if (!runner.content.includes(profile.runner.testEntry)) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner source must reference the declared PHPUnit entry; confirm its complete invocation and argument forwarding.', profile.runner.file);
@@ -319,28 +320,28 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
       files = suiteFiles(root, xmlConfig.selectors, profile.selectors.filePatterns);
     }
     if (input.testFiles !== undefined) {
-      const supplied = input.testFiles.map(f => relativeTarget(root, f));
+      const supplied = input.testFiles.map(f => relativeTarget(root, resolve(hostRoot, f)));
       if (supplied.some(f => !f) || canonicalJson([...supplied].sort()) !== canonicalJson(files)) stop('EXECUTION_TARGET_MISMATCH', 'testFiles must equal the files selected by the actual command. Do not supply a subset for a full-suite invocation.');
     }
     if (input.testCode !== undefined) stop('EXECUTION_TARGET_MISMATCH', 'Profile v3 reads actual test files; omit inline testCode.');
   }
   const relatedSnapshot = readRelatedCode(root, [...profile.codeReviewRoots, ...evidencePaths]);
-  if (relatedSnapshot.status !== 'complete') throw new ExecutionEvidenceError('RELATED_CODE_REVIEW_INCOMPLETE', relatedSnapshot.reason, undefined, [...evidence, ...relatedSnapshot.files]);
-  const commandPolicies = loadEffectivePolicies(root), testPolicies = loadEffectiveTestPolicies(root, profile.framework);
+  if (relatedSnapshot.status !== 'complete') throw new ExecutionEvidenceError('RELATED_CODE_REVIEW_INCOMPLETE', relatedSnapshot.reason, relatedSnapshot.file, [...evidence, ...relatedSnapshot.files]);
+  const commandPolicies = loadEffectivePolicies(hostRoot), testPolicies = loadEffectiveTestPolicies(hostRoot, profile.framework);
   const policyHash = sha256(canonicalJson({ command: commandPolicies.hash, test: testPolicies.hash }));
   const runtimeEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(?:PATH|PHP|COMPOSER|APP_|DB_|XDG_CONFIG_HOME)/u.test(key)).map(([key, value]) => [key, sha256(value ?? '')]));
   const manifest = evidence.map(({ key, digest, bytes }) => ({ key, digest, bytes }));
-  const fingerprint = sha256(canonicalJson({ version: EXECUTION_VERIFIER_VERSION, project: projectId(root), profileDigest: rawProfile.digest,
+  const fingerprint = sha256(canonicalJson({ version: conditions ? 'jev-db-execution-v1' : EXECUTION_VERIFIER_VERSION, project: projectId(hostRoot), profileDigest,
     baseCommand, chain: chain.map(v => sha256(v)), manifest, autoManifest, vendorFingerprint, policyHash,
-    runtime: { php: executableDigest(profile.runtime.php), composer: composerRuntime ?? null,
+    runtime: container ? { target: conditions!.target, verification: 'human-approved-container' } : { php: executableDigest(profile.runtime.php), composer: composerRuntime ?? null,
       config: profile.runtime.configFiles.map(path => {
         const digest = optionalDigest(path);
         if (digest === 'absent') stop('EXECUTION_EVIDENCE_INCOMPLETE', 'A declared runtime configuration file is missing.');
         return { path, digest };
       }), environment: runtimeEnvironment } }));
-  const scope = { projectRoot: root, name: profile.name, command: baseCommand, chain, entry: profile.entry, runner: profile.runner, selectors: profile.selectors,
-    resources: profile.resources, files: manifest.map(f => f.key), runtime: profile.runtime, composerPluginMode: composerRuntime?.noPlugins ? 'disabled' : 'absence-inspected',
+  const scope = { source: conditions ? 'db' : 'profile', ...(conditions ? { conditions } : {}), verification: container ? 'human-approved-container' : 'local-runtime-inspected', containerInternalsVerified: false, projectRoot: hostRoot, hostWorkingDirectory: root, name: profile.name, command: baseCommand, chain, entry: profile.entry, runner: profile.runner, selectors: profile.selectors,
+    resources: profile.resources, files: manifest.map(f => f.key), changeDetection: {sources:manifest, automaticFiles:autoManifest, localVendorFingerprint:container ? null : vendorFingerprint, policyHash}, ...(container ? {} : { runtime: profile.runtime }), composerPluginMode: composerRuntime?.noPlugins ? 'disabled' : container ? 'human-approved-container' : 'absence-inspected',
     reviewBoundary: 'Review the complete PHP runner, guard loading, PHPUnit invocation and argument forwarding. This is not automatic PHP dependency resolution.' };
-  return { root, profilePath, profile, fingerprint, policyHash, scope, evidence, related: relatedSnapshot.files,
+  return { root, projectRoot:hostRoot, profilePath, profile, ...(conditions ? { conditions } : {}), ...(conditionId ? {conditionId} : {}), fingerprint, policyHash, scope, evidence, related: relatedSnapshot.files,
     dependencyFingerprint: relatedSnapshot.fingerprint, files, executionFingerprint: sha256(canonicalJson({ command: sha256(input.command), files, filter: filter === undefined ? null : sha256(filter), fingerprint })), baseCommand };
 }
