@@ -40,7 +40,7 @@ try {
   const repeat={command:`podman exec --workdir /fixture ${containerName} composer --no-plugins test`,cwd:project,framework:'laravel',environment:'testing'};
   const executionConditions={target:{mode:'podman',containerName,projectRoot:'/fixture',cwd:'/fixture'},
     runner:{safetyFiles:['tests/Support/DatabaseGuard.php']},selectors:{filePatterns:['tests/Feature/**'],allowFilter:true,allowFullSuite:true},
-    codeReviewRoots:['tests/Support'],resources:{database:{policy:'sqlite-memory',rejectFallback:true,rejectAdditionalConnections:true},filesystem:{writableRoots:['bootstrap/cache']},network:{policy:'deny'},credentials:{policy:'deny'}}};
+    codeReviewRoots:['tests/Support','composer.lock'],environmentFiles:['phpunit.xml','composer.lock'],resources:{database:{policy:'sqlite-memory',rejectFallback:true,rejectAdditionalConnections:true},filesystem:{writableRoots:['bootstrap/cache']},network:{policy:'deny'},credentials:{policy:'deny'}}};
   const pending=await evaluateTest(config,{...repeat,executionConditions});
   assert.ok(pending.executionReviewId,JSON.stringify(pending));
   transitionTestExecutionApproval(openDatabase(),pending.executionReviewId,'approve',new Date().toISOString());

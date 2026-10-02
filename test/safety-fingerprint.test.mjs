@@ -86,3 +86,59 @@ test('Profile v2 keeps command and environment outside the code identity', () =>
   assert.equal(canonicalJson(testInputIdentity(base, undefined, true)), canonicalJson(testInputIdentity({ ...base, command: 'bin/other', environment: 'other' }, undefined, true)));
   assert.notEqual(canonicalJson(testInputIdentity(base, undefined, true)), canonicalJson(testInputIdentity({ ...base, testCode: 'const secret = "b";' }, undefined, true)));
 });
+
+
+test('composer.lock is digest-only for explicit paths and traversal, outside source file and byte limits', (t) => {
+  const root = relatedProject(t);
+  for (let i = 0; i < 64; i++) writeFileSync(join(root, 'app', `source${i}.php`), i < 2 ? 'a'.repeat(32768) : '');
+  const lock = Buffer.from(JSON.stringify({ packages: [], marker: 'metadata-only'.repeat(100000) }));
+  writeFileSync(join(root, 'app/composer.lock'), lock);
+  const snapshot = readRelatedCode(root, ['app', 'app/composer.lock']);
+  assert.equal(snapshot.status, 'complete');
+  assert.equal(snapshot.files.length, 64);
+  assert.deepEqual(snapshot.metadata, [{ key: 'app/composer.lock', bytes: lock.length, digest: sha256(lock) }]);
+  assert.equal(JSON.stringify(snapshot).includes('metadata-only'), false);
+  const explicit = readRelatedCode(root, ['app/composer.lock']);
+  assert.equal(explicit.status, 'complete');
+  assert.deepEqual(explicit.files, []);
+  assert.deepEqual(explicit.metadata, snapshot.metadata);
+  writeFileSync(join(root, 'app/composer.lock'), Buffer.concat([lock, Buffer.from('\r\n')]));
+  assert.notEqual(readRelatedCode(root, ['app']).fingerprint, snapshot.fingerprint);
+  writeFileSync(join(root, 'app/other.lock'), 'a'.repeat(32769));
+  assert.equal(readRelatedCode(root, ['app/other.lock']).status, 'incomplete');
+});
+
+test('composer.lock metadata retains bounded reads and fail-closed path validation', (t) => {
+  const root = relatedProject(t);
+  const path = join(root, 'composer.lock');
+  writeFileSync(path, Buffer.alloc(8 * 1024 * 1024));
+  const exact = readRelatedCode(root, ['composer.lock']);
+  assert.equal(exact.status, 'complete');
+  assert.equal(exact.metadata[0].bytes, 8 * 1024 * 1024);
+  writeFileSync(path, Buffer.alloc(8 * 1024 * 1024 + 1));
+  assert.match(readRelatedCode(root, ['composer.lock']).reason, /8 MiB/);
+  rmSync(path);
+  assert.equal(readRelatedCode(root, ['composer.lock']).status, 'incomplete');
+  writeFileSync(join(root, 'app/lock.json'), '{}');
+  symlinkSync(join(root, 'app/lock.json'), path);
+  assert.match(readRelatedCode(root, ['composer.lock']).reason, /symbolic link/);
+  rmSync(path);
+  mkdirSync(path);
+  writeFileSync(join(path, 'bad.php'), 'a'.repeat(32769));
+  assert.equal(readRelatedCode(root, ['composer.lock']).status, 'incomplete', 'directories named composer.lock are still traversed');
+});
+
+
+test('metadata has its own file count bound', (t) => {
+  const root = relatedProject(t);
+  for (let i = 0; i < 64; i++) {
+    mkdirSync(join(root, 'app', `dependency${i}`));
+    writeFileSync(join(root, 'app', `dependency${i}`, 'composer.lock'), '{}');
+  }
+  const exact = readRelatedCode(root, ['app']);
+  assert.equal(exact.status, 'complete');
+  assert.equal(exact.metadata.length, 64);
+  mkdirSync(join(root, 'app/extra'));
+  writeFileSync(join(root, 'app/extra/composer.lock'), '{}');
+  assert.match(readRelatedCode(root, ['app']).reason, /metadata.*64-file/);
+});

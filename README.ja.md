@@ -245,6 +245,12 @@ Composerの`--`以降へ、許可された相対PHPファイルと、許可さ�
 
 `reviewReasons`は`registration-incomplete`、`conditions-ambiguous`、`conditions-mismatch`、`unsupported-form`、`execution-approval`、`command-risk`、`code-risk`、`evidence-incomplete`、`evaluation-error`を区別します。`missingFields`、`conditionCandidates`、`evidenceErrors`、既存の`fileErrors`を確認して修正し、Server発行IDと`approvable=true`がある理由だけを承認します。API／DB／読込障害、未対応、scope不一致を別の理由の承認で解消できません。静的／Policy／Jevのdenyと未解決reviewは常に優先します。実行承認後はコードcache HIT時もcommandを毎回Jev評価し、一般コマンドallow cacheは停止したままです。provider／model変更はコード／command審査に影響しますが、その変更だけで環境再承認を要求しません。
 
+`composer.lock`はJSONテキストですが、全文は依存メタデータとして扱い、ソース審査へ提出しません。この名前と完全一致する通常ファイル（入れ子のパスを含む）は、明示指定・`codeReviewRoots`配下の探索のどちらでも、Jevへ送るcommand証拠本文と`relatedCode`から除外します。変更検出にはproject相対パス・元バイト列のSHA-256 digest・byte数だけを保持します。
+
+ソースの64ファイル／1件32 KiB／合計64 KiB上限には算入せず、メタデータは別枠で64ファイル／1件8 MiB、探索4096 entryは共通です。存在しない／読めないファイル、symlink、通常ファイル以外では引き続き停止します。他のlockfileにはこの除外を適用しません。ローカルのComposer plugin検査はJSONをローカルで読み続けますが、コンテナ内部の検査は行いません。`testFiles`での`composer.lock`提出も禁止します（`TEST_FILE_METADATA_ONLY`）。
+
+これを含む既存DB登録・旧Profileの設定変更は不要です。lock変更は該当するコード審査の同一性を失効させ、実行条件または自動依存検出に含まれる場合は実行再承認が必要です。更新後は再build／再起動して再チェックしてください。`related-code-v2`によりDB schemaを変えずに以前のコードcache／Human Reviewを失効させますが、一致する実行承認・環境承認は保持します。
+
 証拠／関連snapshotは64ファイル、1件32 KiB、合計64 KiB、探索4096 entry、テスト選択は128ファイルで各テストに同じ1件読込上限を適用します。完成コードrequestは256 KiB、command contextは192 KiB、ローカル依存manifestは20000ファイル／40000 entry／1件8 MiBです。不完全な証拠を切り詰め・除外で迂回できません。検査対象は読み取れる通常ファイル、symlinkなし、ソースは有効なtextが必要です。ゲートはOS sandboxやチェックから実行までの変更防止を提供せず、コードや照合条件が変われば再チェックします。
 
 移行：旧processを停止し、SQLite／WALの整合したbackup後に更新します。schema 7から8へtransaction内で条件登録とlegacy／DB承認の識別を追加します。既存履歴・cacheは保持し、旧Profile承認をDB承認へ自動変換しません。移行時はexecutionConditionsを渡し、新scopeを明示確認して新IDを承認・再チェックします。その後の通常運用では旧Profileを削除できます。旧Profile承認IDを明示的legacy pathなしで使うと`EXECUTION_MIGRATION_REQUIRED`となります。旧Serverはschema 8を開けず、downgradeには更新前backupが必要です。配布JEV_POLICYの日英両方もServerと同時更新してください。
@@ -360,7 +366,7 @@ Profile v2では、人が初回確認する実行環境と、変更ごとに自�
     "selectors": { "filePatterns": ["tests/**"], "allowFilter": true }
   },
   "environmentFiles": ["phpunit.xml", "bootstrap/app.php", "config/database.php"],
-  "codeReviewRoots": ["app", "tests/Support", "composer.json", "composer.lock"],
+  "codeReviewRoots": ["app", "tests/Support", "composer.json"],
   "resources": {
     "database": { "policy": "sqlite-memory", "rejectFallback": true, "rejectAdditionalConnections": true },
     "filesystem": { "writableRoots": ["storage/framework/testing"] },
@@ -372,13 +378,13 @@ Profile v2では、人が初回確認する実行環境と、変更ごとに自�
 
 Profile v2では`testFiles`と同じファイルを示す構造化`execution`を`jev_check_test`へ渡します。`command`にはrunnerの相対パスだけを指定し、対象やfilterをshell文字列へ連結しません。
 
-各チェックで、Serverは`codeReviewRoots`配下の全ファイルの現在のUTF-8本文を読み、重複するrootを重複排除します。同一のメモリ上のスナップショットから元バイト列のdigestを作り、Built-in／User／Project Policy・frameworkの静的検査を行い、マスクした`relatedCode`（`file`、`content`）をJevへ送ります。1リクエスト内の複数`testFiles`はこのスナップショットを共有します。関連コードのfindingにはproject相対パスの`file`が付く場合があります。平文の本文はSQLite・ログ・MCP結果へ保存せず、Server外へ送る本文はマスク済みのみです。マスクはbest effortなので、利用前に設定範囲の機密情報を確認してください。
+各チェックで、Serverは`codeReviewRoots`配下のソースファイル（メタデータ専用の`composer.lock`を除く）の現在のUTF-8本文を読み、重複するrootを重複排除します。同一のメモリ上のスナップショットから元バイト列のdigestを作り、Built-in／User／Project Policy・frameworkの静的検査を行い、マスクした`relatedCode`（`file`、`content`）をJevへ送ります。1リクエスト内の複数`testFiles`はこのスナップショットを共有します。関連コードのfindingにはproject相対パスの`file`が付く場合があります。平文の本文はSQLite・ログ・MCP結果へ保存せず、Server外へ送る本文はマスク済みのみです。マスクはbest effortなので、利用前に設定範囲の機密情報を確認してください。
 
-審査上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親要素を含むsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`で停止します。無断の切り詰めや拡張子による除外はしません。承認可能な`reviewId`、cache／Human Approvalによる迂回、Execution Ticketはなく、範囲・読み取り可否・リクエスト容量を修正して再チェックしてください。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを失効させません。
+審査上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親要素を含むsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`で停止します。明示されたメタデータ専用`composer.lock`の例外を除き、無断の切り詰めや拡張子による除外はしません。承認可能な`reviewId`、cache／Human Approvalによる迂回、Execution Ticketはなく、範囲・読み取り可否・リクエスト容量を修正して再チェックしてください。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを失効させません。
 
-審査範囲は指定テストと明示した`codeReviewRoots`のみで、import・package・動的依存を自動展開しません。`codeReviewRoots: []`は有効ですが、追加コード審査を指定していないという意味であり、依存全体の安全性を示しません。上限内で適切な範囲を選定してください（例の大きな`app`や`composer.lock`は上限を超える場合があります）。停止の回避だけを目的に必要なファイルを除外してはいけません。runner側のresource・fingerprint確認も引き続き必要です。
+審査範囲は指定テストと明示した`codeReviewRoots`のみで、import・package・動的依存を自動展開しません。`codeReviewRoots: []`は有効ですが、追加コード審査を指定していないという意味であり、依存全体の安全性を示しません。上限内で適切な範囲を選定してください（例の大きな`app`はソース上限を超える場合があります）。停止の回避だけを目的に必要なファイルを除外してはいけません。runner側のresource・fingerprint確認も引き続き必要です。
 
-移行：`related-code-v1`へのevaluator更新により、その更新自体はDB schemaを変更しなくても以前のコードcacheとHuman Reviewは再利用できません。更新したServerを再build／再起動し、再チェックして、必要なら新しいHuman Approvalを取得し、任意のProfile v2 Ticket経路を使う場合だけ新しいExecution Ticketを取得してください。監査・review履歴と、一致するEnvironment Approvalは維持します。既存Profile v2の設定は新しい審査上限を満たす必要がありますが、入力引数とprofile形式は変わりません。
+移行：`related-code-v2`へのevaluator更新により、その更新自体はDB schemaを変更しなくても以前のコードcacheとHuman Reviewは再利用できません。更新したServerを再build／再起動し、再チェックして、必要なら新しいHuman Approvalを取得し、任意のProfile v2 Ticket経路を使う場合だけ新しいExecution Ticketを取得してください。監査・review履歴と、一致するEnvironment Approvalは維持します。既存Profile v2の設定は新しい審査上限を満たす必要がありますが、入力引数とprofile形式は変わりません。
 
 初回は`environmentReviewId`と`decision=review`が返ります。人がrunnerとresource scopeを確認した後、`jev_environment_approve`へそのIDだけを渡します。承認は既定で30日有効で、`jev_environment_revoke`により即時取消できます。
 

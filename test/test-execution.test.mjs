@@ -249,3 +249,20 @@ test('a requested approval ID cannot resurrect an environment changed and then r
   assert.equal(getTestExecutionApproval(openDatabase(),id).status,'superseded');
   f.put('config/database.php',prior);assert.equal((await evaluateTest(config,{...f.input,executionApprovalId:id})).allowed,false);
 });
+
+
+test('explicit Profile v3 treats large composer.lock as metadata in evidence and related roots', async () => {
+  const f = fixture(), calls = mock();
+  f.profile.environmentFiles.push('composer.lock');
+  f.profile.codeReviewRoots.push('composer.lock');
+  f.save();
+  const marker = 'legacy-lock-not-source';
+  f.put('composer.lock', JSON.stringify({ packages: [], marker: marker.repeat(10000) }));
+  const id = await approve(f);
+  const first = await evaluateTest(config, f.input);
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  assert.equal((await evaluateTest(config, f.input)).executionApproval.approvalId, id);
+  assert.equal(JSON.stringify(calls).includes(marker), false);
+  f.put('composer.lock', JSON.stringify({ packages: [], marker: marker.repeat(10000) }) + '\n');
+  assert.notEqual((await evaluateTest(config, f.input)).executionReviewId, id);
+});

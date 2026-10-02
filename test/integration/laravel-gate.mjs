@@ -18,7 +18,7 @@ const executionConditions = {
   target: {mode:'local'},
   entry: { adapter: 'composer-script', script: 'test' }, runner: { file: 'scripts/test-safe.php', safetyFiles: ['tests/Support/DatabaseGuard.php'] },
   selectors: { filePatterns: ['tests/Feature/**'], allowFilter: true, allowFullSuite: true },
-  environmentFiles: ['phpunit.xml'], codeReviewRoots: ['tests/Support'],
+  environmentFiles: ['phpunit.xml', 'composer.lock'], codeReviewRoots: ['tests/Support', 'composer.lock'],
   runtime: { php: '/usr/local/bin/php', composer: '/usr/local/bin/composer', composerHome: '/tmp/jev-composer-home', configFiles: [] },
   resources: { database: { policy: 'sqlite-memory', rejectFallback: true, rejectAdditionalConnections: true },
     filesystem: { writableRoots: ['bootstrap/cache'] }, network: { policy: 'deny' }, credentials: { policy: 'deny' } },

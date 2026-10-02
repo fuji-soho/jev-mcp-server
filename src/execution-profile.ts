@@ -2,7 +2,7 @@ import { lstatSync, readFileSync, realpathSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { SaxesParser } from 'saxes';
-import { canonicalJson, digestPaths, projectId, readRelatedCode, relativeTarget, resolveTestRoot, sha256, type RelatedCodeFile } from './safety-fingerprint.js';
+import { canonicalJson, digestPaths, projectId, readRelatedCode, relativeTarget, resolveTestRoot, sha256, type RelatedCodeFile, type FileManifestEntry } from './safety-fingerprint.js';
 import { loadEffectivePolicies, loadEffectiveTestPolicies } from './policy.js';
 import type { TestCheckInput } from './types.js';
 
@@ -31,6 +31,7 @@ export function usesExecutionProfile(input: TestCheckInput): boolean {
 function readProjectFiles(root: string, files: string[]): RelatedCodeFile[] {
   const snapshot = readRelatedCode(root, files);
   if (snapshot.status !== 'complete') throw new ExecutionEvidenceError('EXECUTION_EVIDENCE_INCOMPLETE', snapshot.reason, snapshot.file, snapshot.files);
+  if (!snapshot.files.length && files.length) stop('EXECUTION_EVIDENCE_INCOMPLETE', 'Required execution source cannot be dependency metadata.', files[0]);
   return snapshot.files;
 }
 function jsonFile(root: string, file: string): Record<string, unknown> {
@@ -217,7 +218,7 @@ function suiteFiles(root: string, selectors: Array<{ path: string; suffix: strin
 export interface ExecutionSnapshot {
   conditions?: ExecutionConditions; conditionId?: string;
   root: string; projectRoot: string; profilePath: string; profile: ExecutionProfile; fingerprint: string; policyHash: string;
-  scope: Record<string, unknown>; evidence: RelatedCodeFile[]; related: RelatedCodeFile[];
+  scope: Record<string, unknown>; evidence: RelatedCodeFile[]; related: RelatedCodeFile[]; metadata: FileManifestEntry[];
   dependencyFingerprint: string; files: string[]; executionFingerprint: string; baseCommand: string;
 }
 
@@ -306,8 +307,11 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
     catch { return stop('EXECUTION_DEPENDENCY_INCOMPLETE', 'Installed vendor dependencies must be readable, symlink-free and within 20000 files, 40000 entries and 8 MiB per file. Reinstall or correct the dependency scope.'); }
   }
   const evidencePaths = [...definitionFiles, profile.runner.file, ...profile.runner.safetyFiles, ...profile.environmentFiles, ...(bootstrap && !(container && bootstrap.startsWith('vendor/')) ? [bootstrap] : []), ...(!container ? [profile.runner.testEntry] : [])];
-  const evidence = readProjectFiles(root, [...new Set(evidencePaths)]);
+  const evidenceSnapshot = readRelatedCode(root, [...new Set(evidencePaths)]);
+  if (evidenceSnapshot.status !== 'complete') throw new ExecutionEvidenceError('EXECUTION_EVIDENCE_INCOMPLETE', evidenceSnapshot.reason, evidenceSnapshot.file, evidenceSnapshot.files);
+  const evidence = evidenceSnapshot.files;
   const runner = evidence.find(f => f.key === profile.runner.file)!;
+  if (!runner) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner must be a source file, not dependency metadata.', profile.runner.file);
   if (!runner.content.includes(profile.runner.testEntry)) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner source must reference the declared PHPUnit entry; confirm its complete invocation and argument forwarding.', profile.runner.file);
   for (const file of profile.runner.safetyFiles) if (!runner.content.includes(file) && !runner.content.includes(file.split('/').at(-1)!)) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner must reference every declared safety file; confirm the guard loading path.', profile.runner.file);
   // The PHP runner is a human-reviewed boundary, not an arbitrary shell resolver.
@@ -330,7 +334,7 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
   const commandPolicies = loadEffectivePolicies(hostRoot), testPolicies = loadEffectiveTestPolicies(hostRoot, profile.framework);
   const policyHash = sha256(canonicalJson({ command: commandPolicies.hash, test: testPolicies.hash }));
   const runtimeEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(?:PATH|PHP|COMPOSER|APP_|DB_|XDG_CONFIG_HOME)/u.test(key)).map(([key, value]) => [key, sha256(value ?? '')]));
-  const manifest = evidence.map(({ key, digest, bytes }) => ({ key, digest, bytes }));
+  const manifest = [...evidence, ...(evidenceSnapshot.metadata ?? [])].sort((a, b) => a.key.localeCompare(b.key)).map(({ key, digest, bytes }) => ({ key, digest, bytes }));
   const fingerprint = sha256(canonicalJson({ version: conditions ? 'jev-db-execution-v1' : EXECUTION_VERIFIER_VERSION, project: projectId(hostRoot), profileDigest,
     baseCommand, chain: chain.map(v => sha256(v)), manifest, autoManifest, vendorFingerprint, policyHash,
     runtime: container ? { target: conditions!.target, verification: 'human-approved-container' } : { php: executableDigest(profile.runtime.php), composer: composerRuntime ?? null,
@@ -342,6 +346,6 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
   const scope = { source: conditions ? 'db' : 'profile', ...(conditions ? { conditions } : {}), verification: container ? 'human-approved-container' : 'local-runtime-inspected', containerInternalsVerified: false, projectRoot: hostRoot, hostWorkingDirectory: root, name: profile.name, command: baseCommand, chain, entry: profile.entry, runner: profile.runner, selectors: profile.selectors,
     resources: profile.resources, files: manifest.map(f => f.key), changeDetection: {sources:manifest, automaticFiles:autoManifest, localVendorFingerprint:container ? null : vendorFingerprint, policyHash}, ...(container ? {} : { runtime: profile.runtime }), composerPluginMode: composerRuntime?.noPlugins ? 'disabled' : container ? 'human-approved-container' : 'absence-inspected',
     reviewBoundary: 'Review the complete PHP runner, guard loading, PHPUnit invocation and argument forwarding. This is not automatic PHP dependency resolution.' };
-  return { root, projectRoot:hostRoot, profilePath, profile, ...(conditions ? { conditions } : {}), ...(conditionId ? {conditionId} : {}), fingerprint, policyHash, scope, evidence, related: relatedSnapshot.files,
+  return { root, projectRoot:hostRoot, profilePath, profile, ...(conditions ? { conditions } : {}), ...(conditionId ? {conditionId} : {}), fingerprint, policyHash, scope, evidence, related: relatedSnapshot.files, metadata: relatedSnapshot.metadata ?? [],
     dependencyFingerprint: relatedSnapshot.fingerprint, files, executionFingerprint: sha256(canonicalJson({ command: sha256(input.command), files, filter: filter === undefined ? null : sha256(filter), fingerprint })), baseCommand };
 }

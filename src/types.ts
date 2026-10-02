@@ -142,7 +142,8 @@ export type TestFileErrorCode =
   | 'TEST_FILE_OUTSIDE_CWD'
   | 'TEST_FILE_SYMLINK'
   | 'TEST_FILE_NOT_REGULAR'
-  | 'TEST_FILE_UNREADABLE';
+  | 'TEST_FILE_UNREADABLE'
+  | 'TEST_FILE_METADATA_ONLY';
 
 export interface TestFileError {
   file: string;

@@ -4,7 +4,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { TestCheckInput, TestFileError } from './types.js';
 
 export const FINGERPRINT_SCHEMA_VERSION = 2;
-export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1:related-code-v1';
+export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1:related-code-v2';
 
 function normalize(value: unknown): unknown {
   if (typeof value === 'string') return value.replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n').normalize('NFC');
@@ -102,6 +102,7 @@ export function resolveTestRoot(root: string): TestRootResolution {
 export function readTestFile(root: string, file: string): TestFileResolution {
   const target = relativeTarget(root, file);
   if (target === undefined) return { ok: false, error: { file, code: 'TEST_FILE_OUTSIDE_CWD', message: 'The requested test file resolves outside cwd in the MCP server filesystem.' } };
+  if (isMetadataOnlyFile(target)) return { ok: false, error: { file, code: 'TEST_FILE_METADATA_ONLY', message: 'composer.lock is dependency metadata and cannot be submitted as test source.' } };
   const path = resolve(root, target);
   try {
     const stat = lstatSync(path);
@@ -123,14 +124,17 @@ const MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024;
 export interface FileManifestEntry { key: string; digest: string; bytes: number; }
 
 export const RELATED_CODE_LIMITS = { files: 64, fileBytes: 32 * 1024, totalBytes: 64 * 1024, entries: 4096 } as const;
+export const RELATED_METADATA_LIMITS = { files: 64, fileBytes: MAX_MANIFEST_FILE_BYTES } as const;
+export function isMetadataOnlyFile(key: string): boolean { return key.split('/').at(-1) === 'composer.lock'; }
 export interface RelatedCodeFile extends FileManifestEntry { content: string; }
 export type RelatedCodeSnapshot =
-  | { status: 'complete'; fingerprint: string; files: RelatedCodeFile[] }
-  | { status: 'incomplete'; reason: string; file?: string; files: RelatedCodeFile[] };
+  | { status: 'complete'; fingerprint: string; files: RelatedCodeFile[]; metadata?: FileManifestEntry[] }
+  | { status: 'incomplete'; reason: string; file?: string; files: RelatedCodeFile[]; metadata?: FileManifestEntry[] };
 
-/** Read once: the original bytes identify the exact text inspected locally and sent (redacted) to Jev. */
+/** Source text is read once; composer.lock is hashed locally without retaining or submitting its body. */
 export function readRelatedCode(root: string, configuredPaths: string[]): RelatedCodeSnapshot {
   const files: RelatedCodeFile[] = [];
+  const metadata: FileManifestEntry[] = [];
   let totalBytes = 0;
   let entries = 0;
   const visited = new Set<string>();
@@ -160,6 +164,29 @@ export function readRelatedCode(root: string, configuredPaths: string[]): Relate
         return;
       }
       if (!stat.isFile()) throw new Error('Related code is not a regular file.');
+      if (isMetadataOnlyFile(key)) {
+        if (metadata.length >= RELATED_METADATA_LIMITS.files) throw new Error('Related code metadata exceeds the 64-file limit.');
+        if (stat.size > RELATED_METADATA_LIMITS.fileBytes) throw new Error('Related code metadata exceeds the 8 MiB per-file limit.');
+        const fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        try {
+          const opened = fstatSync(fd);
+          if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) throw new Error('Related code metadata changed while being opened.');
+          const hash = createHash('sha256');
+          const buffer = Buffer.alloc(64 * 1024);
+          let bytes = 0;
+          for (;;) {
+            const count = readSync(fd, buffer, 0, buffer.length, null);
+            if (count === 0) break;
+            bytes += count;
+            if (bytes > RELATED_METADATA_LIMITS.fileBytes) throw new Error('Related code metadata exceeds the 8 MiB per-file limit.');
+            hash.update(buffer.subarray(0, count));
+          }
+          const after = fstatSync(fd);
+          if (bytes !== opened.size || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || relativeTarget(resolvedRoot, realpathSync(absolute)) === undefined) throw new Error('Related code metadata changed while being read.');
+          metadata.push({ key, digest: `sha256:${hash.digest('hex')}`, bytes });
+        } finally { closeSync(fd); }
+        return;
+      }
       if (files.length >= RELATED_CODE_LIMITS.files) throw new Error('Related code exceeds the 64-file limit.');
       if (stat.size > RELATED_CODE_LIMITS.fileBytes) throw new Error('Related code exceeds the 32 KiB per-file limit.');
       const fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -190,11 +217,12 @@ export function readRelatedCode(root: string, configuredPaths: string[]): Relate
     };
     for (const path of [...new Set(configuredPaths)].sort()) visit(path.replaceAll('\\', '/'));
     files.sort((a, b) => a.key.localeCompare(b.key));
-    return { status: 'complete', files, fingerprint: sha256(canonicalJson({ version: 'related-code-v1', limits: RELATED_CODE_LIMITS, files: files.map(({ key, digest, bytes }) => ({ key, digest, bytes })) })) };
+    // Preserve manifest identities; EVALUATOR_VERSION separates the changed Jev review input.
+    return { status: 'complete', files, metadata, fingerprint: sha256(canonicalJson({ version: 'related-code-v1', limits: RELATED_CODE_LIMITS, files: [...files, ...metadata].sort((a, b) => a.key.localeCompare(b.key)).map(({ key, digest, bytes }) => ({ key, digest, bytes })) })) };
   } catch (error) {
     // Never return OS errors containing absolute paths or file contents.
     const reason = error instanceof Error && error.message.startsWith('Related code') ? error.message : 'Related code could not be read completely.';
-    return { status: 'incomplete', files, reason, ...(currentFile ? {file:currentFile} : {}) };
+    return { status: 'incomplete', files, metadata, reason, ...(currentFile ? {file:currentFile} : {}) };
   }
 }
 

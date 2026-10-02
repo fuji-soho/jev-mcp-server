@@ -5,7 +5,7 @@ import { buildCommandStaticFindings } from './command-checker.js';
 import { ExecutionRegistrationError } from './execution-conditions.js';
 import { ExecutionEvidenceError, snapshotExecution } from './execution-profile.js';
 import { customFindings, evaluateTestCode, redactTestText } from './test-checker.js';
-import { canonicalJson, projectId, readRelatedCode, sha256 } from './safety-fingerprint.js';
+import { canonicalJson, EVALUATOR_VERSION, projectId, readRelatedCode, sha256 } from './safety-fingerprint.js';
 import { findPolicyMatches, loadEffectivePolicies, loadEffectiveTestPolicies, strictestDecision } from './policy.js';
 import { openDatabase } from './storage/sqlite.js';
 import { executionApprovalFor } from './storage/test-execution-approval.js';
@@ -100,12 +100,12 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       audit(result, response.model); return result;
     }
     const related = [...new Map([...snapshot.evidence, ...snapshot.related].map(f => [f.key, f])).values()].sort((a, b) => a.key.localeCompare(b.key));
-    const dependencyFingerprint = sha256(canonicalJson(related.map(({ key, digest, bytes }) => ({ key, digest, bytes }))));
+    const dependencyFingerprint = sha256(canonicalJson([...related, ...snapshot.metadata].sort((a, b) => a.key.localeCompare(b.key)).map(({ key, digest, bytes }) => ({ key, digest, bytes }))));
     let codeResult = await evaluateTestCode(config, { ...input, cwd: snapshot.root, testFiles: snapshot.files }, {
       assessment: { version: 3, status: 'verified', fingerprintMatched: true, runtimeMatched: snapshot.conditions?.target.mode !== 'podman' && snapshot.conditions?.target.mode !== 'docker', profileDigest: snapshot.fingerprint,
         dependencyFingerprint, profileName: snapshot.profile.name, environmentFingerprint: snapshot.fingerprint },
       jevContext: { version: 3, executionConditions: snapshot.fingerprint, resources: snapshot.profile.resources, environmentApproved: true },
-      executionApproved: true, policyRoot: snapshot.projectRoot, dbRegistered: snapshot.conditions !== undefined, relatedCode: { status: 'complete', fingerprint: dependencyFingerprint, files: related },
+      executionApproved: true, policyRoot: snapshot.projectRoot, dbRegistered: snapshot.conditions !== undefined, relatedCode: { status: 'complete', fingerprint: dependencyFingerprint, files: related, metadata: snapshot.metadata },
     }, tests);
     if (snapshot.conditions) { const {safetyProfile: _legacyProfile, ...normalResult} = codeResult; codeResult = normalResult; }
     if (!codeResult.ok || codeResult.decision === 'deny') {
@@ -124,7 +124,7 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       }
       const now = new Date();
       const codeIdentity = sha256(canonicalJson(tests.flatMap(t => t.ok ? [{ file: t.target, digest: t.digest }] : [])));
-      const fingerprint = sha256(canonicalJson({ execution: snapshot.executionFingerprint, dependencies: snapshot.dependencyFingerprint,
+      const fingerprint = sha256(canonicalJson({ evaluatorVersion: EVALUATOR_VERSION, execution: snapshot.executionFingerprint, dependencies: snapshot.dependencyFingerprint,
         codeIdentity, model: evaluationIdentity(config), context: input.context === undefined ? null : sha256(input.context), diff: input.diff === undefined ? null : sha256(input.diff), reviews: commandReviews }));
       const key = bindHumanReviewModel({ projectId: projectId(snapshot.projectRoot), targetType: 'test-execution', targetKey: snapshot.profilePath, fingerprint,
         commandHash: sha256(input.command), testFilesHash: codeIdentity, cwdHash: sha256(snapshot.projectRoot), policyHash: snapshot.policyHash,

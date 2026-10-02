@@ -265,3 +265,55 @@ test('nested container workdir maps below host project root and retains root pro
   const outside={...f.input,command:f.input.command.replace('/container/project/nested','/outside'),executionConditions:{...f.executionConditions,target:{...f.executionConditions.target,cwd:'/outside'}}};
   assert.equal((await evaluateTest(config,outside)).errorCode,'EXECUTION_CONDITIONS_MISMATCH');
 });
+
+
+for (const mode of ['local', 'podman', 'docker']) test(`${mode}: large lockfile metadata is included in approval identity without Jev submission`, async () => {
+  const f = fixture(mode), calls = mock();
+  f.executionConditions.codeReviewRoots.push('composer.lock');
+  f.executionConditions.environmentFiles = ['phpunit.xml', 'composer.lock'];
+  const marker = 'never-submit-lock-body';
+  f.put('composer.lock', JSON.stringify({ packages: [], marker: marker.repeat(10000) }));
+  const pending = await approve(f.input);
+  const source = pending.executionApproval.scope.changeDetection.sources.find(f => f.key === 'composer.lock');
+  assert.ok(source.digest.startsWith('sha256:'));
+  assert.ok(source.bytes > 32768);
+  const first = await evaluateTest(config, f.repeat);
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  const again = await evaluateTest(config, f.repeat);
+  assert.equal(again.codeAssessment.status, 'cache-hit');
+  assert.equal(again.executionApproval.approvalId, pending.executionReviewId);
+  assert.equal(JSON.stringify(calls).includes(marker), false);
+  for (const call of calls.filter(c => c.state.relatedCode)) assert.equal(call.state.relatedCode.some(f => f.file === 'composer.lock'), false);
+  f.put('composer.lock', JSON.stringify({ packages: [], marker: marker.repeat(10000) }) + '\n');
+  const changed = await evaluateTest(config, f.repeat);
+  assert.equal(changed.allowed, false);
+  assert.notEqual(changed.executionReviewId, pending.executionReviewId);
+  assert.equal(getTestExecutionApproval(openDatabase(), pending.executionReviewId).status, 'superseded');
+});
+
+test('local Composer plugin inspection still reads metadata-only composer.lock', async () => {
+  const f = fixture('local'), calls = mock();
+  f.executionConditions.codeReviewRoots.push('composer.lock');
+  f.put('composer.lock', JSON.stringify({ packages: [{ type: 'composer-plugin' }], marker: 'x'.repeat(100000) }));
+  const result = await evaluateTest(config, f.input);
+  assert.equal(result.allowed, false);
+  assert.equal(result.executionReviewId, undefined);
+  assert.match(result.reason, /plugin/i);
+  assert.equal(calls.length, 0);
+});
+
+
+test('nested metadata found by traversal invalidates code review while preserving execution approval', async () => {
+  const f = fixture(), calls = mock(0.1, 0.5);
+  f.put('app/composer.lock', JSON.stringify({ marker: 'nested-lock-body'.repeat(10000) }));
+  const pending = await approve(f.input);
+  const first = await evaluateTest(config, f.repeat);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(config, f.repeat)).allowed, true);
+  f.put('app/composer.lock', JSON.stringify({ marker: 'nested-lock-body'.repeat(10000) }) + '\n');
+  const changed = await evaluateTest(config, f.repeat);
+  assert.equal(changed.allowed, false);
+  assert.notEqual(changed.reviewId, first.reviewId);
+  assert.equal(changed.executionApproval.approvalId, pending.executionReviewId);
+  assert.equal(JSON.stringify(calls).includes('nested-lock-body'), false);
+});

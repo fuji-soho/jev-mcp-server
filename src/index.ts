@@ -149,7 +149,7 @@ const testOutputSchema = {
   policiesApplied: z.array(z.string()).optional(),
   fileErrors: z.array(z.object({
     file: z.string(),
-    code: z.enum(['TEST_FILE_NOT_FOUND', 'TEST_FILE_OUTSIDE_CWD', 'TEST_FILE_SYMLINK', 'TEST_FILE_NOT_REGULAR', 'TEST_FILE_UNREADABLE']),
+    code: z.enum(['TEST_FILE_NOT_FOUND', 'TEST_FILE_OUTSIDE_CWD', 'TEST_FILE_SYMLINK', 'TEST_FILE_NOT_REGULAR', 'TEST_FILE_UNREADABLE', 'TEST_FILE_METADATA_ONLY']),
     message: z.string(),
   })).optional(),
 };

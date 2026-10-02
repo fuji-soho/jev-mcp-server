@@ -959,7 +959,7 @@ test('related code is fully sent, redacted, and re-evaluated on raw-only changes
   assert.equal(first.allowed, true);
   assert.equal((await evaluateTest(pinnedConfig, input)).codeAssessment.status, 'cache-hit');
   const related = JSON.parse(bodies[0]).state.relatedCode;
-  assert.deepEqual(related.map((item) => item.file), ['app/Service.php', 'composer.lock', 'tests/Support/Helper.php']);
+  assert.deepEqual(related.map((item) => item.file), ['app/Service.php', 'tests/Support/Helper.php']);
   assert.ok(related[0].content.includes("return 'safe-marker'"));
   assert.ok(related[0].content.includes('[REDACTED]'));
   writeFileSync(file, code(secrets[1]));
@@ -1209,4 +1209,49 @@ test('an alias actual-model change replaces code approval but preserves Environm
   assert.equal(otherProvider.environmentAssessment.status, 'approved');
   assert.equal(otherProvider.environmentAssessment.approvalId, approved.environmentAssessment.approvalId);
   assert.equal(otherProvider.errorCode, 'JEV_NETWORK_ERROR');
+});
+
+
+test('Profile v2 excludes large composer.lock bodies but raw changes invalidate code approval', async (t) => {
+  const { cwd, input, bodies, approvalId } = await relatedCodeFixture(t);
+  const marker = 'lock-only-payload-marker';
+  writeFileSync(join(cwd, 'composer.lock'), JSON.stringify({ packages: [], description: marker.repeat(10000) }));
+  const first = await evaluateTest(pinnedConfig, input);
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  assert.equal((await evaluateTest(pinnedConfig, input)).codeAssessment.status, 'cache-hit');
+  assert.equal(bodies.join('').includes(marker), false);
+  assert.equal(JSON.parse(bodies[0]).state.relatedCode.some(f => f.file === 'composer.lock'), false);
+  writeFileSync(join(cwd, 'composer.lock'), JSON.stringify({ packages: [], description: marker.repeat(10000) }) + '\n');
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.allowed, true, JSON.stringify(changed));
+  assert.equal(changed.codeAssessment.status, 'evaluated');
+  assert.notEqual(changed.codeAssessment.dependencyFingerprint, first.codeAssessment.dependencyFingerprint);
+  assert.equal(changed.environmentAssessment.approvalId, approvalId);
+  assert.equal(bodies.length, 2);
+});
+
+test('composer.lock cannot be submitted as an explicit test file', async (t) => {
+  const cwd = profileV2Project();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return modelResponse('typesafe', 0.1); };
+  const result = await evaluateTest(pinnedConfig, { command: 'node tests/run.js', cwd, testFiles: ['composer.lock'] });
+  assert.equal(result.errorCode, 'TEST_FILE_VALIDATION_ERROR');
+  assert.equal(result.fileErrors[0].code, 'TEST_FILE_METADATA_ONLY');
+  assert.equal(result.allowed, false);
+  assert.equal(calls, 0);
+});
+
+
+test('digest-only lock changes require a new code Human Review despite identical Jev source text', async (t) => {
+  const { cwd, input, bodies, approvalId } = await relatedCodeFixture(t, 0.5);
+  const first = await evaluateTest(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), first.reviewId, 'approve', new Date().toISOString());
+  assert.equal((await evaluateTest(pinnedConfig, input)).allowed, true);
+  writeFileSync(join(cwd, 'composer.lock'), '{}\r\n');
+  const changed = await evaluateTest(pinnedConfig, input);
+  assert.equal(changed.allowed, false);
+  assert.notEqual(changed.reviewId, first.reviewId);
+  assert.equal(changed.environmentAssessment.approvalId, approvalId);
+  assert.deepEqual(JSON.parse(bodies[0]).state.relatedCode, JSON.parse(bodies.at(-1)).state.relatedCode);
 });
