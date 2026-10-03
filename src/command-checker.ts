@@ -12,7 +12,7 @@ import { resolve } from 'node:path';
 import { logEvent } from './logger.js';
 import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
 
-export const COMMAND_EVALUATOR_VERSION = `${EVALUATOR_VERSION}:command-scope-v1:no-command-cache-v1:command-human-review-v1`;
+export const COMMAND_EVALUATOR_VERSION = `${EVALUATOR_VERSION}:command-scope-v1:no-command-cache-v1:command-human-review-v2`;
 
 const MAX_COMMAND_LENGTH = 16_000;
 const MAX_CONTEXT_LENGTH = 16_000;
@@ -93,7 +93,7 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
   const pid = projectId(root);
   const contextHash = sha256(canonicalJson(state));
   const targetKey = input.target?.trim() || 'command';
-  const auditIdentity = { projectId: pid, targetType: 'command', targetKey, fingerprint: buildFingerprint({ projectId: pid, targetType: 'command', targetKey, testSpecific: state, sharedContext: { environment: input.environment }, policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion, evaluatorVersion: COMMAND_EVALUATOR_VERSION }), policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion, evaluatorVersion: COMMAND_EVALUATOR_VERSION };
+  const auditIdentity = { projectId: pid, targetType: 'command', targetKey, fingerprint: buildFingerprint({ projectId: pid, targetType: 'command', targetKey, testSpecific: state, sharedContext: { environment: input.environment, staticFindingsHash: sha256(canonicalJson(staticResult.findings.map((finding) => canonicalJson(finding)).sort())) }, policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion, evaluatorVersion: COMMAND_EVALUATOR_VERSION }), policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion, evaluatorVersion: COMMAND_EVALUATOR_VERSION };
   const exactInputHash = sha256(canonicalJson(input));
   const humanReviewContext: Omit<HumanReviewKey, 'actualModel'> = {
     projectId: pid, targetType: 'command', targetKey, fingerprint: auditIdentity.fingerprint,
@@ -138,7 +138,6 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
       const executionContentUnreviewed = staticResult.findings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed');
       const reason = matchedPolicy?.reason ?? (executionContentUnreviewed ? COMMAND_SCOPE_REVIEW_MESSAGE : 'The command has a moderate probability of being destructive and requires human review.');
       const pending = { ...common, allowed: false, needsHumanReview: true, decision, reason };
-      if (executionContentUnreviewed) { audit(pending, jevDecision); return pending; }
       if (!isVersionedModel(response.model)) {
         const result = { ...pending, errorCode: 'JEV_MODEL_ID_UNVERIFIED', reason: 'The API did not identify a versioned actual model. Human Approval cannot be safely matched; use a provider that reports a jev-X.Y.Z model ID.' };
         audit(result, jevDecision); return result;
@@ -148,7 +147,7 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
         const now = new Date();
         const approved = lookupApprovedHumanReview(db, key, now.toISOString());
         if (approved) {
-          const result = { ...common, allowed: true, needsHumanReview: false, decision: 'allow' as const, reason: 'A valid Human Approval matches the exact command, project, policy, context, and actual model.' };
+          const result = { ...common, allowed: true, needsHumanReview: false, decision: 'allow' as const, approval: { reviewId: approved.reviewId, basis: 'human' as const }, reason: `Human Approval ${approved.reviewId} matches the exact command, project, policy, context, static findings, evaluator version, and actual model.${executionContentUnreviewed ? ' Execution contents remain unverified; the human accepted this uncertainty.' : ''}` };
           markHumanReviewUsed(db, approved.reviewId, now.toISOString());
           audit(result, jevDecision); return result;
         }

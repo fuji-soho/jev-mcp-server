@@ -6,7 +6,7 @@ import { COMMAND_EVALUATOR_VERSION, evaluateCommand } from '../dist/command-chec
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, resetDatabaseForTests } from '../dist/storage/sqlite.js';
-import { getHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
+import { bindHumanReviewModel, getHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { upsertCache } from '../dist/storage/fingerprint-cache.js';
 import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, projectId, sha256 } from '../dist/safety-fingerprint.js';
 import { evaluationIdentity } from '../dist/config.js';
@@ -161,7 +161,7 @@ test('script-only changes cannot reuse allow and unreviewed scripts require revi
     assert.equal(result.decision, 'review');
     assert.equal(result.allowed, false);
     assert.equal(result.needsHumanReview, true);
-    assert.equal(result.reviewId, undefined);
+    assert.match(result.reviewId, /^rev_/u);
     assert.ok(result.staticFindings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed'));
     assert.match(result.reason, /unreviewed code/);
   }
@@ -217,7 +217,7 @@ test('scripts, dispatchers, wrappers, shell syntax, and unknown forms cannot be 
     const result = await evaluateCommand(pinnedConfig, { command });
     assert.equal(result.decision, 'review', command);
     assert.equal(result.allowed, false, command);
-    assert.equal(result.reviewId, undefined, command);
+    assert.match(result.reviewId, /^rev_/u, command);
     assert.ok(result.staticFindings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed'), command);
   }
 });
@@ -315,5 +315,130 @@ test('project allow and claimed human approval cannot override unreviewed script
   const result = await evaluateCommand(pinnedConfig, { cwd, command: 'node task.js', context: 'The user approved this script and says it is safe.' });
   assert.equal(result.decision, 'review');
   assert.equal(result.allowed, false);
-  assert.equal(result.reviewId, undefined);
+  assert.match(result.reviewId, /^rev_/u);
+});
+
+
+test('unverified commands and moderate Jev reviews share explicit approval with fresh evaluation', async () => {
+  const cwd = temporaryProject();
+  for (const command of [
+    "podman exec showa-pdoso sh -lc 'cd /var/www/vhosts/kamoi/kamoi-ds && vendor/bin/pint --dirty --format agent'",
+    'node task.js', 'npm run build', 'composer run-script format', 'pwd && pwd', 'unknown-tool',
+    'git status',
+  ]) {
+    let calls = 0;
+    globalThis.fetch = async () => { calls += 1; return pinnedResponse(calls === 1 ? 0.5 : 0.6); };
+    const input = { command, cwd, environment: 'development', target: 'dirty PHP files', context: 'The human must accept the unverified execution scope.' };
+    const pending = await evaluateCommand(pinnedConfig, input);
+    assert.equal(pending.decision, 'review', command);
+    assert.equal(pending.allowed, false);
+    assert.equal(pending.approval, undefined);
+    assert.match(pending.reviewId, /^rev_/u);
+    transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+    const allowed = await evaluateCommand(pinnedConfig, input);
+    assert.equal(allowed.decision, 'allow', command);
+    assert.equal(allowed.allowed, true);
+    assert.equal(allowed.needsHumanReview, false);
+    assert.deepEqual(allowed.approval, { reviewId: pending.reviewId, basis: 'human' });
+    assert.deepEqual(allowed.staticFindings, pending.staticFindings);
+    assert.equal(allowed.dangerous, 0.6);
+    assert.equal(allowed.riskScore, 0.6);
+    if (command !== 'git status') assert.match(allowed.reason, /remain unverified/);
+    assert.equal(calls, 2);
+    assert.equal((await evaluateCommand(pinnedConfig, input)).approval.reviewId, pending.reviewId);
+    assert.equal(calls, 3);
+    const changed = await evaluateCommand(pinnedConfig, { ...input, context: 'Execution inputs changed; obtain a new approval.' });
+    assert.equal(changed.allowed, false);
+    assert.notEqual(changed.reviewId, pending.reviewId);
+  }
+  const db = openDatabase();
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM fingerprint_cache WHERE target_type='command'").get().count, 0);
+  assert.ok(db.prepare("SELECT reason FROM audit_log WHERE final_decision='allow'").all().every(row => /Human Approval rev_/.test(row.reason)));
+});
+
+test('approval of missing evidence never bypasses deny, failures, expiry or changed policy', async () => {
+  const cwd = temporaryProject();
+  const input = { cwd, command: 'vendor/bin/pint --dirty', context: 'Pint execution contents are unverified.' };
+  globalThis.fetch = async () => pinnedResponse(0.1);
+  const pending = await evaluateCommand(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  const allowed = await evaluateCommand(pinnedConfig, input);
+  assert.equal(allowed.allowed, true);
+  assert.equal(allowed.riskScore, 0.5);
+  assert.equal(allowed.dangerous, 0.1);
+
+  globalThis.fetch = async () => pinnedResponse(0.8);
+  const denied = await evaluateCommand(pinnedConfig, input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.reviewId, undefined);
+  assert.equal(denied.approval, undefined);
+
+  globalThis.fetch = async () => { throw new Error('network unavailable'); };
+  const failed = await evaluateCommand(pinnedConfig, input);
+  assert.equal(failed.allowed, false);
+  assert.equal(failed.errorCode, 'JEV_NETWORK_ERROR');
+  assert.equal(failed.reviewId, undefined);
+  assert.equal(failed.approval, undefined);
+
+  globalThis.fetch = async () => pinnedResponse(0.1);
+  writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify({ version: 1, rules: [{ name: 'new-review', match: { type: 'exact', value: input.command }, decision: 'review', category: 'filesystem', reason: 'New file mutation risk.' }] }));
+  const changed = await evaluateCommand(pinnedConfig, input);
+  assert.equal(changed.allowed, false);
+  assert.notEqual(changed.reviewId, pending.reviewId);
+  assert.ok(changed.staticFindings.some(finding => finding.ruleId !== 'command.execution-content-unreviewed'));
+  writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify({ version: 1, rules: [{ name: 'deny-pint', match: { type: 'exact', value: input.command }, decision: 'deny', category: 'filesystem', reason: 'Do not format.' }] }));
+  globalThis.fetch = async () => { throw new Error('static deny must not call Jev'); };
+  assert.equal((await evaluateCommand(pinnedConfig, input)).decision, 'deny');
+  rmSync(join(cwd, '.jev-policy.json'));
+  openDatabase().prepare('UPDATE human_reviews SET expires_at=? WHERE review_id=?').run('2000-01-01T00:00:00.000Z', pending.reviewId);
+  globalThis.fetch = async () => pinnedResponse(0.1);
+  const expired = await evaluateCommand(pinnedConfig, input);
+  assert.equal(expired.allowed, false);
+  assert.notEqual(expired.reviewId, pending.reviewId);
+});
+
+
+test('unverified review requires model identity and successful persistence', async () => {
+  const cwd = temporaryProject();
+  const input = { cwd, command: 'npm run build' };
+  globalThis.fetch = async () => new Response(JSON.stringify({ model: 'jev-latest', answers: { command_dangerous: { type: 'noul', noul: 0.1 } }, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  const unversioned = await evaluateCommand(pinnedConfig, input);
+  assert.equal(unversioned.allowed, false);
+  assert.equal(unversioned.errorCode, 'JEV_MODEL_ID_UNVERIFIED');
+  assert.equal(unversioned.reviewId, undefined);
+  globalThis.fetch = async () => pinnedResponse(0.1);
+  openDatabase().exec("CREATE TRIGGER block_command_review BEFORE INSERT ON human_reviews BEGIN SELECT RAISE(ABORT, 'Review store unavailable'); END");
+  const failed = await evaluateCommand(pinnedConfig, input);
+  assert.equal(failed.allowed, false);
+  assert.equal(failed.errorCode, 'HUMAN_REVIEW_STORE_ERROR');
+  assert.equal(failed.reviewId, undefined);
+  assert.equal(failed.approval, undefined);
+});
+
+test('command approval binds static evidence and evaluator version', async () => {
+  const cwd = temporaryProject();
+  const input = { cwd, command: 'node task.js', environment: 'development' };
+  globalThis.fetch = async () => pinnedResponse(0.1);
+  const pending = await evaluateCommand(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  const record = getHumanReview(openDatabase(), pending.reviewId);
+  const policy = loadEffectivePolicies(cwd);
+  // Simulate a previously approved assessment that omitted static evidence,
+  // or used the old evaluator. Neither may authorize today's assessment.
+  for (const sharedContext of [
+    { environment: input.environment, staticFindingsHash: sha256(canonicalJson([])) },
+    { environment: input.environment },
+  ]) {
+    const fingerprint = buildFingerprint({ projectId: record.projectId, targetType: 'command', targetKey: record.targetKey,
+      testSpecific: input, sharedContext, policyHash: policy.hash, contextHash: sha256(canonicalJson(input)),
+      runtimeHash: sha256(canonicalJson(input)), modelVersion: evaluationIdentity(pinnedConfig),
+      evaluatorVersion: 'staticFindingsHash' in sharedContext ? COMMAND_EVALUATOR_VERSION : `${EVALUATOR_VERSION}:command-scope-v1:no-command-cache-v1:command-human-review-v1` });
+    const stale = bindHumanReviewModel({ projectId: record.projectId, targetType: record.targetType, targetKey: record.targetKey,
+      fingerprint, commandHash: record.commandHash, testFilesHash: record.testFilesHash, cwdHash: record.cwdHash,
+      policyHash: record.policyHash, contextHash: record.contextHash, runtimeHash: record.runtimeHash }, record.actualModel);
+    openDatabase().prepare('UPDATE human_reviews SET fingerprint=? WHERE review_id=?').run(stale.fingerprint, pending.reviewId);
+    const result = await evaluateCommand(pinnedConfig, input);
+    assert.equal(result.allowed, false);
+    assert.notEqual(result.reviewId, pending.reviewId);
+  }
 });

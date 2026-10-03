@@ -86,15 +86,17 @@
 
 `jev_check_command`は、provider／modelによらずallow cacheを再利用しません。入力とPolicyの検証に成功し、静的`deny`のないチェックでは、毎回Jevを評価します。旧コマンドcacheは履歴としてのみ扱い、テストのcache動作は変更しません。
 
-対応する直接コマンドで現在の静的／Jev評価がreviewを要求し、APIがversion付きの実modelを返した場合、1時間有効な`reviewId`が返ることがあります。正確なcommand、project、target、environment、context、finding、影響を人に提示します。明示承認後はServer発行IDだけを`jev_review_approve`へ渡し、完全に同じ入力を再チェックします。承認はraw command入力、解決済みproject、現在のPolicy、実modelへ一致し、変更時は新しいreviewが必要です。後続のdenyまたは評価障害は常に優先します。承認によってJevの再評価を省略したり、コマンドallow cacheを作成したりしません。
+Jev中リスク、静的review、実行内容の証拠不足を含め、`jev_check_command`のreview評価が正常完了し、APIがversion付きの実model `jev-X.Y.Z`を返し、review storeが利用可能な場合、1時間有効な`reviewId`を発行できます。正確なcommand、project、environment、target、context、finding、影響、未検証範囲を人に提示します。明示承認後はServer発行IDだけを`jev_review_approve`へ渡し、完全に同じ入力で再チェックします。`allowed=true`、`decision=allow`、`needsHumanReview=false`の場合だけ実行します。再チェックでは毎回Jevを呼びます。承認はraw入力、解決済みproject、現在のPolicy、メッセージを含む静的finding、評価器version、実modelに一致する場合だけ有効で、条件変更時は新しいreviewが必要です。一致する承認は期限まで再利用できます。静的／Jev `deny`、不正入力、Policy／API障害、review store障害、versionなしの実modelは承認・迂回できません。承認はコマンドallow cacheを作成しません。
 
 対応範囲は単純な`ls`、`cat`、`mkdir`、`rmdir`、`touch`、`cp`、`mv`、`rm`、任意の引数が`-L`／`-P`だけの`pwd`、READMEに記載した限定optionの`git status`、記載したoptionと`--`以降のパスを使う`git diff --no-ext-diff --no-textconv`です。tokenはASCII英字・数字と`_./:=+-`だけで、space／tabで区切ります。引用符、escape、改行、shell演算子／展開、wrapper、未知の実行ファイル、非対応のGit option／subcommandはreviewが必要です。この分類はPATH、alias／function、binaryの同一性、fsmonitorを含むGit設定、runtime resourceを検証しません。READMEの正確な対応構文を確認し、似たコマンドから対応を推測しないでください。
 
-`staticFindings`に`command.execution-content-unreviewed`がある場合は停止してください。スクリプト本文、依存関係／設定の内容、動的な実行内容は審査されていません。`node task.js`、`python task.py`、`./task.sh`などのスクリプトや、`npm run`、`make`、`composer run-script`などのdispatcherは、Jevが低リスクでも`review`のままです。これらの結果にはコマンド用`reviewId`を発行しません。`jev_review_approve`の呼び出し、allow policyの追加、`context`へのコード／承認申告の追加、人の承認だけで内容不足を解除してはいけません。静的検査／Jevの`deny`は優先します。この条件を回避することだけを目的としてコマンドを簡略化・書き換えてはいけません。
+スクリプト（`node task.js`、`python task.py`、`./task.sh`）、dispatcher（`npm run`、`make`、`composer run-script`）、`podman exec`や`sh -lc`を含むwrapper、非対応構文では、`staticFindings`に`command.execution-content-unreviewed`を保持します。Serverは本文を読み込まず、依存関係／設定、動的実行、コンテナ内部も解決しません。一致する承認がなければJevが低リスクでもreviewです。今回から、人はこの不確実性を明示的に受け入れ、上記フローで承認できます。allow policyの追加や`context`へのコード／承認申告だけでは承認になりません。承認適用後のallowでもfindingと現在のrisk値を保持し、`approval: { "reviewId": "rev_...", "basis": "human" }`を返します。reasonには適用した承認と実行内容が未検証のままであることを記載します。監査reasonには適用review IDを記録し、監査cache statusは引き続きdisabledです。保持されたreview findingだけを理由に最終allowを停止する必要はありません。review回避だけのためにコマンドを書き換えてはいけません。テストには2回目のcommand checkを加えず既存テスト経路を使います。この変更でテストの証拠不足が承認可能になるわけではありません。
 
-コマンド文字列が同じでも、スクリプト本文、関連設定／依存関係、その他の実行入力が変われば再チェックしてください。チェックはファイルをlockせず、実行時の同一性も強制しません。チェックした入力を実行まで維持してください。
+Jevの`dangerous`閾値は変更せず、`0.4`未満はallow、`0.4`以上`0.8`未満はreview、`0.8`以上はdenyとし、より厳しい静的findingを優先します。`riskScore`には静的findingも含み、実行内容の証拠不足だけでも`0.5`になります。承認で数値を下げたり、安全性を保証したりしません。review範囲内の値の変動だけなら再承認は不要です。Pintの`--dirty`は意図したテスト以外の該当dirty PHPファイルも書き換え得ます。`context`の意図した対象は実際の対象を制限しません。
 
-コマンドHuman Reviewへの更新では、旧Serverのプロセスを停止し、更新済みServerを再build／再起動して再チェックしてください。既存schema 8の`human_reviews` tableを使うため、新しいDB移行は不要です。以前のコマンド結果は承認ではないので、Server発行の新しい`reviewId`を取得します。既存履歴とテスト承認は保持します。旧Serverや旧コマンド結果で現行review条件を迂回してはいけません。
+読み取っていないスクリプト本文、依存関係／設定、コンテナ内部はfingerprintに含めず、変更によるコマンド承認失効を自動検出しません。実行入力の変更を把握した場合は、コマンドが同じでも`context`へ変更内容を反映し、新しいreviewを取得します。チェックはファイルをlockせず、実行時の同一性も強制しません。チェックした入力を実行まで維持してください。
+
+移行：旧Serverを停止し、更新後に`npm run build`を実行して再起動し、再チェックしてください。今回のコマンドHuman Review更新はschema 8の`human_reviews`を利用し、DB移行・削除は不要です。評価器versionと静的findingのfingerprint更新により旧コマンド承認は一致しません。Server発行の新しい`reviewId`を取得します。既存の監査／cache履歴とテスト承認は保持します。利用先へコピーした`JEV_POLICY.md`／`JEV_POLICY.ja.md`も更新してください。旧Server、旧Policy、旧結果で現行条件を迂回してはいけません。
 
 ### 読み取り専用操作
 

@@ -7,7 +7,7 @@ const FILE_OPERATIONS = new Set(['ls', 'cat', 'mkdir', 'rmdir', 'touch', 'cp', '
 const STATUS_OPTIONS = new Set(['--short', '-s', '--branch', '-b', '--show-stash', '--porcelain', '--porcelain=v1', '--porcelain=v2', '--long', '--untracked-files', '--untracked-files=no', '--untracked-files=normal', '--untracked-files=all', '--ignored', '--ignored=traditional', '--ignored=matching', '--ignored=no']);
 const DIFF_OPTIONS = new Set(['--no-ext-diff', '--no-textconv', '--stat', '--name-only', '--name-status', '--cached', '--staged']);
 
-export const COMMAND_SCOPE_REVIEW_MESSAGE = 'The command delegates to unreviewed code or is outside the supported direct-command syntax. Script bodies, dependencies, configuration, and dynamic execution are not evaluated; human approval alone cannot resolve this missing evidence.';
+export const COMMAND_SCOPE_REVIEW_MESSAGE = 'The command delegates to unreviewed code or is outside the supported direct-command syntax. Script bodies, dependencies, configuration, and dynamic execution are not evaluated; explicit human approval is required to execute with this unverified scope.';
 
 export function commandScopeFindings(command: string): StaticFinding[] {
   const text = command.replace(/^[ \t]+|[ \t]+$/gu, '');

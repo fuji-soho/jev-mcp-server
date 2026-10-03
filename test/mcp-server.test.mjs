@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
-test('jev_check_command returns unreviewed-content findings through MCP without approval IDs', async () => {
+test('jev_check_command approves unverified execution scope through MCP and preserves findings', async () => {
   const temporary = mkdtempSync('/tmp/jev-mcp-command-scope-');
   const envPath = join(temporary, 'jev.env');
   const preload = join(temporary, 'mock-fetch.mjs');
@@ -25,9 +25,18 @@ test('jev_check_command returns unreviewed-content findings through MCP without 
     assert.equal(result.structuredContent.decision, 'review');
     assert.equal(result.structuredContent.allowed, false);
     assert.equal(result.structuredContent.needsHumanReview, true);
-    assert.equal(result.structuredContent.reviewId, undefined);
+    assert.match(result.structuredContent.reviewId, /^rev_/u);
     assert.equal(result.structuredContent.actualModel, 'jev-1.13.0');
     assert.ok(result.structuredContent.staticFindings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed'));
+    const approval = await client.callTool({ name: 'jev_review_approve', arguments: { reviewId: result.structuredContent.reviewId } });
+    assert.equal(approval.structuredContent.status, 'approved');
+    const rechecked = await client.callTool({ name: 'jev_check_command', arguments: { command: 'node task.js', cwd: temporary } });
+    assert.equal(rechecked.structuredContent.allowed, true);
+    assert.equal(rechecked.structuredContent.needsHumanReview, false);
+    assert.equal(rechecked.structuredContent.decision, 'allow');
+    assert.deepEqual(rechecked.structuredContent.approval, { reviewId: result.structuredContent.reviewId, basis: 'human' });
+    assert.deepEqual(rechecked.structuredContent.staticFindings, result.structuredContent.staticFindings);
+    assert.equal(rechecked.structuredContent.riskScore, 0.5);
     const direct = await client.callTool({ name: 'jev_check_command', arguments: { command: 'pwd', cwd: temporary } });
     assert.equal(direct.structuredContent.decision, 'allow');
   } finally {

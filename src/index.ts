@@ -98,6 +98,7 @@ const outputSchema = {
     dependencyFingerprint: z.string().optional(),
     runnerId: z.string().optional(),
   }).optional(),
+  approval: z.object({ reviewId: z.string(), basis: z.literal('human') }).optional(),
   reviewId: z.string().optional(),
   reviewIds: z.array(z.string()).optional(),
   environmentReviewId: z.string().optional(),
@@ -409,7 +410,7 @@ async function main(): Promise<void> {
     {
       title: 'Check command safety with Jev',
       description:
-        'Evaluate whether a command may destroy or irreversibly modify existing data, databases, files, credentials, or systems. Never reuses command allow cache. A reviewable supported direct command may return a short-lived exact Human Review ID. Scripts, wrappers, unsupported syntax, evaluation failures, and deny results cannot be approved.',
+        'Evaluate whether a command may destroy or irreversibly modify existing data, databases, files, credentials, or systems. Never reuses command allow cache. A successfully evaluated review may return a short-lived exact Human Review ID, including scripts, wrappers and unsupported syntax with unverified execution contents. Explicit human approval and an exact recheck are required; approval does not verify those contents. Evaluation failures and deny results cannot be approved.',
       inputSchema: {
         command: z.string().describe('The command to evaluate; it will not be executed.'),
         cwd: z.string().optional().describe('Optional working directory or project path.'),

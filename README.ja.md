@@ -110,11 +110,26 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 
 tokenに使える文字はASCII英字・数字、`_`、`.`、`/`、`:`、`=`、`+`、`-`だけで、spaceまたはtabで区切ります。先頭・末尾のspaceとtabも許容します。実行ファイル名は上記の名前との完全一致が必要です。引用符、escape、改行、置換、展開、pipeline、redirect、複合コマンド、wrapper、その他のGit option／subcommand、未知の実行ファイルは対象外です。構文一致は毎回の静的検査・Jev評価の対象になるだけで、自動的なallowを意味しません。実行ファイルの解決、PATH、alias／function、インストール済みbinaryの同一性、fsmonitorを含むGit設定、runtime resourceは監査しません。
 
-対応する直接コマンドの評価が`decision=review`となり、APIがversion付きの実model `jev-X.Y.Z`を返した場合、結果にHuman Reviewの`reviewId`が含まれます。人が明示承認した後、そのIDだけを`jev_review_approve`へ渡し、完全に同じ入力で`jev_check_command`を再実行してください。2回目もJevを呼び出し、command、解決済みproject、Policy、environment、target、context、実modelが承認fingerprintと一致する間だけallowになります。Reviewは作成から1時間で失効し、入力またはPolicy変更時は新しいreviewが必要です。後続の静的／Jev `deny`、API障害、review store障害、versionなしの実modelは承認・迂回できません。コマンド承認はallow cacheを作成・再利用しません。
+Jev中リスク、静的review、実行内容の証拠不足を含め、`jev_check_command`のreview評価が正常完了し、APIがversion付きの実model `jev-X.Y.Z`を返し、review storeが利用可能な場合、1時間有効な`reviewId`を発行できます。正確なcommand、project、environment、target、context、finding、影響、未検証範囲を人に提示します。明示承認後はServer発行IDだけを`jev_review_approve`へ渡し、完全に同じ入力で再チェックします。`allowed=true`、`decision=allow`、`needsHumanReview=false`の場合だけ実行します。再チェックでは毎回Jevを呼びます。承認はraw入力、解決済みproject、現在のPolicy、メッセージを含む静的finding、評価器version、実modelに一致する場合だけ有効で、条件変更時は新しいreviewが必要です。一致する承認は期限まで再利用できます。静的／Jev `deny`、不正入力、Policy／API障害、review store障害、versionなしの実modelは承認・迂回できません。承認はコマンドallow cacheを作成しません。
 
-スクリプト（`node task.js`、`python task.py`、`./task.sh`）、dispatcher（`npm run`、`make`、`composer run-script`）、wrapper、その他の非対応構文は、`staticFindings`に`command.execution-content-unreviewed`を追加します。Serverは本文を読み込まず、依存関係・設定も解決しません。Jevが低リスクでも最低限`decision=review`、`allowed=false`、`needsHumanReview=true`を返し、静的検査またはJevの`deny`は優先します。`context`へコードや承認の申告を追加したり、allow policyを設定したりしても、このfindingは解除されません。確認済みテストには2回目のcommand checkを加えず、後述のテスト経路を使用します。この証拠不足の結果には`reviewId`を発行せず、`jev_review_approve`や人の承認だけで解除できません。同じ非対応コマンドの再チェックは引き続き`review`です。
+スクリプト（`node task.js`、`python task.py`、`./task.sh`）、dispatcher（`npm run`、`make`、`composer run-script`）、`podman exec`や`sh -lc`を含むwrapper、非対応構文では、`staticFindings`に`command.execution-content-unreviewed`を保持します。Serverは本文を読み込まず、依存関係／設定、動的実行、コンテナ内部も解決しません。一致する承認がなければJevが低リスクでもreviewです。今回から、人はこの不確実性を明示的に受け入れ、上記フローで承認できます。allow policyの追加や`context`へのコード／承認申告だけでは承認になりません。承認適用後のallowでもfindingと現在のrisk値を保持し、`approval: { "reviewId": "rev_...", "basis": "human" }`を返します。reasonには適用した承認と実行内容が未検証のままであることを記載します。監査reasonには適用review IDを記録し、監査cache statusは引き続きdisabledです。保持されたreview findingだけを理由に最終allowを停止する必要はありません。review回避だけのためにコマンドを書き換えてはいけません。テストには2回目のcommand checkを加えず既存テスト経路を使います。この変更でテストの証拠不足が承認可能になるわけではありません。
 
-移行：旧Serverのプロセスを停止し、更新後に`npm run build`を実行して再起動し、実行前に再チェックしてください。コマンドのHuman Reviewは既存schema 8の`human_reviews` tableを使うため、DB移行・削除は不要です。以前のコマンド結果には再利用可能なコマンド承認がないため、reviewが必要な場合は更新済みServerから新しい`reviewId`を取得します。既存の監査／cache履歴とテスト承認は保持します。旧Serverを同じcacheで動かしたり、現行review規則を迂回するためにdowngradeしたりしないでください。
+Jevの`dangerous`閾値は変更せず、`0.4`未満はallow、`0.4`以上`0.8`未満はreview、`0.8`以上はdenyとし、より厳しい静的findingを優先します。`riskScore`には静的findingも含み、実行内容の証拠不足だけでも`0.5`になります。承認で数値を下げたり、安全性を保証したりしません。review範囲内の値の変動だけなら再承認は不要です。Pintの`--dirty`は意図したテスト以外の該当dirty PHPファイルも書き換え得ます。`context`の意図した対象は実際の対象を制限しません。
+
+読み取っていないスクリプト本文、依存関係／設定、コンテナ内部はfingerprintに含めず、変更によるコマンド承認失効を自動検出しません。実行入力の変更を把握した場合は、コマンドが同じでも`context`へ変更内容を反映し、新しいreviewを取得します。チェックはファイルをlockせず、実行時の同一性も強制しません。チェックした入力を実行まで維持してください。
+
+以下のPintコマンド全体をチェックし、上記の未検証範囲と変更対象を説明して人の承認を得ます。返されたIDだけを承認toolへ渡し、完全に同じ入力で再チェックしてallowの場合だけ実行します。指定可能ならMCPから見えるprojectパスを`cwd`へ追加してください。コマンド内のコンテナパスとは別の名前空間です。
+
+```json
+{
+  "command": "podman exec showa-pdoso sh -lc 'cd /var/www/vhosts/kamoi/kamoi-ds && vendor/bin/pint --dirty --format agent'",
+  "environment": "development",
+  "target": "Git-dirty PHP files",
+  "context": "Format dirty PHP files. The intended target is tests/Feature/EntryTest.php, but other matching dirty PHP files may be rewritten. Pint code, configuration, dependencies and container internals are unverified."
+}
+```
+
+移行：旧Serverを停止し、更新後に`npm run build`を実行して再起動し、再チェックしてください。今回のコマンドHuman Review更新はschema 8の`human_reviews`を利用し、DB移行・削除は不要です。評価器versionと静的findingのfingerprint更新により旧コマンド承認は一致しません。Server発行の新しい`reviewId`を取得します。既存の監査／cache履歴とテスト承認は保持します。利用先へコピーした`JEV_POLICY.md`／`JEV_POLICY.ja.md`も更新してください。旧Server、旧Policy、旧結果で現行条件を迂回してはいけません。
 
 ### User / Project policy
 

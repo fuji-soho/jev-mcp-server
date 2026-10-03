@@ -75,6 +75,7 @@ export interface CommandCheckResult {
   actualModel?: string;
   errorCode?: string;
   reviewId?: string;
+  approval?: { reviewId: string; basis: 'human' };
 }
 
 export interface TestCheckInput {
