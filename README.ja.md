@@ -110,9 +110,11 @@ Codex利用者は、[`examples/AGENTS.ja.md`](examples/AGENTS.ja.md)をプロジ
 
 tokenに使える文字はASCII英字・数字、`_`、`.`、`/`、`:`、`=`、`+`、`-`だけで、spaceまたはtabで区切ります。先頭・末尾のspaceとtabも許容します。実行ファイル名は上記の名前との完全一致が必要です。引用符、escape、改行、置換、展開、pipeline、redirect、複合コマンド、wrapper、その他のGit option／subcommand、未知の実行ファイルは対象外です。構文一致は毎回の静的検査・Jev評価の対象になるだけで、自動的なallowを意味しません。実行ファイルの解決、PATH、alias／function、インストール済みbinaryの同一性、fsmonitorを含むGit設定、runtime resourceは監査しません。
 
-スクリプト（`node task.js`、`python task.py`、`./task.sh`）、dispatcher（`npm run`、`make`、`composer run-script`）、wrapper、その他の非対応構文は、`staticFindings`に`command.execution-content-unreviewed`を追加します。Serverは本文を読み込まず、依存関係・設定も解決しません。Jevが低リスクでも最低限`decision=review`、`allowed=false`、`needsHumanReview=true`を返し、静的検査またはJevの`deny`は優先します。`context`へコードや承認の申告を追加したり、allow policyを設定したりしても、このfindingは解除されません。コマンドチェックでは`reviewId`を発行せず、`jev_review_approve`や人の承認だけで実行内容の不足を解除することもできません。同じ非対応コマンドの再チェックは引き続き`review`となり、このリリースではスクリプトの自動承認を提供しません。
+対応する直接コマンドの評価が`decision=review`となり、APIがversion付きの実model `jev-X.Y.Z`を返した場合、結果にHuman Reviewの`reviewId`が含まれます。人が明示承認した後、そのIDだけを`jev_review_approve`へ渡し、完全に同じ入力で`jev_check_command`を再実行してください。2回目もJevを呼び出し、command、解決済みproject、Policy、environment、target、context、実modelが承認fingerprintと一致する間だけallowになります。Reviewは作成から1時間で失効し、入力またはPolicy変更時は新しいreviewが必要です。後続の静的／Jev `deny`、API障害、review store障害、versionなしの実modelは承認・迂回できません。コマンド承認はallow cacheを作成・再利用しません。
 
-移行：旧Serverのプロセスを停止し、更新後に`npm run build`を実行して再起動し、実行前に再チェックしてください。コマンド用evaluatorに`command-scope-v1:no-command-cache-v1`を追加します。この以前のコマンド専用更新自体にはDB移行・削除は不要でした。現行リリースは後述のschema 8へ移行します。このコマンド専用の更新によって、既存の監査／cache履歴、テストcache、テストのHuman Review、一致するEnvironment Approval、テストのExecution Ticketは失効しません。旧Serverは旧コマンドcacheを再利用できるため、同じcacheとの併用や、reviewを迂回するためのダウングレードは行わないでください。
+スクリプト（`node task.js`、`python task.py`、`./task.sh`）、dispatcher（`npm run`、`make`、`composer run-script`）、wrapper、その他の非対応構文は、`staticFindings`に`command.execution-content-unreviewed`を追加します。Serverは本文を読み込まず、依存関係・設定も解決しません。Jevが低リスクでも最低限`decision=review`、`allowed=false`、`needsHumanReview=true`を返し、静的検査またはJevの`deny`は優先します。`context`へコードや承認の申告を追加したり、allow policyを設定したりしても、このfindingは解除されません。確認済みテストには2回目のcommand checkを加えず、後述のテスト経路を使用します。この証拠不足の結果には`reviewId`を発行せず、`jev_review_approve`や人の承認だけで解除できません。同じ非対応コマンドの再チェックは引き続き`review`です。
+
+移行：旧Serverのプロセスを停止し、更新後に`npm run build`を実行して再起動し、実行前に再チェックしてください。コマンドのHuman Reviewは既存schema 8の`human_reviews` tableを使うため、DB移行・削除は不要です。以前のコマンド結果には再利用可能なコマンド承認がないため、reviewが必要な場合は更新済みServerから新しい`reviewId`を取得します。既存の監査／cache履歴とテスト承認は保持します。旧Serverを同じcacheで動かしたり、現行review規則を迂回するためにdowngradeしたりしないでください。
 
 ### User / Project policy
 

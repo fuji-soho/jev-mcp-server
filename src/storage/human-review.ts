@@ -5,7 +5,7 @@ import { canonicalJson, sha256 } from '../safety-fingerprint.js';
 
 export interface HumanReviewKey {
   projectId: string;
-  targetType: 'test-file' | 'test-execution';
+  targetType: 'command' | 'test-file' | 'test-execution';
   targetKey: string;
   fingerprint: string;
   commandHash: string;

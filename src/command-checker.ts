@@ -1,4 +1,4 @@
-import { evaluationIdentity, type Config } from './config.js';
+import { evaluationIdentity, isVersionedModel, type Config } from './config.js';
 import { checkCommandWithJev, JevError } from './cloudflare-jev.js';
 import { findPolicyMatches, loadEffectivePolicies, strictestDecision } from './policy.js';
 import type { CommandCheckInput, CommandCheckResult, PolicyFinding, RiskCategory, StaticFinding } from './types.js';
@@ -10,8 +10,9 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { logEvent } from './logger.js';
+import { bindHumanReviewModel, createOrGetHumanReview, lookupApprovedHumanReview, markHumanReviewUsed, type HumanReviewKey } from './storage/human-review.js';
 
-export const COMMAND_EVALUATOR_VERSION = `${EVALUATOR_VERSION}:command-scope-v1:no-command-cache-v1`;
+export const COMMAND_EVALUATOR_VERSION = `${EVALUATOR_VERSION}:command-scope-v1:no-command-cache-v1:command-human-review-v1`;
 
 const MAX_COMMAND_LENGTH = 16_000;
 const MAX_CONTEXT_LENGTH = 16_000;
@@ -93,6 +94,12 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
   const contextHash = sha256(canonicalJson(state));
   const targetKey = input.target?.trim() || 'command';
   const auditIdentity = { projectId: pid, targetType: 'command', targetKey, fingerprint: buildFingerprint({ projectId: pid, targetType: 'command', targetKey, testSpecific: state, sharedContext: { environment: input.environment }, policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion, evaluatorVersion: COMMAND_EVALUATOR_VERSION }), policyHash: staticResult.policyHash, contextHash, runtimeHash: contextHash, modelVersion, evaluatorVersion: COMMAND_EVALUATOR_VERSION };
+  const exactInputHash = sha256(canonicalJson(input));
+  const humanReviewContext: Omit<HumanReviewKey, 'actualModel'> = {
+    projectId: pid, targetType: 'command', targetKey, fingerprint: auditIdentity.fingerprint,
+    commandHash: sha256(input.command), testFilesHash: sha256(canonicalJson([])), cwdHash: sha256(root),
+    policyHash: staticResult.policyHash, contextHash: exactInputHash, runtimeHash: exactInputHash,
+  };
   let db;
   try { db = openDatabase(); } catch { db = undefined; }
   const staticDecision = strictestDecision(staticResult.findings.map((finding) => finding.decision).concat(staticResult.policyFindings.map((finding) => finding.decision)));
@@ -123,7 +130,38 @@ export async function evaluateCommand(config: Config, input: CommandCheckInput):
     const decision = strictestDecision([jevDecision, deny === undefined ? 'allow' : 'deny', review === undefined ? 'allow' : 'review']);
     const matchedPolicy = staticResult.policyFindings.find((finding) => finding.decision === decision);
     const common = { ...evaluation, actualModel: response.model, ok: true, dangerous, categories, riskScore, risks, staticFindings: staticResult.findings, policyFindings: staticResult.policyFindings, policyVersion: staticResult.policyVersion, model: 'combined' as const };
-    const result = decision === 'deny' ? { ...common, allowed: false, needsHumanReview: false, decision, reason: matchedPolicy?.reason ?? 'The command has a high probability of causing destructive or irreversible changes.' } : decision === 'review' ? { ...common, allowed: false, needsHumanReview: true, decision, reason: matchedPolicy?.reason ?? (staticResult.findings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed') ? COMMAND_SCOPE_REVIEW_MESSAGE : 'The command has a moderate probability of being destructive and requires human review.') } : { ...common, allowed: true, needsHumanReview: false, decision, reason: 'No clear destructive risk was found in the command, context, or configured safety policies.' };
+    if (decision === 'deny') {
+      const result = { ...common, allowed: false, needsHumanReview: false, decision, reason: matchedPolicy?.reason ?? 'The command has a high probability of causing destructive or irreversible changes.' };
+      audit(result, jevDecision); return result;
+    }
+    if (decision === 'review') {
+      const executionContentUnreviewed = staticResult.findings.some((finding) => finding.ruleId === 'command.execution-content-unreviewed');
+      const reason = matchedPolicy?.reason ?? (executionContentUnreviewed ? COMMAND_SCOPE_REVIEW_MESSAGE : 'The command has a moderate probability of being destructive and requires human review.');
+      const pending = { ...common, allowed: false, needsHumanReview: true, decision, reason };
+      if (executionContentUnreviewed) { audit(pending, jevDecision); return pending; }
+      if (!isVersionedModel(response.model)) {
+        const result = { ...pending, errorCode: 'JEV_MODEL_ID_UNVERIFIED', reason: 'The API did not identify a versioned actual model. Human Approval cannot be safely matched; use a provider that reports a jev-X.Y.Z model ID.' };
+        audit(result, jevDecision); return result;
+      }
+      const key = bindHumanReviewModel(humanReviewContext, response.model);
+      if (db) {
+        const now = new Date();
+        const approved = lookupApprovedHumanReview(db, key, now.toISOString());
+        if (approved) {
+          const result = { ...common, allowed: true, needsHumanReview: false, decision: 'allow' as const, reason: 'A valid Human Approval matches the exact command, project, policy, context, and actual model.' };
+          markHumanReviewUsed(db, approved.reviewId, now.toISOString());
+          audit(result, jevDecision); return result;
+        }
+        try {
+          const review = createOrGetHumanReview(db, key, now.toISOString(), new Date(now.getTime() + 60 * 60 * 1000).toISOString());
+          const result = { ...pending, reviewId: review.reviewId };
+          audit(result, jevDecision); return result;
+        } catch { /* fail closed without an approvable ID */ }
+      }
+      const result = { ...pending, errorCode: 'HUMAN_REVIEW_STORE_ERROR', reason: 'The Human Review could not be stored. Recheck after the review store is available.' };
+      audit(result, jevDecision); return result;
+    }
+    const result = { ...common, allowed: true, needsHumanReview: false, decision, reason: 'No clear destructive risk was found in the command, context, or configured safety policies.' };
     audit(result, jevDecision); return result;
   } catch (error) {
     if (error instanceof JevError) { const result = { ...reviewResult('Jev could not complete the safety check. Human review is required before execution.', error.code, staticResult.findings, staticResult.policyFindings, staticResult.policyVersion), ...evaluation }; audit(result); return result; }

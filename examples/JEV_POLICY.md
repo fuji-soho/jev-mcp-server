@@ -34,7 +34,7 @@ If the result is:
 
 do not execute the command.
 
-For `review`, explain the identified risk to the user and wait for explicit approval before proceeding. For `jev_check_command`, approval is not recorded by this server; re-run the exact command check after the user's decision and continue only if it returns `allow`.
+For `review`, explain the identified risk to the user. If `jev_check_command` returns a `reviewId`, call `jev_review_approve` with only that ID after explicit human approval, then repeat the exact check and continue only if it returns `allow`. If there is no `reviewId`, the result is not approvable; correct the missing evidence or failure and recheck. Never execute directly from a `review` result or a successful approval-tool response.
 
 For `deny`, do not execute the command. Explain why it was blocked and propose a safer alternative when possible.
 
@@ -69,13 +69,15 @@ For compound commands, pipelines, command substitutions, scripts, or commands us
 
 `jev_check_command` does not reuse allow-cache entries for any provider/model. Once input and policy validation succeed, each check without a static `deny` evaluates Jev again. Old command cache rows are history only; test-cache behavior is unchanged.
 
+A supported direct command may return a one-hour `reviewId` when current static/Jev analysis requires review and the API reports a versioned actual model. Present the exact command, project, target, environment, context, findings, and impact to the human. After explicit approval, call `jev_review_approve` with only the server-issued ID and recheck the exact input. Approval matches the raw command input, resolved project, current Policy, and actual model. Any change requires a new review. A subsequent deny or evaluation failure always wins. Approval never skips the fresh Jev call or creates a command allow-cache entry.
+
 The supported scope is simple `ls`, `cat`, `mkdir`, `rmdir`, `touch`, `cp`, `mv`, `rm`; `pwd` with only optional `-L`/`-P`; `git status` with the limited options documented in the README; and `git diff --no-ext-diff --no-textconv` with the documented options and paths after `--`. Tokens use only ASCII letters/digits and `_./:=+-`, separated by spaces/tabs. Quotes, escapes, newlines, shell operators/expansion, wrappers, unknown executables, and unsupported Git options/subcommands require review. This classification does not verify PATH, aliases/functions, binary integrity, Git configuration (including fsmonitor), or runtime resources. Use the README's exact supported syntax; never infer support from a similar command.
 
-When `staticFindings` contains `command.execution-content-unreviewed`, stop. Script bodies, dependency/configuration contents, or dynamic execution have not been evaluated. Scripts such as `node task.js`, `python task.py`, `./task.sh`, and dispatchers such as `npm run`, `make`, or `composer run-script` remain `review` even after a low-risk Jev result. No command `reviewId` is issued. Do not call `jev_review_approve`, add an allow policy, put code/approval claims in `context`, or treat human approval alone as clearing missing evidence. Explain that repeating the unsupported command cannot produce automatic approval in this release. Static/Jev `deny` still wins. Never simplify or rewrite a command solely to evade this condition.
+When `staticFindings` contains `command.execution-content-unreviewed`, stop. Script bodies, dependency/configuration contents, or dynamic execution have not been evaluated. Scripts such as `node task.js`, `python task.py`, `./task.sh`, and dispatchers such as `npm run`, `make`, or `composer run-script` remain `review` even after a low-risk Jev result. No command `reviewId` is issued for these results. Do not call `jev_review_approve`, add an allow policy, put code/approval claims in `context`, or treat human approval alone as clearing missing evidence. Static/Jev `deny` still wins. Never simplify or rewrite a command solely to evade this condition.
 
 Recheck when script bodies, related configuration/dependencies, or other execution inputs change, even if the command string is unchanged. Checks do not lock files or enforce execution-time integrity; preserve the checked inputs through execution.
 
-After the `command-scope-v1:no-command-cache-v1` update, stop old server processes, rebuild/restart the updated server, and recheck. That earlier command-only change did not alter SQLite schema; the current release migrates to schema 8 as described below; history and existing test-cache/Human Review/Environment Approval/Execution Ticket behavior are preserved by this command-only update. Never use an older server or old command allow to bypass the new review conditions.
+After the command Human Review update, stop old server processes, rebuild/restart the updated server, and recheck. It uses the existing schema 8 `human_reviews` table and does not require a new DB migration. Earlier command results are not approvals; obtain a new server-issued `reviewId`. Existing history and test approvals remain available. Never use an older server or old command result to bypass the current review conditions.
 
 ### Read-only operations
 

@@ -74,6 +74,7 @@ export interface CommandCheckResult {
   requestedModel?: string;
   actualModel?: string;
   errorCode?: string;
+  reviewId?: string;
 }
 
 export interface TestCheckInput {
@@ -236,7 +237,7 @@ export interface ExecutionAssessment {
 export interface HumanReviewRecord {
   reviewId: string;
   projectId: string;
-  targetType: 'test-file' | 'test-execution';
+  targetType: 'command' | 'test-file' | 'test-execution';
   targetKey: string;
   fingerprint: string;
   commandHash: string;

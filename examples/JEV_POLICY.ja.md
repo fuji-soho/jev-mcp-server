@@ -32,7 +32,7 @@
 - `allowed=false`
 - `needsHumanReview=true`
 
-`review` の場合は、検出されたリスクをユーザーへ説明し、明示的な承認を得るまで実行しないでください。`jev_check_command` の判定はこのServerに承認記録を保存しないため、ユーザーの判断後も完全に同じコマンドを再チェックし、`allow` の場合だけ続行してください。
+`review`の場合は、検出されたリスクをユーザーへ説明してください。`jev_check_command`が`reviewId`を返した場合だけ、人の明示承認後にそのIDだけを`jev_review_approve`へ渡し、完全に同じ内容を再チェックして`allow`の場合だけ続行します。`reviewId`がなければ承認不可なので、不足証拠または障害を修正して再チェックしてください。`review`結果や承認toolの成功応答だけから直接実行してはいけません。
 
 `deny` の場合は実行しないでください。ブロックされた理由を説明し、可能であればより安全な代替手段を提示してください。
 
@@ -86,13 +86,15 @@
 
 `jev_check_command`は、provider／modelによらずallow cacheを再利用しません。入力とPolicyの検証に成功し、静的`deny`のないチェックでは、毎回Jevを評価します。旧コマンドcacheは履歴としてのみ扱い、テストのcache動作は変更しません。
 
+対応する直接コマンドで現在の静的／Jev評価がreviewを要求し、APIがversion付きの実modelを返した場合、1時間有効な`reviewId`が返ることがあります。正確なcommand、project、target、environment、context、finding、影響を人に提示します。明示承認後はServer発行IDだけを`jev_review_approve`へ渡し、完全に同じ入力を再チェックします。承認はraw command入力、解決済みproject、現在のPolicy、実modelへ一致し、変更時は新しいreviewが必要です。後続のdenyまたは評価障害は常に優先します。承認によってJevの再評価を省略したり、コマンドallow cacheを作成したりしません。
+
 対応範囲は単純な`ls`、`cat`、`mkdir`、`rmdir`、`touch`、`cp`、`mv`、`rm`、任意の引数が`-L`／`-P`だけの`pwd`、READMEに記載した限定optionの`git status`、記載したoptionと`--`以降のパスを使う`git diff --no-ext-diff --no-textconv`です。tokenはASCII英字・数字と`_./:=+-`だけで、space／tabで区切ります。引用符、escape、改行、shell演算子／展開、wrapper、未知の実行ファイル、非対応のGit option／subcommandはreviewが必要です。この分類はPATH、alias／function、binaryの同一性、fsmonitorを含むGit設定、runtime resourceを検証しません。READMEの正確な対応構文を確認し、似たコマンドから対応を推測しないでください。
 
-`staticFindings`に`command.execution-content-unreviewed`がある場合は停止してください。スクリプト本文、依存関係／設定の内容、動的な実行内容は審査されていません。`node task.js`、`python task.py`、`./task.sh`などのスクリプトや、`npm run`、`make`、`composer run-script`などのdispatcherは、Jevが低リスクでも`review`のままです。コマンド用の`reviewId`は発行しません。`jev_review_approve`の呼び出し、allow policyの追加、`context`へのコード／承認申告の追加、人の承認だけで内容不足を解除してはいけません。このリリースでは、同じ非対応コマンドを繰り返しても自動承認されないことを説明してください。静的検査／Jevの`deny`は優先します。この条件を回避することだけを目的としてコマンドを簡略化・書き換えてはいけません。
+`staticFindings`に`command.execution-content-unreviewed`がある場合は停止してください。スクリプト本文、依存関係／設定の内容、動的な実行内容は審査されていません。`node task.js`、`python task.py`、`./task.sh`などのスクリプトや、`npm run`、`make`、`composer run-script`などのdispatcherは、Jevが低リスクでも`review`のままです。これらの結果にはコマンド用`reviewId`を発行しません。`jev_review_approve`の呼び出し、allow policyの追加、`context`へのコード／承認申告の追加、人の承認だけで内容不足を解除してはいけません。静的検査／Jevの`deny`は優先します。この条件を回避することだけを目的としてコマンドを簡略化・書き換えてはいけません。
 
 コマンド文字列が同じでも、スクリプト本文、関連設定／依存関係、その他の実行入力が変われば再チェックしてください。チェックはファイルをlockせず、実行時の同一性も強制しません。チェックした入力を実行まで維持してください。
 
-`command-scope-v1:no-command-cache-v1`への更新では、旧Serverのプロセスを停止し、更新済みServerを再build／再起動して再チェックしてください。この以前のコマンド専用更新はschemaを変更せず、現行リリースはschema 8へ移行します。このコマンド専用更新により履歴や、既存テストcache／Human Review／Environment Approval／Execution Ticketの動作は変更しません。旧Serverや旧コマンドallowで新しいreview条件を迂回してはいけません。
+コマンドHuman Reviewへの更新では、旧Serverのプロセスを停止し、更新済みServerを再build／再起動して再チェックしてください。既存schema 8の`human_reviews` tableを使うため、新しいDB移行は不要です。以前のコマンド結果は承認ではないので、Server発行の新しい`reviewId`を取得します。既存履歴とテスト承認は保持します。旧Serverや旧コマンド結果で現行review条件を迂回してはいけません。
 
 ### 読み取り専用操作
 

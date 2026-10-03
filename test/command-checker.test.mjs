@@ -6,6 +6,7 @@ import { COMMAND_EVALUATOR_VERSION, evaluateCommand } from '../dist/command-chec
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, resetDatabaseForTests } from '../dist/storage/sqlite.js';
+import { getHumanReview, transitionHumanReview } from '../dist/storage/human-review.js';
 import { upsertCache } from '../dist/storage/fingerprint-cache.js';
 import { buildFingerprint, canonicalJson, EVALUATOR_VERSION, projectId, sha256 } from '../dist/safety-fingerprint.js';
 import { evaluationIdentity } from '../dist/config.js';
@@ -226,6 +227,78 @@ test('supported direct commands still require and may pass fresh Jev evaluation'
   for (const command of ['pwd', 'pwd -P', 'git status --short --branch', 'git status --porcelain=v2', 'git diff --no-ext-diff --no-textconv --stat -- src/file.ts', 'ls src', 'cat README.md', 'mkdir new-dir', 'rmdir empty-dir', 'touch file.txt', 'cp a b', 'mv a b', 'rm file.txt', '  pwd\t-P  ']) {
     assert.equal((await evaluateCommand(pinnedConfig, { command })).decision, 'allow', command);
   }
+});
+
+test('a supported direct command review can be approved only for its exact current identity', async () => {
+  const cwd = temporaryProject();
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return pinnedResponse(0.5); };
+  const input = { command: 'rm -r build', cwd, environment: 'development', target: 'generated build directory', context: 'remove generated output' };
+  const pending = await evaluateCommand(pinnedConfig, input);
+  assert.equal(pending.decision, 'review');
+  assert.match(pending.reviewId, /^rev_/u);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  const allowed = await evaluateCommand(pinnedConfig, input);
+  assert.equal(allowed.decision, 'allow');
+  assert.equal(allowed.allowed, true);
+  assert.equal(allowed.needsHumanReview, false);
+  assert.equal(getHumanReview(openDatabase(), pending.reviewId).usedAt !== undefined, true);
+  assert.equal(calls, 2, 'approval never bypasses fresh Jev evaluation');
+
+  for (const changed of [
+    { ...input, command: 'rm -r dist' },
+    { ...input, target: 'different target' },
+    { ...input, context: 'different context' },
+    { ...input, environment: 'staging' },
+  ]) {
+    const result = await evaluateCommand(pinnedConfig, changed);
+    assert.equal(result.allowed, false);
+    assert.equal(result.decision, 'review');
+    assert.match(result.reviewId, /^rev_/u);
+    assert.notEqual(result.reviewId, pending.reviewId);
+  }
+});
+
+test('command approval cannot override a later Jev deny or an unversioned model', async () => {
+  const cwd = temporaryProject();
+  const input = { command: 'rm -r build', cwd };
+  globalThis.fetch = async () => pinnedResponse(0.5);
+  const pending = await evaluateCommand(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+  globalThis.fetch = async () => pinnedResponse(0.9);
+  const denied = await evaluateCommand(pinnedConfig, input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.allowed, false);
+
+  globalThis.fetch = async () => new Response(JSON.stringify({ model: 'jev-latest', answers: { command_dangerous: { type: 'noul', noul: 0.5 } }, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  const unversioned = await evaluateCommand({ ...pinnedConfig, requestedModel: 'jev-latest' }, input);
+  assert.equal(unversioned.errorCode, 'JEV_MODEL_ID_UNVERIFIED');
+  assert.equal(unversioned.reviewId, undefined);
+});
+
+test('command approval expires and cannot cross project, policy, or actual-model changes', async () => {
+  const cwd = temporaryProject();
+  const input = { command: 'rm -r build', cwd };
+  globalThis.fetch = async () => pinnedResponse(0.5);
+  const pending = await evaluateCommand(pinnedConfig, input);
+  transitionHumanReview(openDatabase(), pending.reviewId, 'approve', new Date().toISOString());
+
+  const otherProject = await evaluateCommand(pinnedConfig, { ...input, cwd: temporaryProject() });
+  assert.notEqual(otherProject.reviewId, pending.reviewId);
+  writeFileSync(join(cwd, '.jev-policy.json'), JSON.stringify({ version: 1, rules: [{ name: 'review-build-removal', match: { type: 'exact', value: input.command }, decision: 'review', category: 'filesystem', reason: 'Review generated output removal.' }] }));
+  const changedPolicy = await evaluateCommand(pinnedConfig, input);
+  assert.notEqual(changedPolicy.reviewId, pending.reviewId);
+
+  rmSync(join(cwd, '.jev-policy.json'));
+  globalThis.fetch = async () => new Response(JSON.stringify({ model: 'jev-1.14.0', answers: { command_dangerous: { type: 'noul', noul: 0.5 } }, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  const changedModel = await evaluateCommand(pinnedConfig, input);
+  assert.notEqual(changedModel.reviewId, pending.reviewId);
+
+  openDatabase().prepare('UPDATE human_reviews SET expires_at=? WHERE review_id=?').run('2000-01-01T00:00:00.000Z', pending.reviewId);
+  globalThis.fetch = async () => pinnedResponse(0.5);
+  const expired = await evaluateCommand(pinnedConfig, input);
+  assert.notEqual(expired.reviewId, pending.reviewId);
+  assert.equal(getHumanReview(openDatabase(), pending.reviewId).status, 'expired');
 });
 
 test('Jev deny wins over missing command evidence and static deny avoids the API', async () => {
