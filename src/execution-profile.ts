@@ -2,11 +2,13 @@ import { lstatSync, readFileSync, realpathSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { SaxesParser } from 'saxes';
+import { inspectRunner } from './runner-review.js';
 import { canonicalJson, digestPaths, projectId, readRelatedCode, relativeTarget, resolveTestRoot, sha256, type RelatedCodeFile, type FileManifestEntry } from './safety-fingerprint.js';
 import { loadEffectivePolicies, loadEffectiveTestPolicies } from './policy.js';
 import type { TestCheckInput } from './types.js';
 
-export const EXECUTION_VERIFIER_VERSION = 'jev-test-execution-v1';
+export const EXECUTION_VERIFIER_VERSION = 'jev-test-execution-v2';
+export const DB_EXECUTION_VERIFIER_VERSION = 'jev-db-execution-v2';
 export { executionProfileSchema } from './execution-schema.js';
 import { executionProfileSchema, type ExecutionProfile, type ExecutionConditions } from './execution-schema.js';
 import { parseExecutionInvocation, resolveExecutionConditions, conditionsProfile, wrapExecutionCommand, mappedHostWorkdir } from './execution-conditions.js';
@@ -313,9 +315,18 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
   const runner = evidence.find(f => f.key === profile.runner.file)!;
   if (!runner) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner must be a source file, not dependency metadata.', profile.runner.file);
   if (!runner.content.includes(profile.runner.testEntry)) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner source must reference the declared PHPUnit entry; confirm its complete invocation and argument forwarding.', profile.runner.file);
-  for (const file of profile.runner.safetyFiles) if (!runner.content.includes(file) && !runner.content.includes(file.split('/').at(-1)!)) stop('EXECUTION_CHAIN_UNRESOLVED', 'The runner must reference every declared safety file; confirm the guard loading path.', profile.runner.file);
-  // The PHP runner is a human-reviewed boundary, not an arbitrary shell resolver.
-  if (/\b(?:eval|shell_exec|passthru|system)\s*\(|\b(?:sh|bash)\s+-[lc]/u.test(runner.content)) stop('EXECUTION_CHAIN_UNRESOLVED', 'Dynamic shell/eval execution inside the runner is unsupported.', profile.runner.file);
+  // Guard loading is a human-reviewed boundary; filename mentions cannot prove execution.
+  for (const file of profile.runner.safetyFiles) if (!evidence.some(f => f.key === file)) stop('EXECUTION_EVIDENCE_INCOMPLETE', 'Declared safety files must contain reviewable source, not dependency metadata.', file);
+  let runnerReview;
+  try { runnerReview = inspectRunner(runner.content, profile.runner.testEntry); }
+  catch (error) { throw new ExecutionEvidenceError('EXECUTION_CHAIN_UNRESOLVED', error instanceof Error ? error.message : 'Runner process invocation is unsupported.', profile.runner.file, evidence); }
+  if (runnerReview.needsLaravelBootstrap) {
+    const preparation = readRelatedCode(root, ['artisan', 'bootstrap/app.php']);
+    if (preparation.status !== 'complete') throw new ExecutionEvidenceError('EXECUTION_EVIDENCE_INCOMPLETE', preparation.reason, preparation.file, [...evidence, ...preparation.files]);
+    for (const required of ['artisan', 'bootstrap/app.php']) if (!preparation.files.some(f => f.key === required)) throw new ExecutionEvidenceError('EXECUTION_EVIDENCE_INCOMPLETE', 'Preparation entry must be a regular source file.', required, [...evidence, ...preparation.files]);
+    for (const file of preparation.files) if (!evidence.some(f => f.key === file.key)) evidence.push(file);
+    evidencePaths.push('artisan', 'bootstrap/app.php');
+  }
   let files: string[] = [];
   if (!approvalOnly) {
     if (selected.length) files = [...selected].sort();
@@ -335,7 +346,7 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
   const policyHash = sha256(canonicalJson({ command: commandPolicies.hash, test: testPolicies.hash }));
   const runtimeEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(?:PATH|PHP|COMPOSER|APP_|DB_|XDG_CONFIG_HOME)/u.test(key)).map(([key, value]) => [key, sha256(value ?? '')]));
   const manifest = [...evidence, ...(evidenceSnapshot.metadata ?? [])].sort((a, b) => a.key.localeCompare(b.key)).map(({ key, digest, bytes }) => ({ key, digest, bytes }));
-  const fingerprint = sha256(canonicalJson({ version: conditions ? 'jev-db-execution-v1' : EXECUTION_VERIFIER_VERSION, project: projectId(hostRoot), profileDigest,
+  const fingerprint = sha256(canonicalJson({ version: conditions ? DB_EXECUTION_VERIFIER_VERSION : EXECUTION_VERIFIER_VERSION, project: projectId(hostRoot), profileDigest,
     baseCommand, chain: chain.map(v => sha256(v)), manifest, autoManifest, vendorFingerprint, policyHash,
     runtime: container ? { target: conditions!.target, verification: 'human-approved-container' } : { php: executableDigest(profile.runtime.php), composer: composerRuntime ?? null,
       config: profile.runtime.configFiles.map(path => {
@@ -345,7 +356,9 @@ export function snapshotExecution(input: TestCheckInput, approvalOnly = false): 
       }), environment: runtimeEnvironment } }));
   const scope = { source: conditions ? 'db' : 'profile', ...(conditions ? { conditions } : {}), verification: container ? 'human-approved-container' : 'local-runtime-inspected', containerInternalsVerified: false, projectRoot: hostRoot, hostWorkingDirectory: root, name: profile.name, command: baseCommand, chain, entry: profile.entry, runner: profile.runner, selectors: profile.selectors,
     resources: profile.resources, files: manifest.map(f => f.key), changeDetection: {sources:manifest, automaticFiles:autoManifest, localVendorFingerprint:container ? null : vendorFingerprint, policyHash}, ...(container ? {} : { runtime: profile.runtime }), composerPluginMode: composerRuntime?.noPlugins ? 'disabled' : container ? 'human-approved-container' : 'absence-inspected',
-    reviewBoundary: 'Review the complete PHP runner, guard loading, PHPUnit invocation and argument forwarding. This is not automatic PHP dependency resolution.' };
+    runnerVerification: { version: 'runner-review-v2', processInvocations: runnerReview.processes, guardLoadingVerified: false, guardApplicabilityVerified: false, resourceIsolationVerified: false,
+      preparationFiles: runnerReview.needsLaravelBootstrap ? ['artisan', 'bootstrap/app.php'] : [] },
+    reviewBoundary: 'Human review must confirm guard loading via PHPUnit/autoload/test inheritance, guard coverage and ordering before DB access, subprocess targets and selector forwarding, exit handling and cache restoration. Review Laravel startup before PHPUnit (including artisan config:clear) for DB access and side effects. Filename mentions and caller context do not prove enforcement. This is bounded syntax inspection, not automatic PHP dependency resolution or runtime isolation proof.' };
   return { root, projectRoot:hostRoot, profilePath, profile, ...(conditions ? { conditions } : {}), ...(conditionId ? {conditionId} : {}), fingerprint, policyHash, scope, evidence, related: relatedSnapshot.files, metadata: relatedSnapshot.metadata ?? [],
     dependencyFingerprint: relatedSnapshot.fingerprint, files, executionFingerprint: sha256(canonicalJson({ command: sha256(input.command), files, filter: filter === undefined ? null : sha256(filter), fingerprint })), baseCommand };
 }

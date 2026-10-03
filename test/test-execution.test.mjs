@@ -266,3 +266,15 @@ test('explicit Profile v3 treats large composer.lock as metadata in evidence and
   f.put('composer.lock', JSON.stringify({ packages: [], marker: marker.repeat(10000) }) + '\n');
   assert.notEqual((await evaluateTest(config, f.input)).executionReviewId, id);
 });
+
+
+test('explicit Profile v3 supports indirect guards and reviewed fixed passthru', async () => {
+  const f = fixture(), calls = mock();
+  f.put('scripts/test-safe.php', "<?php $cmd = escapeshellarg(PHP_BINARY).' vendor/bin/phpunit'; passthru($cmd, $status); exit($status);");
+  const id = await approve(f);
+  const result = await evaluateTest(config, f.input);
+  assert.equal(result.allowed, true, JSON.stringify(result));
+  assert.equal(result.executionApproval.approvalId, id);
+  assert.equal(result.executionApproval.scope.runnerVerification.guardLoadingVerified, false);
+  assert.equal(calls.length, 2);
+});

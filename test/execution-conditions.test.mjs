@@ -317,3 +317,124 @@ test('nested metadata found by traversal invalidates code review while preservin
   assert.equal(changed.executionApproval.approvalId, pending.executionReviewId);
   assert.equal(JSON.stringify(calls).includes('nested-lock-body'), false);
 });
+
+
+test('indirect guard loading is human-reviewed without filename mentions; guard changes require reapproval', async () => {
+  const f = fixture(), calls = mock();
+  f.put('scripts/test-safe.php', '<?php $entry=[PHP_BINARY,"vendor/bin/phpunit"]; /* guard is loaded by PHPUnit bootstrap */');
+  const pending = await approve(f.input);
+  const scope = pending.executionApproval.scope;
+  assert.equal(scope.runnerVerification.guardLoadingVerified, false);
+  assert.equal(scope.runnerVerification.guardApplicabilityVerified, false);
+  assert.equal(scope.runnerVerification.resourceIsolationVerified, false);
+  assert.ok(scope.files.includes('tests/Support/DatabaseGuard.php'));
+  assert.ok(scope.files.includes('tests/bootstrap.php'));
+  const first = await evaluateTest(config, f.repeat);
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  assert.ok(JSON.stringify(calls).includes('function guardMemory'));
+  f.put('tests/Support/DatabaseGuard.php', '<?php function guardChanged() {}');
+  assert.notEqual((await evaluateTest(config, f.repeat)).executionReviewId, pending.executionReviewId);
+});
+
+for (const mode of ['local', 'podman']) test(`${mode}: fixed passthru requires scoped approval and preparation evidence`, async () => {
+  const f = fixture(mode), calls = mock();
+  mkdirSync(join(f.cwd, 'bootstrap'));
+  f.put('artisan', '<?php /* Laravel entry */');
+  f.put('bootstrap/app.php', '<?php /* Laravel application setup */');
+  f.put('scripts/test-safe.php', `<?php
+    $clear = escapeshellarg(PHP_BINARY).' artisan config:clear'; passthru($clear, $clearStatus);
+    if ($clearStatus !== 0) { exit(1); }
+    $args = array_slice($argv,1); $cmd = escapeshellarg(PHP_BINARY).' vendor/bin/phpunit';
+    foreach ($args as $arg) { $cmd .= ' '.escapeshellarg($arg); }
+    passthru($cmd, $status); exit($status);`);
+  const pending = await approve(f.input);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(pending.executionApproval.scope.runnerVerification.processInvocations.map(p => p.arguments), [['artisan','config:clear'],['vendor/bin/phpunit']]);
+  assert.ok(pending.executionApproval.scope.files.includes('artisan'));
+  assert.ok(pending.executionApproval.scope.files.includes('bootstrap/app.php'));
+  assert.equal((await evaluateTest(config, f.repeat)).allowed, true);
+  const again = await evaluateTest(config, f.repeat);
+  assert.equal(again.executionApproval.approvalId, pending.executionReviewId);
+  assert.equal(again.codeAssessment.status, 'cache-hit');
+  f.put('bootstrap/app.php', '<?php /* changed application startup */');
+  assert.notEqual((await evaluateTest(config, f.repeat)).executionReviewId, pending.executionReviewId);
+});
+
+test('unresolved passthru and missing preparation evidence cannot be human-approved', async () => {
+  const f = fixture(), calls = mock();
+  f.put('scripts/test-safe.php', '<?php /* vendor/bin/phpunit */ passthru($_GET["command"]);');
+  const dynamic = await evaluateTest(config, f.input);
+  assert.equal(dynamic.errorCode, 'EXECUTION_CHAIN_UNRESOLVED');
+  assert.equal(dynamic.executionReviewId, undefined);
+  assert.equal(dynamic.needsHumanReview, false);
+  f.put('scripts/test-safe.php', "<?php passthru(escapeshellarg(PHP_BINARY).' artisan config:clear'); passthru(escapeshellarg(PHP_BINARY).' vendor/bin/phpunit');");
+  const missing = await evaluateTest(config, f.input);
+  assert.equal(missing.errorCode, 'EXECUTION_EVIDENCE_INCOMPLETE');
+  assert.equal(missing.executionReviewId, undefined);
+  assert.equal(calls.length, 0);
+});
+
+test('removing guard filename checks never bypasses missing evidence or an indirect guard deny', async () => {
+  const f = fixture(), calls = mock();
+  f.put('scripts/test-safe.php', '<?php $entry=[PHP_BINARY,"vendor/bin/phpunit"];');
+  rmSync(join(f.cwd, 'tests/Support/DatabaseGuard.php'));
+  const missing = await evaluateTest(config, {...f.input, context:'The guard is loaded indirectly and protects SQLite memory.'});
+  assert.equal(missing.errorCode, 'EXECUTION_EVIDENCE_INCOMPLETE');
+  assert.equal(missing.executionReviewId, undefined);
+  f.put('tests/Support/DatabaseGuard.php', '<?php // DROP DATABASE customer_records');
+  const denied = await evaluateTest(config, f.input);
+  assert.equal(denied.decision, 'deny');
+  assert.equal(denied.executionReviewId, undefined);
+  assert.equal(calls.length, 0);
+});
+
+test('old execution approval identities are superseded while registration and history remain', async () => {
+  const f = fixture(); mock();
+  const old = await approve(f.input);
+  openDatabase().prepare("UPDATE test_execution_approvals SET verifier_version='jev-db-execution-v1',fingerprint='legacy-review-identity' WHERE approval_id=?").run(old.executionReviewId);
+  const pending = await evaluateTest(config, f.repeat);
+  assert.equal(pending.allowed, false);
+  assert.notEqual(pending.executionReviewId, old.executionReviewId);
+  assert.equal(pending.executionConditionsId, old.executionConditionsId);
+  assert.equal(getTestExecutionApproval(openDatabase(), old.executionReviewId).status, 'superseded');
+  const row = openDatabase().prepare('SELECT verifier_version FROM test_execution_approvals WHERE approval_id=?').get(pending.executionReviewId);
+  assert.equal(row.verifier_version, 'jev-db-execution-v2');
+});
+
+
+test('known static guard deny survives missing preparation evidence', async () => {
+  const f = fixture(), calls = mock();
+  f.put('scripts/test-safe.php', "<?php passthru(escapeshellarg(PHP_BINARY).' artisan config:clear'); passthru(escapeshellarg(PHP_BINARY).' vendor/bin/phpunit');");
+  f.put('tests/Support/DatabaseGuard.php', '<?php // DROP DATABASE customer_records');
+  const result = await evaluateTest(config, f.input);
+  assert.equal(result.decision, 'deny');
+  assert.equal(result.executionReviewId, undefined);
+  assert.equal(calls.length, 0);
+});
+
+
+test('related code above 64 KiB is fully reviewed when the serialized request fits', async () => {
+  const f = fixture(), calls = mock();
+  for (let i = 0; i < 3; i++) f.put(`app/Large${i}.php`, `<?php /*${'.'.repeat(31000)}*/`);
+  const pending = await approve(f.input);
+  const result = await evaluateTest(config, f.repeat);
+  assert.equal(result.allowed, true, JSON.stringify(result));
+  assert.equal(result.executionApproval.approvalId, pending.executionReviewId);
+  const request = calls.find(c => 'test_dangerous' in c.questions);
+  const files = request.state.relatedCode.filter(f => f.file.startsWith('app/Large'));
+  assert.equal(files.length, 3);
+  assert.equal(files.reduce((bytes, f) => bytes + Buffer.byteLength(f.content), 0), 3 * 31010);
+});
+
+
+test('the 1024 KiB read budget does not bypass the 256 KiB serialized request limit', async () => {
+  const f = fixture(), calls = mock();
+  for (let i = 0; i < 9; i++) f.put(`app/Large${i}.php`, `<?php /*${'.'.repeat(31000)}*/`);
+  await approve(f.input);
+  const result = await evaluateTest(config, f.repeat);
+  assert.equal(result.allowed, false);
+  assert.equal(result.errorCode, 'RELATED_CODE_REVIEW_INCOMPLETE');
+  assert.ok(result.reason.includes('256 KiB'), JSON.stringify(result));
+  assert.equal(result.reviewId, undefined);
+  assert.equal(calls.filter(c => 'test_dangerous' in c.questions).length, 0);
+});

@@ -35,11 +35,15 @@ test('related snapshots deduplicate overlapping roots and identify raw contents,
 
 test('related snapshot accepts exactly the file and byte limits', (t) => {
   const root = relatedProject(t);
-  for (let i = 0; i < 64; i++) writeFileSync(join(root, 'app', `file${i}.txt`), i < 2 ? 'a'.repeat(32768) : '');
+  for (let i = 0; i < 64; i++) writeFileSync(join(root, 'app', `file${i}.txt`), i < 32 ? 'a'.repeat(32768) : '');
   const result = readRelatedCode(root, ['app']);
   assert.equal(result.status, 'complete');
   assert.equal(result.files.length, 64);
-  assert.equal(result.files.reduce((total, file) => total + file.bytes, 0), 65536);
+  assert.equal(result.files.reduce((total, file) => total + file.bytes, 0), 1048576);
+  writeFileSync(join(root, 'app', 'file63.txt'), 'x');
+  const over = readRelatedCode(root, ['app']);
+  assert.equal(over.status, 'incomplete');
+  assert.match(over.reason, /1024 KiB total limit/);
 });
 
 for (const [name, prepare, roots = ['app']] of [
@@ -50,7 +54,7 @@ for (const [name, prepare, roots = ['app']] of [
   ['binary', (root) => writeFileSync(join(root, 'app', 'binary'), Buffer.from([0, 1]))],
   ['non-UTF8', (root) => writeFileSync(join(root, 'app', 'invalid'), Buffer.from([0xff]))],
   ['large file', (root) => writeFileSync(join(root, 'app', 'large'), 'a'.repeat(32769))],
-  ['total bytes', (root) => { for (let i = 0; i < 3; i++) writeFileSync(join(root, 'app', `large${i}`), 'a'.repeat(32768)); }],
+  ['total bytes', (root) => { for (let i = 0; i < 33; i++) writeFileSync(join(root, 'app', `large${i}`), 'a'.repeat(32768)); }],
   ['file count', (root) => { for (let i = 0; i < 65; i++) writeFileSync(join(root, 'app', `${i}`), ''); }],
   ['entry count', (root) => { for (let i = 0; i < 4097; i++) mkdirSync(join(root, 'app', `${i}`)); }],
 ]) {
@@ -90,7 +94,7 @@ test('Profile v2 keeps command and environment outside the code identity', () =>
 
 test('composer.lock is digest-only for explicit paths and traversal, outside source file and byte limits', (t) => {
   const root = relatedProject(t);
-  for (let i = 0; i < 64; i++) writeFileSync(join(root, 'app', `source${i}.php`), i < 2 ? 'a'.repeat(32768) : '');
+  for (let i = 0; i < 64; i++) writeFileSync(join(root, 'app', `source${i}.php`), i < 32 ? 'a'.repeat(32768) : '');
   const lock = Buffer.from(JSON.stringify({ packages: [], marker: 'metadata-only'.repeat(100000) }));
   writeFileSync(join(root, 'app/composer.lock'), lock);
   const snapshot = readRelatedCode(root, ['app', 'app/composer.lock']);

@@ -183,6 +183,12 @@ inspect、mount／image／container ID追跡、内部collector、MCP移動、コ
 
 既存runnerは毎回SQLite memoryを強制し、設定cacheを処理・復元し、実接続先を確認して永続／fallback／追加接続を拒否します。宣言、ソース参照、AIの隔離申告だけで強制を証明したと扱いません。初回に既存runnerとguard全文を確認し、新runner SDKを要求しません。
 
+DB実行・明示的な旧Profile v3では、`runner.safetyFiles`に接続guardソースを指定し、PHPUnit XMLや`.env.testing`は`environmentFiles`へ置きます。runner内へのファイル名の直接記載は要求せず、記載を実行の証明にも使いません。guardファイルは引き続き完全・読取可能・通常ファイル・symlinkなしのソースとし、元バイト列で変更検出します。依存メタデータや呼出側の`context`でguardソースを代替してはいけません。実行承認前に、実際のPHPUnit bootstrap、Composerのautoload対応、テスト継承を読み、対象へのguard適用、DB操作より前の実行順序、永続／fallback／追加接続の拒否を確認します。必要なファイルを宣言範囲に含めてください。`runnerVerification.guardLoadingVerified`、`guardApplicabilityVerified`、`resourceIsolationVerified`はすべてfalseであり、構文／ローカルruntime検査をこれらの証明として説明してはいけません。実際の経路やresource保護を確認できなければ承認せず停止します。
+
+`executionApproval.scope.runnerVerification.processInvocations`をrunner全文と照合します。対応する`passthru`は、`escapeshellarg(PHP_BINARY)`と完全一致するliteralなPHPUnit入口または` artisan config:clear`の連結で、selector転送は未変更の`array_slice($argv, 1)`の`foreach`内でspaceと`escapeshellarg`を使います。対応する`proc_open`は固定PHP_BINARYの引数配列を使い、PHPUnitに限り検証済みselector配列を転送します。未対応のcommand構築／alias／scope、生連結、任意command／option、文字列形式の`proc_open`、`eval`、backtick、その他のshell実行関数は、承認不可の`EXECUTION_CHAIN_UNRESOLVED`で停止するため、承認で迂回してはいけません。新規runnerでは引数配列を基本とします。対応構文でも明示的な実行承認と現在のcommand／コード／Policy審査が必要です。終了コード処理、selector制限、キャッシュ復元も確認してください。
+
+`artisan config:clear`はテストguardより前にLaravelを起動します。認識した呼出しでは`artisan`と`bootstrap/app.php`を審査・変更検出に加え、`preparationFiles`へ提示し、欠落・不完全なら停止します。追加の起動／設定依存とテスト前のDB操作・副作用も確認し、`tests/TestCase.php`のguardがこの段階を保護すると推測してはいけません。更新後は依存更新・再build／再起動して再チェックし、verifierの`jev-db-execution-v2`／`jev-test-execution-v2`に従い、見直したscopeへの新しい明示的な実行承認を取得します。以前のコードcache／Human Reviewで新evaluatorを迂回できません。DB schema・入力形式・履歴は保持し、旧v1／v2の挙動は変えません。guard／環境設定を修正して別の登録も一致する場合は、返された`executionConditionsId`を使います。Server更新だけを理由に利用先runnerを書き換えたり、PHPUnitを実行したりしてはいけません。
+
 許可範囲内のテスト追加・本文変更・ファイル／filter変更では一致する実行承認を再利用します。影響するコードと関連コードを審査し、既存の固定modelによる安全なコードcache条件だけを再利用します。通常の関連コード変更はコード審査だけへ影響します。実行定義、runner、guard、bootstrap／安全設定、登録条件、ローカルruntime／依存、Policy変更は実行再承認を要求します。元バイト列・マスク前入力でdigestを計算し、自己申告hashや同じマスク結果を根拠にしません。秘密情報の平文を変更説明や登録／contextログへ保存・提示しません。通常DB登録とコードcache同一性はProfileの未配置・削除・不正な内容に影響されません。
 
 Composerの`--`以降へ許可した相対PHPファイルと1つのliteralな`--filter VALUE`だけを渡します。`testFiles`は実際の対象集合全体と一致させ、全suiteはXMLから解決した全対象を審査します。filterでも選択ファイル全文を審査します。selectorによるPHP option／configuration／bootstrap変更は禁止です。DB経路ではインライン`testCode`と旧`execution`／`environmentApprovalId`を省略します。必要なhelper／applicationソース、安全設定を含め、読込上限回避のためにroot削減・ファイル除外・本文切詰めをしません。Serverは動的PHP import／process全体を解決しません。既存読込／探索／request上限はREADMEを確認してください。
@@ -221,13 +227,15 @@ Safety Profile v2を使用するプロジェクトでは、承認済みrunnerだ
 
 DB登録条件・旧Profileのどちらでも、`composer.lock`はJSONテキストですが、全文は依存メタデータとして扱い、ソース審査へ提出しません。この名前と完全一致する通常ファイル（入れ子のパスを含む）は、明示指定・`codeReviewRoots`配下の探索のどちらでも、Jevへ送るcommand証拠本文と`relatedCode`から除外します。変更検出にはproject相対パス・元バイト列のSHA-256 digest・byte数だけを保持します。
 
-ソースの64ファイル／1件32 KiB／合計64 KiB上限には算入せず、メタデータは別枠で64ファイル／1件8 MiB、探索4096 entryは共通です。存在しない／読めないファイル、symlink、通常ファイル以外では引き続き停止します。他のlockfileにはこの除外を適用しません。ローカルのComposer plugin検査はJSONをローカルで読み続けますが、コンテナ内部の検査は行いません。`testFiles`での`composer.lock`提出も禁止します（`TEST_FILE_METADATA_ONLY`）。
+ソースの64ファイル／1件32 KiB／合計1024 KiB上限には算入せず、メタデータは別枠で64ファイル／1件8 MiB、探索4096 entryは共通です。存在しない／読めないファイル、symlink、通常ファイル以外では引き続き停止します。他のlockfileにはこの除外を適用しません。ローカルのComposer plugin検査はJSONをローカルで読み続けますが、コンテナ内部の検査は行いません。`testFiles`での`composer.lock`提出も禁止します（`TEST_FILE_METADATA_ONLY`）。
 
 これを含む既存DB登録・旧Profileの設定変更は不要です。lock変更は該当するコード審査の同一性を失効させ、実行条件または自動依存検出に含まれる場合は実行再承認が必要です。更新後は再build／再起動して再チェックしてください。`related-code-v2`によりDB schemaを変えずに以前のコードcache／Human Reviewを失効させますが、一致する実行承認・環境承認は保持します。
 
 Profile v2では、関連するhelper・setup・applicationコードが`codeReviewRoots`の範囲に含まれることを確認してください。Serverはメタデータ専用の`composer.lock`を除くソースについて、manifestやdiffだけでなく現在の全文を検査し、1リクエスト内の全テストで重複排除した同一スナップショットを使います。平文にBuilt-in／User／Project Policyとframeworkの静的検査を適用し、マスクした`relatedCode`（`file`、`content`）をJevへ送ります。関連findingにはproject相対パスの`file`が付く場合があります。元バイト列の変更・追加・削除は対応するコードcacheとHuman Approvalを失効させるため、マスク済み本文が同じという理由で同一性を推測してはいけません。平文の本文はSQLite・ログ・MCP結果へ残しません。マスクはbest effortなので、範囲内の機密情報も別途確認してください。
 
-上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親または末端のsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`となります。承認可能な`reviewId`とExecution Ticketはないので停止してください。`jev_review_approve`、過去の承認／cacheの再利用、本文の切り詰め、拡張子による除外、必要なrootの削除で迂回してはいけません。理由を説明し、読み取り可否・範囲・リクエスト容量を修正して再チェックします。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを取り消しません。
+snapshotの読込上限1024 KiBと、完成したコード審査リクエストのJSON上限256 KiBは別です。読込可能でも送信容量超過なら停止し、自動分割・切り詰めは行いません。
+
+上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計1024 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親または末端のsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`となります。承認可能な`reviewId`とExecution Ticketはないので停止してください。`jev_review_approve`、過去の承認／cacheの再利用、本文の切り詰め、拡張子による除外、必要なrootの削除で迂回してはいけません。理由を説明し、読み取り可否・範囲・リクエスト容量を修正して再チェックします。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを取り消しません。
 
 範囲は指定テストと明示した`codeReviewRoots`だけで、Serverはimport・package・動的依存を自動解決しません。空のroot一覧は追加審査の指定がないという意味であり、依存全体の安全性の証明ではありません。大きなソースディレクトリは上限を超える場合があります。`composer.lock`には別枠のメタデータ上限を適用します。`related-code-v2`へのevaluator更新はその更新自体ではDB schemaを変更せずに以前のコードcache／Human Reviewを失効させます。更新済みServerで再評価し、必要なら新しい明示的なHuman Approvalを取得し、任意のProfile v2 Ticket経路を使う場合だけ新しいExecution Ticketを取得してください。履歴と、一致するEnvironment Approvalは保持します。古いevaluatorやreview／Ticketへ戻して審査を回避してはいけません。
 

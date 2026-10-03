@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalJson, projectId, sha256 } from '../safety-fingerprint.js';
-import { snapshotExecution, EXECUTION_VERIFIER_VERSION, type ExecutionSnapshot } from '../execution-profile.js';
+import { snapshotExecution, EXECUTION_VERIFIER_VERSION, DB_EXECUTION_VERIFIER_VERSION, type ExecutionSnapshot } from '../execution-profile.js';
 import { findPolicyMatches, loadEffectivePolicies, loadEffectiveTestPolicies } from '../policy.js';
 import { insertAudit } from './audit-log.js';
 import type { TestCheckInput } from '../types.js';
@@ -64,7 +64,7 @@ export function executionApprovalFor(db: DatabaseSync, snapshot: ExecutionSnapsh
       framework: snapshot.profile.framework, environment: snapshot.profile.environment };
     db.prepare('INSERT INTO test_execution_approvals(approval_id,project_id,profile_path,condition_id,source_kind,fingerprint,policy_hash,verifier_version,scope_json,request_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(id, pid, snapshot.conditions ? null : snapshot.profilePath, conditionId ?? null, snapshot.conditions ? 'db' : 'profile', snapshot.fingerprint, snapshot.policyHash,
-        snapshot.conditions ? 'jev-db-execution-v1' : EXECUTION_VERIFIER_VERSION, canonicalJson(scope), canonicalJson(request), 'pending', now, expiresAt);
+        snapshot.conditions ? DB_EXECUTION_VERIFIER_VERSION : EXECUTION_VERIFIER_VERSION, canonicalJson(scope), canonicalJson(request), 'pending', now, expiresAt);
     db.exec('COMMIT');
     return getTestExecutionApproval(db, id)!;
   } catch (error) { if (!committed) db.exec('ROLLBACK'); throw error; }

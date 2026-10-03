@@ -222,6 +222,23 @@ Human Reviewの期限は作成時から1時間で、承認操作によって延�
 
 `runner.file`と`entry`は導出可能です。`runner.safetyFiles`には既存接続guardを1件以上指定し、`runner.testEntry`の既定値は`vendor/bin/phpunit`です。`selectors`の全項目（`filePatterns`、`allowFilter`、`allowFullSuite`）、`codeReviewRoots`、`resources`を指定します。DB scopeはSQLite `:memory:`でfallback／追加接続拒否、network／credentialは`deny`、filesystemは書込み可能rootを宣言します。関連rootの空配列は明示的に確認するもので、依存が存在しないことの証明ではありません。`environmentFiles`はPHPUnit XMLから導出できますが、必要な既存安全設定を追加してください。project内の参照パスは相対で、ホストroot外へ出せません。
 
+DB登録実行・明示的な旧Profile v3のどちらでも、guardの読み込みとrunnerのプロセス起動を審査します。`runner.safetyFiles`には既存の接続guardソースを指定し、runner本文へのファイル名の直接記載は要求しません。PHPUnit XMLや`.env.testing`は`environmentFiles`へ指定します。Laravelの基底クラスにguardがある場合、条件の該当部分は次のようにできます。
+
+```json
+{
+  "runner": {"file": "scripts/test-safe.php", "safetyFiles": ["tests/TestCase.php"]},
+  "environmentFiles": ["phpunit.xml", ".env.testing"]
+}
+```
+
+宣言した安全ファイルは引き続き、読取可能・通常ファイル・symlinkなし・審査可能な完全ソースであることを要求し、実行条件の変更検出に含めます。依存メタデータはguardソースの代わりにできません。コメントを含むファイル名の記載はguard実行の証明にはなりません。初回実行承認では、PHPUnitのbootstrap／autoload／テスト継承による実際の読み込み経路、guardを使う対象、DB操作より前の実行順序、永続／fallback／追加接続の拒否を確認します。関連ソース・設定を登録範囲に含めてください。呼出側の`context`は説明であり、欠落ファイルの代わりにはなりません。`executionApproval.scope.runnerVerification`には`guardLoadingVerified=false`、`guardApplicabilityVerified=false`、`resourceIsolationVerified=false`を返します。ローカルruntime検査や対応構文への一致はこれらを証明せず、人が実ファイルと実行構成から確認して承認します。
+
+`passthru()`は関数名だけで禁止しません。対応するPHP構文は、`escapeshellarg(PHP_BINARY)`と完全一致するliteralな` vendor/bin/phpunit`（または宣言した`runner.testEntry`）／` artisan config:clear`の連結を、直接または固定command変数で渡す形です。PHPUnitへの引数追加は、`array_slice($argv, 1)`またはその未変更変数の`foreach`内で、spaceと`escapeshellarg($argument)`を連結する形だけを認めます。同等の`proc_open([PHP_BINARY, "vendor/bin/phpunit", ...array_slice($argv, 1)], ...)`、固定した`artisan config:clear`の引数配列も対応します。任意の追加option、selectorの生連結、command変更、間接／alias呼出し、未対応のfunction／namespace scope、文字列形式の`proc_open`、`eval`、backtick、その他のshell実行関数は未対応で、承認不可の`EXECUTION_CHAIN_UNRESOLVED`として停止します。限定した構文認識であり、PHP全般の制御フロー・依存解析ではありません。外側のコンテナwrapperとComposer解析の既存制限も維持します。
+
+`runnerVerification.processInvocations`には、認識したAPI・固定実行先／引数・転送方式を提示します。runner全文について、引数制限、終了コード、事前処理、キャッシュ復元を人が確認し、現在のJev／Policy／コード審査も通す必要があります。`artisan config:clear`はテストguardより前にLaravelを起動するため、Serverは`artisan`と`bootstrap/app.php`も読み込み・fingerprint化し、`preparationFiles`に提示します。欠落／読込不可／容量超過なら停止します。追加の起動ソース・設定とPHPUnit前のDB操作・副作用も確認してください。`tests/TestCase.php`のguardだけでは、この段階を保護できません。新規runnerでは引数配列を渡す形式を基本とします。
+
+今回の審査変更の移行：依存を更新し（ソースcheckoutでは`npm ci`）、Serverを再build／再起動して再チェックします。DBと旧v3の実行verifierは`jev-db-execution-v2`／`jev-test-execution-v2`となり、以前の実行承認には見直したscopeへの新しい明示承認が必要です。以前のコードcache／Human Reviewも新しいevaluatorの同一性を迂回できません。DB schema・条件の入力形式は変えず、履歴を保持します。既存登録は再利用できますが、guardと環境設定の分離により条件を変更し、複数登録が一致する場合は、新しく返された`executionConditionsId`を明示してください。Jev更新は利用先runnerを書き換えず、PHPUnitを自動実行しません。
+
 ローカルでは同じscope項目に`target: {"mode":"local"}`を使い、`composer test`や`php scripts/test-safe.php`を直接指定します。`runtime.configFiles`へ有効なPHP設定をすべて指定し、対象がない場合だけ人が確認した空配列を渡します。`runtime.php`／`runtime.composer`はPATHから検出可能で、読み取れる絶対パスでも指定できます。Composerはそのadapterだけで必要です。ローカル実行ファイル、PHP shebang、runtime設定、環境、installed vendor、Composer／global metadataの既存検査は維持します。`runtime.composerHome`の明示値は実際のComposer homeと一致させ、独自homeはMCPと実行側の`COMPOSER_HOME`を一致させます。ローカルMCPと実行のnamespace・設定が対応する必要があります。
 
 Dockerでは`target.mode=docker`と正確なDocker commandを使います。shellを介さない対応例は次のとおりです。
@@ -247,11 +264,11 @@ Composerの`--`以降へ、許可された相対PHPファイルと、許可さ�
 
 `composer.lock`はJSONテキストですが、全文は依存メタデータとして扱い、ソース審査へ提出しません。この名前と完全一致する通常ファイル（入れ子のパスを含む）は、明示指定・`codeReviewRoots`配下の探索のどちらでも、Jevへ送るcommand証拠本文と`relatedCode`から除外します。変更検出にはproject相対パス・元バイト列のSHA-256 digest・byte数だけを保持します。
 
-ソースの64ファイル／1件32 KiB／合計64 KiB上限には算入せず、メタデータは別枠で64ファイル／1件8 MiB、探索4096 entryは共通です。存在しない／読めないファイル、symlink、通常ファイル以外では引き続き停止します。他のlockfileにはこの除外を適用しません。ローカルのComposer plugin検査はJSONをローカルで読み続けますが、コンテナ内部の検査は行いません。`testFiles`での`composer.lock`提出も禁止します（`TEST_FILE_METADATA_ONLY`）。
+ソースの64ファイル／1件32 KiB／合計1024 KiB上限には算入せず、メタデータは別枠で64ファイル／1件8 MiB、探索4096 entryは共通です。存在しない／読めないファイル、symlink、通常ファイル以外では引き続き停止します。他のlockfileにはこの除外を適用しません。ローカルのComposer plugin検査はJSONをローカルで読み続けますが、コンテナ内部の検査は行いません。`testFiles`での`composer.lock`提出も禁止します（`TEST_FILE_METADATA_ONLY`）。
 
 これを含む既存DB登録・旧Profileの設定変更は不要です。lock変更は該当するコード審査の同一性を失効させ、実行条件または自動依存検出に含まれる場合は実行再承認が必要です。更新後は再build／再起動して再チェックしてください。`related-code-v2`によりDB schemaを変えずに以前のコードcache／Human Reviewを失効させますが、一致する実行承認・環境承認は保持します。
 
-証拠／関連snapshotは64ファイル、1件32 KiB、合計64 KiB、探索4096 entry、テスト選択は128ファイルで各テストに同じ1件読込上限を適用します。完成コードrequestは256 KiB、command contextは192 KiB、ローカル依存manifestは20000ファイル／40000 entry／1件8 MiBです。不完全な証拠を切り詰め・除外で迂回できません。検査対象は読み取れる通常ファイル、symlinkなし、ソースは有効なtextが必要です。ゲートはOS sandboxやチェックから実行までの変更防止を提供せず、コードや照合条件が変われば再チェックします。
+証拠／関連snapshotは64ファイル、1件32 KiB、合計1024 KiB、探索4096 entry、テスト選択は128ファイルで各テストに同じ1件読込上限を適用します。完成コードrequestは256 KiB、command contextは192 KiB、ローカル依存manifestは20000ファイル／40000 entry／1件8 MiBです。不完全な証拠を切り詰め・除外で迂回できません。検査対象は読み取れる通常ファイル、symlinkなし、ソースは有効なtextが必要です。ゲートはOS sandboxやチェックから実行までの変更防止を提供せず、コードや照合条件が変われば再チェックします。
 
 移行：旧processを停止し、SQLite／WALの整合したbackup後に更新します。schema 7から8へtransaction内で条件登録とlegacy／DB承認の識別を追加します。既存履歴・cacheは保持し、旧Profile承認をDB承認へ自動変換しません。移行時はexecutionConditionsを渡し、新scopeを明示確認して新IDを承認・再チェックします。その後の通常運用では旧Profileを削除できます。旧Profile承認IDを明示的legacy pathなしで使うと`EXECUTION_MIGRATION_REQUIRED`となります。旧Serverはschema 8を開けず、downgradeには更新前backupが必要です。配布JEV_POLICYの日英両方もServerと同時更新してください。
 
@@ -380,7 +397,9 @@ Profile v2では`testFiles`と同じファイルを示す構造化`execution`を
 
 各チェックで、Serverは`codeReviewRoots`配下のソースファイル（メタデータ専用の`composer.lock`を除く）の現在のUTF-8本文を読み、重複するrootを重複排除します。同一のメモリ上のスナップショットから元バイト列のdigestを作り、Built-in／User／Project Policy・frameworkの静的検査を行い、マスクした`relatedCode`（`file`、`content`）をJevへ送ります。1リクエスト内の複数`testFiles`はこのスナップショットを共有します。関連コードのfindingにはproject相対パスの`file`が付く場合があります。平文の本文はSQLite・ログ・MCP結果へ保存せず、Server外へ送る本文はマスク済みのみです。マスクはbest effortなので、利用前に設定範囲の機密情報を確認してください。
 
-審査上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計64 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親要素を含むsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`で停止します。明示されたメタデータ専用`composer.lock`の例外を除き、無断の切り詰めや拡張子による除外はしません。承認可能な`reviewId`、cache／Human Approvalによる迂回、Execution Ticketはなく、範囲・読み取り可否・リクエスト容量を修正して再チェックしてください。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを失効させません。
+snapshotの読込上限1024 KiBと、完成したコード審査リクエストのJSON上限256 KiBは別です。読込可能でも送信容量超過なら停止し、自動分割・切り詰めは行いません。
+
+審査上限は関連ファイル64件、1ファイル32 KiB、元バイト列の合計1024 KiB、ディレクトリを含む探索entry 4096件、完成したJevリクエストのJSON全体256 KiBです。存在しない／読めないパス、親要素を含むsymlink、通常ファイル以外、binary／非UTF-8、上限超過では`RELATED_CODE_REVIEW_INCOMPLETE`、`decision=review`、`allowed=false`で停止します。明示されたメタデータ専用`composer.lock`の例外を除き、無断の切り詰めや拡張子による除外はしません。承認可能な`reviewId`、cache／Human Approvalによる迂回、Execution Ticketはなく、範囲・読み取り可否・リクエスト容量を修正して再チェックしてください。検出済みの静的`deny`は維持します。関連コードの審査失敗だけでは一致するEnvironment Approvalを失効させません。
 
 審査範囲は指定テストと明示した`codeReviewRoots`のみで、import・package・動的依存を自動展開しません。`codeReviewRoots: []`は有効ですが、追加コード審査を指定していないという意味であり、依存全体の安全性を示しません。上限内で適切な範囲を選定してください（例の大きな`app`はソース上限を超える場合があります）。停止の回避だけを目的に必要なファイルを除外してはいけません。runner側のresource・fingerprint確認も引き続き必要です。
 
@@ -407,7 +426,7 @@ npm run typecheck
 npm test
 ```
 
-`npm run test:laravel`は専用のPodman PHP／Composer／Node imageをbuildし、一時projectへfixture依存を導入した後、networkとhost DB mountなしでゲートとLaravel／PHPUnitを実行します。Profile／Ticketなしのlocalとホスト→Podman実行、承認／cache再利用、テスト追加、guard変更時再承認、実際のSQLite memory、永続／fallback接続拒否、config cache復元、runner迂回拒否を確認します。Podmanとimage／依存準備時のnetworkが必要で、hostへのPHP導入は不要です。終了後にfixture projectと名前付きテストコンテナを削除します。
+`npm run test:laravel`は専用のPodman PHP／Composer／Node imageをbuildし、一時projectへfixture依存を導入した後、networkとhost DB mountなしでゲートとLaravel／PHPUnitを実行します。Profile／Ticketなしのlocalとホスト→Podman実行、承認／cache再利用、テスト追加、guard変更時再承認、実際のSQLite memory、永続／fallback接続拒否、config cache復元、runner迂回拒否を確認します。Podmanとimage／依存準備時のnetworkが必要で、hostへのPHP導入は不要です。終了後にfixture projectと名前付きテストコンテナを削除します。 ホスト→Podmanのfixtureでは、固定した`passthru`呼出し、実際の`artisan config:clear`、間接的なguard読込み、事前処理ファイルの変更検出も確認します。
 
 `npm test` はリポジトリ自身のユニットテストを実行します。テスト内の評価対象コマンドはモックJevへ入力として渡すだけで、実行しません。
 

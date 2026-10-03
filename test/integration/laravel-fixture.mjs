@@ -41,8 +41,12 @@ try {
   const executionConditions={target:{mode:'podman',containerName,projectRoot:'/fixture',cwd:'/fixture'},
     runner:{safetyFiles:['tests/Support/DatabaseGuard.php']},selectors:{filePatterns:['tests/Feature/**'],allowFilter:true,allowFullSuite:true},
     codeReviewRoots:['tests/Support','composer.lock'],environmentFiles:['phpunit.xml','composer.lock'],resources:{database:{policy:'sqlite-memory',rejectFallback:true,rejectAdditionalConnections:true},filesystem:{writableRoots:['bootstrap/cache']},network:{policy:'deny'},credentials:{policy:'deny'}}};
+  cpSync(join(project,'scripts/test-safe-passthru.php'),join(project,'scripts/test-safe.php'));
   const pending=await evaluateTest(config,{...repeat,executionConditions});
   assert.ok(pending.executionReviewId,JSON.stringify(pending));
+  assert.equal(pending.executionApproval.scope.runnerVerification.guardLoadingVerified,false);
+  assert.equal(pending.executionApproval.scope.runnerVerification.processInvocations.filter(p=>p.api==='passthru').length,2);
+  assert.ok(pending.executionApproval.scope.files.includes('bootstrap/app.php'));
   transitionTestExecutionApproval(openDatabase(),pending.executionReviewId,'approve',new Date().toISOString());
   const allowed=await evaluateTest(config,repeat);assert.equal(allowed.allowed,true,JSON.stringify(allowed));
   assert.equal(allowed.executionAssessment.sourceVerification,'human-approved-container');assert.equal(allowed.executionAssessment.ticket,undefined);
@@ -56,7 +60,9 @@ try {
   const replacement=await evaluateTest(config,repeat);assert.ok(replacement.executionReviewId);assert.notEqual(replacement.executionReviewId,pending.executionReviewId);
   transitionTestExecutionApproval(openDatabase(),replacement.executionReviewId,'approve',new Date().toISOString());assert.equal((await evaluateTest(config,repeat)).allowed,true);
   assert.match(run(['exec','--workdir','/fixture',containerName,'composer','--no-plugins','test']),/OK \(3 tests, 4 assertions\)/u);
-  console.log('Host gate + Podman: no Profile/Ticket; exact container command; approval/cache reused; added tests accepted; changed guard requires reapproval; actual DB guard tests pass.');
+  const startup=join(project,'bootstrap/app.php');writeFileSync(startup,readFileSync(startup,'utf8')+'\n// changed preparation evidence\n');
+  const startupChanged=await evaluateTest(config,repeat);assert.equal(startupChanged.allowed,false);assert.notEqual(startupChanged.executionReviewId,replacement.executionReviewId);
+  console.log('Host gate + Podman + fixed passthru + indirect guard: no Profile/Ticket; exact container command; approval/cache reused; added tests accepted; changed guard requires reapproval; actual DB guard tests pass.');
 } finally {
   if(containerStarted)run(['rm','-f',containerName]);
   globalThis.fetch=previousFetch;resetDatabaseForTests();

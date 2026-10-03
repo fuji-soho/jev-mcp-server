@@ -3,7 +3,7 @@ import { evaluationIdentity, isVersionedModel } from './config.js';
 import { checkCommandWithJev, JevError } from './cloudflare-jev.js';
 import { buildCommandStaticFindings } from './command-checker.js';
 import { ExecutionRegistrationError } from './execution-conditions.js';
-import { ExecutionEvidenceError, snapshotExecution } from './execution-profile.js';
+import { DB_EXECUTION_VERIFIER_VERSION, EXECUTION_VERIFIER_VERSION, ExecutionEvidenceError, snapshotExecution } from './execution-profile.js';
 import { customFindings, evaluateTestCode, redactTestText } from './test-checker.js';
 import { canonicalJson, EVALUATOR_VERSION, projectId, readRelatedCode, sha256 } from './safety-fingerprint.js';
 import { findPolicyMatches, loadEffectivePolicies, loadEffectiveTestPolicies, strictestDecision } from './policy.js';
@@ -73,7 +73,7 @@ export async function evaluateTestExecution(config: Config, input: TestCheckInpu
       insertAudit(db, { toolName: 'jev_check_test', targetType: 'test-execution', targetKey: snapshot.profilePath, projectId: projectId(snapshot.projectRoot),
         fingerprint: snapshot.executionFingerprint, policyHash: snapshot.policyHash, cacheStatus: 'disabled', finalDecision: result.decision,
         allowed: result.allowed, needsHumanReview: result.needsHumanReview, modelVersion: evaluationIdentity(config), actualModel,
-        jevProvider: config.provider, requestedModel: config.requestedModel, evaluatorVersion: 'jev-test-execution-v1',
+        jevProvider: config.provider, requestedModel: config.requestedModel, evaluatorVersion: snapshot.conditions ? DB_EXECUTION_VERIFIER_VERSION : EXECUTION_VERIFIER_VERSION,
         reason: result.reason, summary: canonicalJson({ executionApprovalId: approval.approvalId, status: approval.status }) });
     };
     if (approval.status !== 'approved') {

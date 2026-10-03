@@ -4,7 +4,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { TestCheckInput, TestFileError } from './types.js';
 
 export const FINGERPRINT_SCHEMA_VERSION = 2;
-export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1:related-code-v2';
+export const EVALUATOR_VERSION = 'jev-mcp-server@1.1.0:approval-model-v1:raw-test-input-v1:related-code-v2:runner-review-v2';
 
 function normalize(value: unknown): unknown {
   if (typeof value === 'string') return value.replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n').normalize('NFC');
@@ -123,7 +123,7 @@ const MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024;
 
 export interface FileManifestEntry { key: string; digest: string; bytes: number; }
 
-export const RELATED_CODE_LIMITS = { files: 64, fileBytes: 32 * 1024, totalBytes: 64 * 1024, entries: 4096 } as const;
+export const RELATED_CODE_LIMITS = { files: 64, fileBytes: 32 * 1024, totalBytes: 1024 * 1024, entries: 4096 } as const;
 export const RELATED_METADATA_LIMITS = { files: 64, fileBytes: MAX_MANIFEST_FILE_BYTES } as const;
 export function isMetadataOnlyFile(key: string): boolean { return key.split('/').at(-1) === 'composer.lock'; }
 export interface RelatedCodeFile extends FileManifestEntry { content: string; }
@@ -206,7 +206,7 @@ export function readRelatedCode(root: string, configuredPaths: string[]): Relate
         if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || relativeTarget(resolvedRoot, realpathSync(absolute)) === undefined) throw new Error('Related code changed while being read.');
         contents = buffer.subarray(0, length);
       } finally { closeSync(fd); }
-      if (totalBytes + contents.byteLength > RELATED_CODE_LIMITS.totalBytes) throw new Error('Related code exceeds the 64 KiB total limit.');
+      if (totalBytes + contents.byteLength > RELATED_CODE_LIMITS.totalBytes) throw new Error('Related code exceeds the 1024 KiB total limit.');
       if (contents.includes(0)) throw new Error('Related code contains binary content.');
       let content: string;
       try { content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(contents); }
